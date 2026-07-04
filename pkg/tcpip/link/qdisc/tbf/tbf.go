@@ -48,26 +48,9 @@ var _ stack.QueueingDiscipline = (*discipline)(nil)
 type discipline struct {
 	// Immutable configuration set by New.
 	lower stack.LinkWriter
-	clock tcpip.Clock `state:"nosave"`
-	burst uint32      // largest packet this TBF will pass, bytes
+	burst uint32 // largest packet this TBF will pass, bytes
 
-	// Shutdown state.
-	wg     sync.WaitGroup `state:"nosave"`
-	closed atomicbitops.Int32
-
-	// Wakers driving dispatchLoop.
-	newPacketWaker sleep.Waker `state:"nosave"`
-	tokenWaker     sleep.Waker `state:"nosave"`
-	closeWaker     sleep.Waker `state:"nosave"`
-
-	mu queueMutex `state:"nosave"`
-	// +checklocks:mu
-	queue qdisc.PacketBufferCircularList
-
-	// Dispatcher state: mutated only inside dispatchLoop and
-	// thus not protected by mu.
-	bucket   tokenBucket
-	watchdog tcpip.Timer `state:"nosave"`
+	pacedQueue
 }
 
 // len2TimeNS returns the number of ns to transmit len bytes at rate bytes/sec.
@@ -140,6 +123,156 @@ func (tb *tokenBucket) consume(now tcpip.MonotonicTime, pktLen uint32) (bool, ti
 	return true, 0
 }
 
+// pacedQueue is the shaping engine shared by the egress discipline and the
+// ingress shaper: a bounded packet backlog drained by a single dispatch
+// goroutine at the pace set by a token bucket. It is parameterized over how
+// packets leave the queue — written to the link below (egress) or delivered
+// to the stack above (ingress).
+//
+// +stateify savable
+type pacedQueue struct {
+	// Immutable configuration set by start.
+	clock tcpip.Clock `state:"nosave"`
+
+	// Shutdown state.
+	wg     sync.WaitGroup `state:"nosave"`
+	closed atomicbitops.Int32
+
+	// Wakers driving dispatchLoop.
+	newPacketWaker sleep.Waker `state:"nosave"`
+	tokenWaker     sleep.Waker `state:"nosave"`
+	closeWaker     sleep.Waker `state:"nosave"`
+
+	mu queueMutex `state:"nosave"`
+	// +checklocks:mu
+	queue qdisc.PacketBufferCircularList
+
+	// Dispatcher state: mutated only inside dispatchLoop and
+	// thus not protected by mu.
+	bucket   tokenBucket
+	watchdog tcpip.Timer `state:"nosave"`
+}
+
+// start initializes the backlog and token bucket and spawns the dispatch
+// goroutine. deliver is called from that goroutine with mu released to pass
+// each batch of packets on; it takes ownership of the batch's references and
+// must leave the batch empty.
+//
+// +checklocksignore: we don't have to hold locks during initialization.
+func (q *pacedQueue) start(clock tcpip.Clock, rate uint64, buffer int64, queueLen uint32, deliver func(*stack.PacketBufferList)) {
+	q.clock = clock
+	q.bucket = makeTokenBucket(rate, buffer, clock.NowMonotonic())
+	q.queue.Init(int(queueLen))
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		q.dispatchLoop(deliver)
+	}()
+}
+
+// enqueueResult is the outcome of pacedQueue.enqueue.
+type enqueueResult int
+
+const (
+	enqueued enqueueResult = iota
+	queueFull
+	queueClosed
+)
+
+// enqueue appends pkt (taking a new reference) to the backlog and wakes the
+// dispatch goroutine. The packet is not queued if the backlog is full or the
+// queue was shut down.
+func (q *pacedQueue) enqueue(pkt *stack.PacketBuffer) enqueueResult {
+	if q.closed.Load() == qDiscClosed {
+		return queueClosed
+	}
+
+	q.mu.Lock()
+	// Re-check closed now that we hold mu: the dispatch loop drains the queue
+	// under mu when it observes the close, so a packet pushed after that
+	// drain would never be released.
+	if q.closed.Load() == qDiscClosed {
+		q.mu.Unlock()
+		return queueClosed
+	}
+	haveSpace := q.queue.HasSpace()
+	if haveSpace {
+		q.queue.PushBack(pkt.IncRef())
+	}
+	q.mu.Unlock()
+	if !haveSpace {
+		return queueFull
+	}
+
+	q.newPacketWaker.Assert()
+	return enqueued
+}
+
+// signalShutdown tells the dispatch goroutine to drop any queued packets and
+// exit, and makes future enqueues no-ops. It does not wait for the
+// goroutine. Idempotent.
+func (q *pacedQueue) signalShutdown() {
+	if q.closed.Swap(qDiscClosed) != qDiscClosed {
+		q.closeWaker.Assert()
+	}
+}
+
+func (q *pacedQueue) dispatchLoop(deliver func(*stack.PacketBufferList)) {
+	s := sleep.Sleeper{}
+	s.AddWaker(&q.newPacketWaker)
+	s.AddWaker(&q.tokenWaker)
+	s.AddWaker(&q.closeWaker)
+	defer s.Done()
+
+	var batch stack.PacketBufferList
+	for {
+		switch w := s.Fetch(true); w {
+		case &q.newPacketWaker, &q.tokenWaker:
+		case &q.closeWaker:
+			if q.watchdog != nil {
+				q.watchdog.Stop()
+			}
+			q.mu.Lock()
+			for p := q.queue.RemoveFront(); p != nil; p = q.queue.RemoveFront() {
+				p.DecRef()
+			}
+			q.queue.DecRef()
+			q.mu.Unlock()
+			return
+		default:
+			panic("unknown waker")
+		}
+
+		q.mu.Lock()
+		for pkt := q.queue.PeekFront(); pkt != nil; pkt = q.queue.PeekFront() {
+			ok, wait := q.bucket.consume(q.clock.NowMonotonic(), uint32(pkt.Size()))
+			if !ok {
+				if q.watchdog != nil {
+					q.watchdog.Stop()
+				}
+				q.watchdog = q.clock.AfterFunc(wait, q.tokenWaker.Assert)
+				break
+			}
+			q.queue.RemoveFront()
+			batch.PushBack(pkt)
+
+			possiblyAnotherPacket := batch.Len() < BatchSize && !q.queue.IsEmpty()
+			if possiblyAnotherPacket {
+				continue
+			}
+			q.mu.Unlock()
+			deliver(&batch)
+			q.mu.Lock()
+		}
+		if batch.Len() > 0 {
+			q.mu.Unlock()
+			deliver(&batch)
+			q.mu.Lock()
+		}
+		q.mu.Unlock()
+	}
+}
+
 // validateConfig checks that rate and burst form a usable single-rate token
 // bucket for lower and returns the bucket capacity ("buffer") in nanoseconds.
 // kind, rateFlag and burstFlag name the configuration surface (egress or
@@ -178,70 +311,10 @@ func validateConfig(lower stack.LinkEndpoint, rate uint64, burst uint32, kind, r
 	return buffer, nil
 }
 
-func (d *discipline) dispatchLoop() {
-	s := sleep.Sleeper{}
-	s.AddWaker(&d.newPacketWaker)
-	s.AddWaker(&d.tokenWaker)
-	s.AddWaker(&d.closeWaker)
-	defer s.Done()
-
-	var batch stack.PacketBufferList
-	for {
-		switch w := s.Fetch(true); w {
-		case &d.newPacketWaker, &d.tokenWaker:
-		case &d.closeWaker:
-			if d.watchdog != nil {
-				d.watchdog.Stop()
-			}
-			d.mu.Lock()
-			for p := d.queue.RemoveFront(); p != nil; p = d.queue.RemoveFront() {
-				p.DecRef()
-			}
-			d.queue.DecRef()
-			d.mu.Unlock()
-			return
-		default:
-			panic("unknown waker")
-		}
-
-		d.mu.Lock()
-		for pkt := d.queue.PeekFront(); pkt != nil; pkt = d.queue.PeekFront() {
-			ok, wait := d.bucket.consume(d.clock.NowMonotonic(), uint32(pkt.Size()))
-			if !ok {
-				if d.watchdog != nil {
-					d.watchdog.Stop()
-				}
-				d.watchdog = d.clock.AfterFunc(wait, d.tokenWaker.Assert)
-				break
-			}
-			d.queue.RemoveFront()
-			batch.PushBack(pkt)
-
-			possiblyAnotherPacket := batch.Len() < BatchSize && !d.queue.IsEmpty()
-			if possiblyAnotherPacket {
-				continue
-			}
-			d.mu.Unlock()
-			_, _ = d.lower.WritePackets(batch)
-			batch.Reset()
-			d.mu.Lock()
-		}
-		if batch.Len() > 0 {
-			d.mu.Unlock()
-			_, _ = d.lower.WritePackets(batch)
-			batch.Reset()
-			d.mu.Lock()
-		}
-		d.mu.Unlock()
-	}
-}
-
 // New creates a new TBF queueing discipline that will rate-limit lower to
 // rate bytes/sec with bursts of up to burst bytes, queueing up to queueLen
 // packets of backlog before dropping. Note that queueLen counts packets,
 // not bytes as in Linux's sch_tbf.c, for consistency with the fifo qdisc.
-//
-// +checklocksignore: we don't have to hold locks during initialization.
 func New(lower stack.LinkEndpoint, clock tcpip.Clock, rate uint64, burst, queueLen uint32) (stack.QueueingDiscipline, error) {
 	buffer, err := validateConfig(lower, rate, burst, "qdisc=tbf", "qdisc-tbf-rate", "qdisc-tbf-burst")
 	if err != nil {
@@ -249,53 +322,38 @@ func New(lower stack.LinkEndpoint, clock tcpip.Clock, rate uint64, burst, queueL
 	}
 
 	d := &discipline{
-		lower:  lower,
-		clock:  clock,
-		burst:  burst,
-		bucket: makeTokenBucket(rate, buffer, clock.NowMonotonic()),
+		lower: lower,
+		burst: burst,
 	}
-	d.queue.Init(int(queueLen))
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
-		d.dispatchLoop()
-	}()
+	d.start(clock, rate, buffer, queueLen, func(batch *stack.PacketBufferList) {
+		_, _ = d.lower.WritePackets(*batch)
+		batch.Reset()
+	})
 	return d, nil
 }
 
 // WritePacket implements stack.QueueingDiscipline.WritePacket.
 func (d *discipline) WritePacket(pkt *stack.PacketBuffer) tcpip.Error {
-	if d.closed.Load() == qDiscClosed {
-		return &tcpip.ErrClosedForSend{}
-	}
-
 	if uint32(pkt.Size()) > d.burst {
 		// if the burst parameter is not smaller than the expected packet size,
 		// oversize packets should be impossible with New's GSO check
 		return &tcpip.ErrMessageTooLong{}
 	}
 
-	d.mu.Lock()
-	if d.closed.Load() == qDiscClosed {
-		d.mu.Unlock()
-		return &tcpip.ErrClosedForSend{}
-	}
-	haveSpace := d.queue.HasSpace()
-	if haveSpace {
-		d.queue.PushBack(pkt.IncRef())
-	}
-	d.mu.Unlock()
-	if !haveSpace {
+	switch d.enqueue(pkt) {
+	case enqueued:
+		return nil
+	case queueFull:
 		return &tcpip.ErrNoBufferSpace{}
+	case queueClosed:
+		return &tcpip.ErrClosedForSend{}
+	default:
+		panic("unknown enqueueResult")
 	}
-
-	d.newPacketWaker.Assert()
-	return nil
 }
 
 // Close implements stack.QueueingDiscipline.Close.
 func (d *discipline) Close() {
-	d.closed.Store(qDiscClosed)
-	d.closeWaker.Assert()
+	d.signalShutdown()
 	d.wg.Wait()
 }

@@ -13,24 +13,17 @@ declare_mutex(
     prefix = "queue",
 )
 
-declare_mutex(
-    name = "ingress_queue_mutex",
-    out = "ingress_queue_mutex.go",
-    package = "tbf",
-    prefix = "ingressQueue",
-)
-
 go_library(
     name = "tbf",
     srcs = [
         "ingress.go",
-        "ingress_queue_mutex.go",
         "queue_mutex.go",
         "tbf.go",
     ],
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
+        "//pkg/log",
         "//pkg/sleep",
         "//pkg/sync",
         "//pkg/sync/locking",

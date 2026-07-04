@@ -15,14 +15,20 @@
 package tbf
 
 import (
-	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/sleep"
-	"gvisor.dev/gvisor/pkg/sync"
+	"time"
+
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/nested"
-	"gvisor.dev/gvisor/pkg/tcpip/link/qdisc"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
+
+// ingressDropLogger rate-limits the warning logged when inbound packets are
+// dropped because the shaper's backlog is full. Unlike egress drops, which
+// surface to the NIC as ErrNoBufferSpace, ingress drops have no error path
+// back into the stack, so this log line and the dropped counter are the only
+// signals that the backlog is overflowing.
+var ingressDropLogger = log.BasicRateLimitedLogger(time.Minute)
 
 // Ingress is a stack.LinkEndpoint decorator that applies single-rate token
 // bucket shaping to inbound traffic before it is delivered to the network
@@ -43,30 +49,11 @@ import (
 type Ingress struct {
 	nested.Endpoint
 
-	// Immutable configuration set by NewIngress.
-	clock tcpip.Clock `state:"nosave"`
-
 	// dropped counts inbound packets dropped because the backlog queue was
 	// full. Packets discarded by Close or detach are not counted.
 	dropped tcpip.StatCounter
 
-	// Shutdown state.
-	wg     sync.WaitGroup `state:"nosave"`
-	closed atomicbitops.Int32
-
-	// Wakers driving dispatchLoop.
-	newPacketWaker sleep.Waker `state:"nosave"`
-	tokenWaker     sleep.Waker `state:"nosave"`
-	closeWaker     sleep.Waker `state:"nosave"`
-
-	mu ingressQueueMutex `state:"nosave"`
-	// +checklocks:mu
-	queue qdisc.PacketBufferCircularList
-
-	// Dispatcher state: mutated only inside dispatchLoop and
-	// thus not protected by mu.
-	bucket   tokenBucket
-	watchdog tcpip.Timer `state:"nosave"`
+	pacedQueue
 }
 
 var _ stack.GSOEndpoint = (*Ingress)(nil)
@@ -80,25 +67,15 @@ var _ stack.NetworkDispatcher = (*Ingress)(nil)
 // (possible when GRO coalesces TCP segments beyond it) is not dropped; it
 // passes once the bucket is completely full and drives the bucket into debt,
 // preserving the sustained rate.
-//
-// +checklocksignore: we don't have to hold locks during initialization.
 func NewIngress(lower stack.LinkEndpoint, clock tcpip.Clock, rate uint64, burst, queueLen uint32) (*Ingress, error) {
 	buffer, err := validateConfig(lower, rate, burst, "ingress-qdisc=tbf", "ingress-qdisc-tbf-rate", "ingress-qdisc-tbf-burst")
 	if err != nil {
 		return nil, err
 	}
 
-	e := &Ingress{
-		clock:  clock,
-		bucket: makeTokenBucket(rate, buffer, clock.NowMonotonic()),
-	}
+	e := &Ingress{}
 	e.Endpoint.Init(lower, e)
-	e.queue.Init(int(queueLen))
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		e.dispatchLoop()
-	}()
+	e.start(clock, rate, buffer, queueLen, e.deliverBatch)
 	return e, nil
 }
 
@@ -107,34 +84,15 @@ func NewIngress(lower stack.LinkEndpoint, clock tcpip.Clock, rate uint64, burst,
 // paced delivery to the dispatcher attached above this endpoint, or dropped
 // if the backlog queue is full.
 func (e *Ingress) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	if e.closed.Load() == qDiscClosed {
-		return
-	}
-
-	e.mu.Lock()
-	// Re-check closed now that we hold mu: the dispatch loop drains the queue
-	// under mu when it observes the close, so a packet pushed after that
-	// drain would never be released.
-	if e.closed.Load() == qDiscClosed {
-		e.mu.Unlock()
-		return
-	}
-	haveSpace := e.queue.HasSpace()
-	if haveSpace {
-		// Some lower endpoints (e.g. xdp) carry the protocol only in the
-		// argument; stash it on the packet so dispatchLoop can deliver with
-		// the same protocol later.
-		pkt.NetworkProtocolNumber = protocol
-		e.queue.PushBack(pkt.IncRef())
-	}
-	e.mu.Unlock()
-	if !haveSpace {
+	// Some lower endpoints (e.g. xdp) carry the protocol only in the
+	// argument; stash it on the packet so dispatchLoop can deliver with the
+	// same protocol later, as the NIC itself would.
+	pkt.NetworkProtocolNumber = protocol
+	if e.enqueue(pkt) == queueFull {
 		// Backlog full: drop, as Linux's sch_tbf does when limit is exceeded.
 		e.dropped.Increment()
-		return
+		ingressDropLogger.Warningf("ingress traffic shaping backlog full; dropping inbound packets (%d dropped on this link so far)", e.dropped.Value())
 	}
-
-	e.newPacketWaker.Assert()
 }
 
 // DroppedPackets returns the number of inbound packets dropped because the
@@ -143,66 +101,11 @@ func (e *Ingress) DroppedPackets() uint64 {
 	return e.dropped.Value()
 }
 
-func (e *Ingress) dispatchLoop() {
-	s := sleep.Sleeper{}
-	s.AddWaker(&e.newPacketWaker)
-	s.AddWaker(&e.tokenWaker)
-	s.AddWaker(&e.closeWaker)
-	defer s.Done()
-
-	var batch stack.PacketBufferList
-	for {
-		switch w := s.Fetch(true); w {
-		case &e.newPacketWaker, &e.tokenWaker:
-		case &e.closeWaker:
-			if e.watchdog != nil {
-				e.watchdog.Stop()
-			}
-			e.mu.Lock()
-			for p := e.queue.RemoveFront(); p != nil; p = e.queue.RemoveFront() {
-				p.DecRef()
-			}
-			e.queue.DecRef()
-			e.mu.Unlock()
-			return
-		default:
-			panic("unknown waker")
-		}
-
-		e.mu.Lock()
-		for pkt := e.queue.PeekFront(); pkt != nil; pkt = e.queue.PeekFront() {
-			ok, wait := e.bucket.consume(e.clock.NowMonotonic(), uint32(pkt.Size()))
-			if !ok {
-				if e.watchdog != nil {
-					e.watchdog.Stop()
-				}
-				e.watchdog = e.clock.AfterFunc(wait, e.tokenWaker.Assert)
-				break
-			}
-			e.queue.RemoveFront()
-			batch.PushBack(pkt)
-
-			possiblyAnotherPacket := batch.Len() < BatchSize && !e.queue.IsEmpty()
-			if possiblyAnotherPacket {
-				continue
-			}
-			e.mu.Unlock()
-			e.deliverBatch(&batch)
-			e.mu.Lock()
-		}
-		if batch.Len() > 0 {
-			e.mu.Unlock()
-			e.deliverBatch(&batch)
-			e.mu.Lock()
-		}
-		e.mu.Unlock()
-	}
-}
-
 // deliverBatch hands each packet to the dispatcher attached above this
 // endpoint (normally the NIC) and then drops the queue's references. Delivery
-// happens outside e.mu because the dispatcher runs protocol processing
-// inline. nested.Endpoint discards the packets if the endpoint was detached.
+// happens outside the queue mutex because the dispatcher runs protocol
+// processing inline. nested.Endpoint discards the packets if the endpoint was
+// detached.
 func (e *Ingress) deliverBatch(batch *stack.PacketBufferList) {
 	for _, pkt := range batch.AsSlice() {
 		e.Endpoint.DeliverNetworkPacket(pkt.NetworkProtocolNumber, pkt)
@@ -245,13 +148,4 @@ func (e *Ingress) Close() {
 // goroutines are quiesced outside of Wait.
 func (e *Ingress) Wait() {
 	e.Endpoint.Wait()
-}
-
-// signalShutdown tells the dispatch goroutine to drop any queued packets and
-// exit, and makes future deliveries no-ops. It does not wait for the
-// goroutine; Close does. Idempotent.
-func (e *Ingress) signalShutdown() {
-	if e.closed.Swap(qDiscClosed) != qDiscClosed {
-		e.closeWaker.Assert()
-	}
 }
