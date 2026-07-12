@@ -194,7 +194,7 @@ func LogPacket(prefix string, dir Direction, protocol tcpip.NetworkProtocolNumbe
 	var fragmentOffset uint16
 	var moreFragments bool
 
-	clone := trimmedClone(pkt)
+	clone := pkt.TrimmedNetworkClone()
 	defer clone.DecRef()
 	switch protocol {
 	case header.IPv4ProtocolNumber:
@@ -385,18 +385,4 @@ func LogPacket(prefix string, dir Direction, protocol tcpip.NetworkProtocolNumbe
 	}
 
 	log.Infof("%s%s %s %s:%d -> %s:%d len:%d id:0x%04x %s", prefix, dir, transName, src, srcPort, dst, dstPort, size, id, details)
-}
-
-// trimmedClone clones the packet buffer to not modify the original. It trims
-// anything before the network header.
-func trimmedClone(pkt *stack.PacketBuffer) *stack.PacketBuffer {
-	// We don't clone the original packet buffer so that the new packet buffer
-	// does not have any of its headers set.
-	//
-	// We trim the link headers from the cloned buffer as the sniffer doesn't
-	// handle link headers.
-	buf := pkt.ToBuffer()
-	buf.TrimFront(int64(len(pkt.VirtioNetHeader().Slice())))
-	buf.TrimFront(int64(len(pkt.LinkHeader().Slice())))
-	return stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
 }
