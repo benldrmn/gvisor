@@ -19,6 +19,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/egressallowlist"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -444,6 +446,32 @@ type Config struct {
 	// AllowConnectedOnSave allows network connections to stay established on save.
 	AllowConnectedOnSave bool `flag:"allow-connected-on-save"`
 
+	// EgressAllowDomains is a comma-separated list of domain patterns (exact
+	// like "docs.github.com" or wildcard like "*.github.com") whose resolved
+	// addresses the sandbox is allowed to reach. The Sentry snoops plain UDP
+	// DNS responses for these names to learn the addresses. Only supported with
+	// sandbox networking.
+	EgressAllowDomains string `flag:"egress-allow-domains"`
+
+	// EgressAllowIPs is a comma-separated list of IPs and CIDRs (v4/v6) the
+	// sandbox is always allowed to reach on any port. When either egress
+	// allowlist flag is set, all other egress is blocked by the Sentry. Only
+	// supported with sandbox networking.
+	EgressAllowIPs string `flag:"egress-allow-ips"`
+
+	// egressAllowDomainsBase and egressAllowIPsBase snapshot the
+	// operator-configured egress allowlist before any OCI annotation override is
+	// applied. Annotations are applied in nondeterministic order and mutate the
+	// live EgressAllow* fields, so the narrowing checks compare against this
+	// snapshot rather than the live fields. Not flags: they are not serialized by
+	// ToFlags, so the snapshot is a single-process concept, valid because
+	// annotation merging happens once in the CLI process before the sandbox
+	// starts. Applying overrides again in another process would re-derive the
+	// baseline from the already-merged fields.
+	egressAllowDomainsBase string
+	egressAllowIPsBase     string
+	egressBaseCaptured     bool
+
 	// AllowRootfsTarAnnotation indicates whether the rootfs tar annotation
 	// should be allowed.
 	AllowRootfsTarAnnotation bool `flag:"allow-rootfs-tar-annotation"`
@@ -475,6 +503,36 @@ func (c *Config) Validate() error {
 	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
+	}
+	if c.EgressAllowDomains != "" || c.EgressAllowIPs != "" {
+		if c.Network != NetworkSandbox {
+			return fmt.Errorf("egress-allow-domains/egress-allow-ips flags are only supported with sandbox networking")
+		}
+		// The egress filter is installed only on the FDBased and XDP-NS link
+		// paths. The XDP redirect and tunnel paths build their link args
+		// separately and do not install the filter, so reject them here rather
+		// than silently failing open.
+		if c.XDP.Mode == XDPModeRedirect || c.XDP.Mode == XDPModeTunnel {
+			return fmt.Errorf("egress-allow-domains/egress-allow-ips flags are not supported with XDP redirect or tunnel mode")
+		}
+		if err := validateEgressDomains(c.EgressAllowDomains); err != nil {
+			return err
+		}
+		if err := validateEgressIPs(c.EgressAllowIPs); err != nil {
+			return err
+		}
+		// A set-but-empty allowlist (e.g. a "," left by templating) would
+		// activate the filter with zero entries and silently drop all egress.
+		if len(egressallowlist.SplitList(c.EgressAllowDomains))+len(egressallowlist.SplitList(c.EgressAllowIPs)) == 0 {
+			return fmt.Errorf("egress-allow-domains/egress-allow-ips are set but contain no entries, which would block all egress")
+		}
+		// A domain allowlist only grows the learned-IP set from a DNS response,
+		// which requires the query to first reach an already-allowed resolver.
+		// With no static IPs no query can leave, so no domain can ever resolve:
+		// the configuration is inert.
+		if len(egressallowlist.SplitList(c.EgressAllowDomains)) > 0 && len(egressallowlist.SplitList(c.EgressAllowIPs)) == 0 {
+			return fmt.Errorf("egress-allow-domains is set but egress-allow-ips is empty: the DNS resolver's IP must be in egress-allow-ips or no query can leave the sandbox")
+		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
 		return fmt.Errorf("qdisc-tbf-burst must be <= %d, got: %d", maxQDiscTBFBurst, c.TBFBurst)
@@ -515,6 +573,160 @@ func (c *Config) Validate() error {
 	}
 	if unsupported := allowedCaps & ^nvconf.SupportedDriverCaps; unsupported != 0 {
 		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: unsupported capabilities: %v", c.NVProxyAllowedDriverCapabilities, unsupported)
+	}
+	return nil
+}
+
+// validateEgressIPs checks that each comma-separated entry is a valid IP or
+// CIDR and that the deduplicated list is within the shared entry cap. It uses
+// the same parser as the Sentry's egress filter, so a value that passes here
+// cannot fail at boot.
+func validateEgressIPs(csv string) error {
+	if _, err := egressallowlist.ParseIPList(egressallowlist.SplitList(csv)); err != nil {
+		return fmt.Errorf("egress-allow-ips: %w", err)
+	}
+	return nil
+}
+
+// validateEgressDomains checks each comma-separated domain pattern and that
+// the deduplicated list is within the shared entry cap. It uses the same
+// matcher constructor as the Sentry's egress filter, so a value that passes
+// here cannot fail at boot.
+func validateEgressDomains(csv string) error {
+	if _, err := egressallowlist.NewDomainMatcher(egressallowlist.SplitList(csv)); err != nil {
+		return fmt.Errorf("egress-allow-domains: %w", err)
+	}
+	return nil
+}
+
+// captureEgressBaseline snapshots the operator-configured egress allowlist the
+// first time it is called, before any egress annotation has mutated the live
+// EgressAllow* fields. The first egress override's check runs before that
+// override is written, so the snapshot is the operator's original.
+func (c *Config) captureEgressBaseline() {
+	if !c.egressBaseCaptured {
+		c.egressBaseCaptured = true
+		c.egressAllowDomainsBase = c.EgressAllowDomains
+		c.egressAllowIPsBase = c.EgressAllowIPs
+	}
+}
+
+// egressAllowlistConfigured reports whether the operator configured any egress
+// allowlist (before annotation overrides). When false, the feature was off (all
+// egress allowed), so an annotation that turns it on only strengthens security.
+func (c *Config) egressAllowlistConfigured() bool {
+	return c.egressAllowDomainsBase != "" || c.egressAllowIPsBase != ""
+}
+
+// checkEgressAllowDomains permits an OCI annotation to set --egress-allow-domains
+// only if it does not widen the operator-configured allowlist.
+func checkEgressAllowDomains(c *Config, name string, value string) error {
+	c.captureEgressBaseline()
+	return checkEgressAllowlistNarrowing(c, name, value, c.egressAllowDomainsBase, c.EgressAllowIPs, egressDomainsSubset)
+}
+
+// checkEgressAllowIPs is the IP-list counterpart to checkEgressAllowDomains. It
+// additionally rejects clearing IPs while domains remain non-empty: with no
+// static IP the resolver is unreachable, so no domain could ever resolve.
+func checkEgressAllowIPs(c *Config, name string, value string) error {
+	c.captureEgressBaseline()
+	if len(egressallowlist.SplitList(value)) == 0 && len(egressallowlist.SplitList(c.EgressAllowDomains)) > 0 {
+		return fmt.Errorf("%s annotation would clear egress-allow-ips while domains remain allowlisted, leaving no reachable DNS resolver (enable --%s to override)", name, flagAllowFlagOverride)
+	}
+	return checkEgressAllowlistNarrowing(c, name, value, c.egressAllowIPsBase, c.EgressAllowDomains, egressIPsSubset)
+}
+
+// checkEgressAllowlistNarrowing is the shared check behind
+// checkEgressAllowDomains and checkEgressAllowIPs: an OCI annotation may set
+// this dimension only if the operator configured no allowlist at all (turning
+// it on only restricts egress), or if value is a subset of base per subset.
+//
+// value is also rejected if both it and otherValue (the other dimension) are
+// empty, since clearing both would disable the filter and allow all egress.
+func checkEgressAllowlistNarrowing(c *Config, name, value, base, otherValue string, subset func(annCSV, baseCSV, name string) error) error {
+	if !c.egressAllowlistConfigured() {
+		return nil
+	}
+	if len(egressallowlist.SplitList(value)) == 0 && len(egressallowlist.SplitList(otherValue)) == 0 {
+		return fmt.Errorf("%s annotation would clear the egress allowlist and disable the filter (enable --%s to override)", name, flagAllowFlagOverride)
+	}
+	return subset(value, base, name)
+}
+
+// egressDomainsSubset returns an error unless every pattern in annCSV is covered
+// by some pattern in baseCSV (i.e. allows a subset of the base's egress).
+func egressDomainsSubset(annCSV, baseCSV, name string) error {
+	type pat struct {
+		suffix   string
+		wildcard bool
+	}
+	var base []pat
+	for _, raw := range egressallowlist.SplitList(baseCSV) {
+		s, w, err := egressallowlist.ParseDomainPattern(raw)
+		if err != nil {
+			return err
+		}
+		base = append(base, pat{s, w})
+	}
+	for _, raw := range egressallowlist.SplitList(annCSV) {
+		s, w, err := egressallowlist.ParseDomainPattern(raw)
+		if err != nil {
+			return err
+		}
+		covered := false
+		for _, b := range base {
+			if domainPatternCovered(s, w, b.suffix, b.wildcard) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return fmt.Errorf("%s annotation may only narrow the runtime-configured egress allowlist: domain %q is not within it (enable --%s to override)", name, raw, flagAllowFlagOverride)
+		}
+	}
+	return nil
+}
+
+// domainPatternCovered reports whether pattern (aSuffix,aWildcard) allows only
+// a subset of what (bSuffix,bWildcard) allows. An exact base covers only the
+// identical exact pattern. A "*." wildcard base covers exact names strictly
+// below it and wildcards at or below it (never the apex, matching the matcher).
+func domainPatternCovered(aSuffix string, aWildcard bool, bSuffix string, bWildcard bool) bool {
+	if !bWildcard {
+		return !aWildcard && aSuffix == bSuffix
+	}
+	if !aWildcard {
+		return strings.HasSuffix(aSuffix, "."+bSuffix)
+	}
+	return aSuffix == bSuffix || strings.HasSuffix(aSuffix, "."+bSuffix)
+}
+
+// egressIPsSubset returns an error unless every IP/CIDR in annCSV is contained
+// within some IP/CIDR in baseCSV.
+func egressIPsSubset(annCSV, baseCSV, name string) error {
+	var base []netip.Prefix
+	for _, raw := range egressallowlist.SplitList(baseCSV) {
+		p, err := egressallowlist.ParseIPEntry(raw)
+		if err != nil {
+			return err
+		}
+		base = append(base, p)
+	}
+	for _, raw := range egressallowlist.SplitList(annCSV) {
+		ap, err := egressallowlist.ParseIPEntry(raw)
+		if err != nil {
+			return fmt.Errorf("%s annotation: %w", name, err)
+		}
+		covered := false
+		for _, b := range base {
+			if b.Bits() <= ap.Bits() && b.Contains(ap.Addr()) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return fmt.Errorf("%s annotation may only narrow the runtime-configured egress IP allowlist: entry %q is not within it (enable --%s to override)", name, raw, flagAllowFlagOverride)
+		}
 	}
 	return nil
 }
