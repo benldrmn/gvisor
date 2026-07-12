@@ -17,6 +17,7 @@ go_library(
     ],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/egressallowlist",
         "//pkg/log",
         "//pkg/refs",
         "//pkg/sentry/devices/nvproxy/nvconf",
