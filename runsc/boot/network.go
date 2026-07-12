@@ -24,11 +24,13 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/egressallowlist"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/link/egressfilter"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
@@ -205,6 +207,17 @@ type CreateLinksAndRoutesArgs struct {
 
 	// IsRestore indicates whether this is part of a restore flow.
 	IsRestore bool
+
+	// EgressAllowDomains is a comma-separated list of domain patterns whose
+	// DNS-resolved addresses are allowed as egress destinations. See
+	// config.Config.EgressAllowDomains.
+	EgressAllowDomains string
+
+	// EgressAllowIPs is a comma-separated list of IPs/CIDRs allowed as egress
+	// destinations. See config.Config.EgressAllowIPs. When either egress
+	// allowlist field is non-empty, an egress filter is installed on every
+	// external NIC and all other egress is blocked.
+	EgressAllowIPs string
 }
 
 // InitPluginStackArgs are arguments to InitPluginStack.
@@ -303,6 +316,26 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 		return fmt.Errorf("args.FilePayload.Files has %d FDs but we need %d entries based on FDBasedLinks, XDPLinks, and PCAP", got, wantFDs)
 	}
 
+	// Build a single egress filter shared by every external NIC. It enforces a
+	// destination-IP allowlist and grows it by snooping DNS. A nil filter means
+	// the feature is off and NIC wrapping is skipped.
+	var egressFilter *egressfilter.Filter
+	if args.EgressAllowDomains != "" || args.EgressAllowIPs != "" {
+		domains := egressallowlist.SplitList(args.EgressAllowDomains)
+		ips := egressallowlist.SplitList(args.EgressAllowIPs)
+		var err error
+		egressFilter, err = egressfilter.NewFilter(egressfilter.Config{
+			Domains: domains,
+			IPs:     ips,
+			Clock:   n.Stack.Clock(),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create egress filter: %w", err)
+		}
+		log.Infof("Egress allowlist active: %d domain(s), %d IP(s), all other egress is blocked",
+			len(domains), len(ips))
+	}
+
 	nicids := make(map[string]tcpip.NICID)
 
 	// Collect routes from all links.
@@ -397,6 +430,12 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 				fdOffset++
 			} else if args.LogPackets {
 				linkEP = sniffer.New(linkEP)
+			}
+
+			// Install the egress filter below the qdisc and above the sniffer so
+			// it sees every outbound packet and drops before the pcap capture.
+			if egressFilter != nil {
+				linkEP = egressfilter.New(linkEP, egressFilter)
 			}
 
 			var qDisc stack.QueueingDiscipline
@@ -496,6 +535,12 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 			fdOffset++
 		} else if args.LogPackets {
 			linkEP = sniffer.New(linkEP)
+		}
+
+		// Install the egress filter below the qdisc and above the sniffer so it
+		// sees every outbound packet and drops before the pcap capture.
+		if egressFilter != nil {
+			linkEP = egressfilter.New(linkEP, egressFilter)
 		}
 
 		var qDisc stack.QueueingDiscipline
