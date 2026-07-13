@@ -24,8 +24,10 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -108,24 +110,17 @@ func TestEvaluateDecisionTable(t *testing.T) {
 func TestOnLinkControlTrafficExemptFromDestinationAllowlist(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9", "2001:db8::1"}})
 
-	igmp := make([]byte, header.IGMPMinimumSize)
-	header.IGMP(igmp).SetType(header.IGMPv2MembershipReport)
-
-	neighborSolicit := make([]byte, header.ICMPv6NeighborSolicitMinimumSize)
-	header.ICMPv6(neighborSolicit).SetType(header.ICMPv6NeighborSolicit)
-
-	mldReport := make([]byte, header.ICMPv6MinimumSize)
-	header.ICMPv6(mldReport).SetType(header.ICMPv6MulticastListenerV2Report)
-
 	for _, tc := range []struct {
 		name string
 		pkt  *stack.PacketBuffer
 		want verdict
 	}{
 		{"arp", ethARP(t, false), verdictAllow},
-		{"igmp", ethV4(t, [4]byte{224, 0, 0, 1}, uint8(header.IGMPProtocolNumber), igmp), verdictAllow},
-		{"neighbor discovery", ethV6(t, mustAddr(t, "ff02::1:ff00:1"), uint8(header.ICMPv6ProtocolNumber), neighborSolicit), verdictAllow},
-		{"multicast listener discovery", ethV6(t, mustAddr(t, "ff02::16"), uint8(header.ICMPv6ProtocolNumber), mldReport), verdictAllow},
+		{"igmp packet socket", validIGMPPacket(t, false), verdictAllow},
+		{"igmp raw socket", validIGMPPacket(t, true), verdictAllow},
+		{"neighbor discovery packet socket", validICMPv6ControlPacket(t, header.ICMPv6NeighborSolicit, false), verdictAllow},
+		{"neighbor discovery raw socket", validICMPv6ControlPacket(t, header.ICMPv6NeighborSolicit, true), verdictAllow},
+		{"multicast listener discovery", validICMPv6ControlPacket(t, header.ICMPv6MulticastListenerV2Report, false), verdictAllow},
 		{"multicast UDP data", ethV4(t, [4]byte{224, 0, 0, 1}, uint8(header.UDPProtocolNumber), nil), verdictDropNotAllowed},
 		{"link-local TCP data", ethV6(t, mustAddr(t, "fe80::1"), uint8(header.TCPProtocolNumber), nil), verdictDropNotAllowed},
 	} {
@@ -133,6 +128,87 @@ func TestOnLinkControlTrafficExemptFromDestinationAllowlist(t *testing.T) {
 			defer tc.pkt.DecRef()
 			if got := f.evaluate(tc.pkt).v; got != tc.want {
 				t.Errorf("evaluate = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMalformedControlTrafficNotExempt(t *testing.T) {
+	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
+	for _, tc := range []struct {
+		name   string
+		packet func(*testing.T, bool) *stack.PacketBuffer
+	}{
+		{
+			name: "oversized IGMP",
+			packet: func(t *testing.T, parsed bool) *stack.PacketBuffer {
+				return validIGMPPacket(t, parsed, maxControlPayloadSize)
+			},
+		},
+		{
+			name: "oversized ICMPv6",
+			packet: func(t *testing.T, parsed bool) *stack.PacketBuffer {
+				return validICMPv6ControlPacket(t, header.ICMPv6NeighborSolicit, parsed, maxControlPayloadSize)
+			},
+		},
+	} {
+		for _, parsed := range []bool{false, true} {
+			origin := "packet"
+			if parsed {
+				origin = "raw"
+			}
+			t.Run(tc.name+" "+origin, func(t *testing.T) {
+				pkt := tc.packet(t, parsed)
+				defer pkt.DecRef()
+				if got := f.evaluate(pkt).v; got == verdictAllow {
+					t.Fatal("malformed control packet was exempted")
+				}
+			})
+		}
+	}
+}
+
+func TestInvalidControlHeadersNotExempt(t *testing.T) {
+	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
+	for _, tc := range []struct {
+		name string
+		pkt  *stack.PacketBuffer
+	}{
+		{
+			name: "IGMP checksum",
+			pkt: func() *stack.PacketBuffer {
+				pkt := validIGMPPacket(t, false)
+				b, _ := pkt.Data().PullUp(pkt.Data().Size())
+				b[header.IPv4MinimumSize+2] ^= 1
+				return pkt
+			}(),
+		},
+		{
+			name: "NDP hop limit",
+			pkt: func() *stack.PacketBuffer {
+				pkt := validICMPv6ControlPacket(t, header.ICMPv6NeighborSolicit, false)
+				b, _ := pkt.Data().PullUp(pkt.Data().Size())
+				b[7]--
+				return pkt
+			}(),
+		},
+		{
+			name: "ICMPv6 code",
+			pkt: func() *stack.PacketBuffer {
+				pkt := validICMPv6ControlPacket(t, header.ICMPv6NeighborSolicit, false)
+				b, _ := pkt.Data().PullUp(pkt.Data().Size())
+				ip := header.IPv6(b)
+				icmp := header.ICMPv6(b[header.IPv6MinimumSize:])
+				icmp.SetCode(1)
+				icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{Header: icmp, Src: ip.SourceAddress(), Dst: ip.DestinationAddress()}))
+				return pkt
+			}(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer tc.pkt.DecRef()
+			if got := f.evaluate(tc.pkt).v; got == verdictAllow {
+				t.Fatal("invalid control packet was exempted")
 			}
 		})
 	}
@@ -226,10 +302,8 @@ func TestNeighborAdvertAllowedNetstackOrigin(t *testing.T) {
 	}
 }
 
-// TestNeighborAdvertPacketSocketTransportHeaderIgnored checks that for a
-// packet-socket-origin packet (empty NetworkHeader), icmpv6Type reads the type
-// from Data, not from a TransportHeader: a workload could otherwise forge a
-// TransportHeader claiming an allowed type to bypass the type check.
+// TestNeighborAdvertPacketSocketTransportHeaderIgnored checks that a forged
+// parsed transport header cannot override packet-socket data.
 func TestNeighborAdvertPacketSocketTransportHeaderIgnored(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	dst := mustAddr(t, "fe80::1")
@@ -476,6 +550,78 @@ func TestLearnSpoofWrongServerOrPort(t *testing.T) {
 	}
 }
 
+func TestInvalidDNSResponsePacketDoesNotLearn(t *testing.T) {
+	badIP := tcpip.AddrFrom4([4]byte{6, 6, 6, 6})
+	for _, tc := range []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{"IPv4 checksum", func(b []byte) { b[8] ^= 1 }},
+		{"UDP checksum", func(b []byte) { b[header.IPv4MinimumSize+6] ^= 1 }},
+		{"UDP length", func(b []byte) { binary.BigEndian.PutUint16(b[header.IPv4MinimumSize+4:], 7) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestFilter(t, Config{Domains: []string{"docs.github.com"}, IPs: []string{"8.8.8.8"}})
+			child := channel.New(4, 1500, "")
+			defer child.Close()
+			ep := New(child, f)
+
+			query := buildQuery(t, 1, "docs.github.com.", dnsmessage.TypeA)
+			qpkt := netstackV4UDP(t, [4]byte{8, 8, 8, 8}, 40000, dnsPort, query)
+			defer qpkt.DecRef()
+			var qlist stack.PacketBufferList
+			qlist.PushBack(qpkt)
+			ep.WritePackets(qlist)
+			child.Drain()
+
+			resp := buildResponse(t, 1, "docs.github.com.", []dnsmessage.Resource{
+				aResource(t, "docs.github.com.", [4]byte{6, 6, 6, 6}),
+			})
+			rpkt := inboundV4UDP(t, [4]byte{8, 8, 8, 8}, [4]byte{192, 168, 1, 2}, dnsPort, 40000, resp)
+			b, ok := rpkt.Data().PullUp(rpkt.Data().Size())
+			if !ok {
+				t.Fatal("PullUp failed")
+			}
+			tc.mutate(b)
+			ep.DeliverNetworkPacket(header.IPv4ProtocolNumber, rpkt)
+			rpkt.DecRef()
+			if f.learned.contains(badIP) {
+				t.Fatalf("learned from response with invalid %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestIPv6DNSFragmentHandling(t *testing.T) {
+	server := mustAddr(t, "2001:db8::53")
+	local := mustAddr(t, "2001:db8::1")
+	learned := tcpip.AddrFrom4([4]byte{1, 2, 3, 4})
+	for _, tc := range []struct {
+		name   string
+		more   bool
+		learns bool
+	}{
+		{"non-atomic", true, false},
+		{"atomic", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestFilter(t, Config{})
+			now := f.clock.NowMonotonic()
+			key := pendingKey{server: server, local: local, clientPort: 40000, txID: 1}
+			f.pending.track(key, "a.example.com", dnsmessage.TypeA, now, now.Add(queryTTL))
+			resp := buildResponse(t, 1, "a.example.com.", []dnsmessage.Resource{
+				aResource(t, "a.example.com.", [4]byte{1, 2, 3, 4}),
+			})
+			pkt := inboundV6FragmentedUDP(t, server, local, dnsPort, 40000, resp, tc.more)
+			f.snoopInbound(header.IPv6ProtocolNumber, pkt)
+			pkt.DecRef()
+			if got := f.learned.contains(learned); got != tc.learns {
+				t.Fatalf("learned = %t, want %t", got, tc.learns)
+			}
+		})
+	}
+}
+
 // --- DNS query handling ---
 
 // captureDispatcher records packets delivered up the stack, flattened so no
@@ -696,6 +842,77 @@ func ethV6(t *testing.T, dst tcpip.Address, nextHeader uint8, payload []byte) *s
 	return ethFrame(t, 0x86dd, buildV6(dst, nextHeader, payload), true)
 }
 
+func validIGMPPacket(t *testing.T, parsed bool, extra ...int) *stack.PacketBuffer {
+	size := header.IGMPMinimumSize
+	messageType := header.IGMPv2MembershipReport
+	if len(extra) != 0 {
+		size += extra[0]
+		messageType = header.IGMPv3MembershipReport
+	}
+	b := make([]byte, size)
+	igmp := header.IGMP(b)
+	igmp.SetType(messageType)
+	igmp.SetChecksum(header.IGMPCalculateChecksum(igmp))
+	ip := buildV4([4]byte{224, 0, 0, 22}, uint8(header.IGMPProtocolNumber), nil, b)
+	ipHeader := header.IPv4(ip)
+	ipHeader.SetTTL(header.IGMPTTL)
+	ipHeader.SetChecksum(^ipHeader.CalculateChecksum())
+	pkt := ethFrame(t, 0x0800, ip, true)
+	if parsed && !parse.IPv4(pkt) {
+		t.Fatal("parse.IPv4 failed")
+	}
+	return pkt
+}
+
+func validICMPv6ControlPacket(t *testing.T, messageType header.ICMPv6Type, parsed bool, extra ...int) *stack.PacketBuffer {
+	src := mustAddr(t, "fe80::2")
+	var dst tcpip.Address
+	var size int
+	var hopLimit uint8
+	var hbh bool
+	switch messageType {
+	case header.ICMPv6NeighborSolicit:
+		dst = mustAddr(t, "ff02::1:ff00:1")
+		size = header.ICMPv6NeighborSolicitMinimumSize
+		hopLimit = header.NDPHopLimit
+	case header.ICMPv6MulticastListenerV2Report:
+		dst = mustAddr(t, "ff02::16")
+		size = header.ICMPv6HeaderSize + header.MLDv2ReportMinimumSize
+		hopLimit = header.MLDHopLimit
+		hbh = true
+	default:
+		t.Fatalf("unsupported control type %d", messageType)
+	}
+	if len(extra) != 0 {
+		size += extra[0]
+	}
+	icmp := header.ICMPv6(make([]byte, size))
+	icmp.SetType(messageType)
+	icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{Header: icmp, Src: src, Dst: dst}))
+	next := uint8(header.ICMPv6ProtocolNumber)
+	payload := []byte(icmp)
+	if hbh {
+		next = uint8(header.IPv6HopByHopOptionsExtHdrIdentifier)
+		payload = append([]byte{uint8(header.ICMPv6ProtocolNumber), 0, 5, 2, 0, 0, 1, 0}, payload...)
+	}
+	b := make([]byte, header.IPv6MinimumSize+len(payload))
+	header.IPv6(b).Encode(&header.IPv6Fields{
+		PayloadLength:     uint16(len(payload)),
+		TransportProtocol: tcpip.TransportProtocolNumber(next),
+		HopLimit:          hopLimit,
+		SrcAddr:           src,
+		DstAddr:           dst,
+	})
+	copy(b[header.IPv6MinimumSize:], payload)
+	pkt := ethFrame(t, 0x86dd, b, true)
+	if parsed {
+		if _, _, _, _, ok := parse.IPv6(pkt); !ok {
+			t.Fatal("parse.IPv6 failed")
+		}
+	}
+	return pkt
+}
+
 // ethV4ICMPEcho builds an IPv4 ICMP echo request to dst.
 func ethV4ICMPEcho(t *testing.T, dst [4]byte) *stack.PacketBuffer {
 	icmp := make([]byte, header.ICMPv4MinimumSize)
@@ -769,13 +986,54 @@ func netstackV4UDP(t *testing.T, dst [4]byte, srcPort, dstPort uint16, payload [
 // packet is at the front of Data.
 func inboundV4UDP(t *testing.T, src, dst [4]byte, srcPort, dstPort uint16, payload []byte) *stack.PacketBuffer {
 	t.Helper()
-	udp := make([]byte, header.UDPMinimumSize)
-	binary.BigEndian.PutUint16(udp[0:2], srcPort)
-	binary.BigEndian.PutUint16(udp[2:4], dstPort)
-	binary.BigEndian.PutUint16(udp[4:6], uint16(header.UDPMinimumSize+len(payload)))
-	ip := buildV4(dst, uint8(header.UDPProtocolNumber), nil, append(udp, payload...))
+	udpBytes := make([]byte, header.UDPMinimumSize+len(payload))
+	udp := header.UDP(udpBytes)
+	udp.Encode(&header.UDPFields{SrcPort: srcPort, DstPort: dstPort, Length: uint16(len(udpBytes))})
+	copy(udpBytes[header.UDPMinimumSize:], payload)
+	srcAddr := tcpip.AddrFrom4(src)
+	dstAddr := tcpip.AddrFrom4(dst)
+	pseudo := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcAddr, dstAddr, uint16(len(udpBytes)))
+	udp.SetChecksum(^udp.CalculateChecksum(checksum.Checksum(payload, pseudo)))
+	if udp.Checksum() == 0 {
+		udp.SetChecksum(0xffff)
+	}
+	ip := buildV4(dst, uint8(header.UDPProtocolNumber), nil, udpBytes)
 	copy(ip[12:16], src[:]) // set source address
+	ipHeader := header.IPv4(ip)
+	ipHeader.SetChecksum(^ipHeader.CalculateChecksum())
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(ip)})
 	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
+	return pkt
+}
+
+func inboundV6FragmentedUDP(t *testing.T, src, dst tcpip.Address, srcPort, dstPort uint16, payload []byte, more bool) *stack.PacketBuffer {
+	t.Helper()
+	udpBytes := make([]byte, header.UDPMinimumSize+len(payload))
+	udp := header.UDP(udpBytes)
+	udp.Encode(&header.UDPFields{SrcPort: srcPort, DstPort: dstPort, Length: uint16(len(udpBytes))})
+	copy(udpBytes[header.UDPMinimumSize:], payload)
+	pseudo := header.PseudoHeaderChecksum(header.UDPProtocolNumber, src, dst, uint16(len(udpBytes)))
+	udp.SetChecksum(^udp.CalculateChecksum(checksum.Checksum(payload, pseudo)))
+	if udp.Checksum() == 0 {
+		udp.SetChecksum(0xffff)
+	}
+	fragment := make([]byte, 8)
+	fragment[0] = uint8(header.UDPProtocolNumber)
+	if more {
+		binary.BigEndian.PutUint16(fragment[2:4], 1)
+	}
+	b := make([]byte, header.IPv6MinimumSize+len(fragment)+len(udpBytes))
+	ip := header.IPv6(b)
+	ip.Encode(&header.IPv6Fields{
+		PayloadLength:     uint16(len(fragment) + len(udpBytes)),
+		TransportProtocol: tcpip.TransportProtocolNumber(header.IPv6FragmentExtHdrIdentifier),
+		HopLimit:          64,
+		SrcAddr:           src,
+		DstAddr:           dst,
+	})
+	copy(b[header.IPv6MinimumSize:], fragment)
+	copy(b[header.IPv6MinimumSize+len(fragment):], udpBytes)
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(b)})
+	pkt.NetworkProtocolNumber = header.IPv6ProtocolNumber
 	return pkt
 }
