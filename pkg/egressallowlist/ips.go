@@ -79,3 +79,29 @@ func ParseIPList(entries []string) ([]netip.Prefix, error) {
 	}
 	return out, nil
 }
+
+// IPListSubset reports whether every address or prefix in subset is contained
+// by an entry in superset. uncovered is the first entry that is not contained.
+func IPListSubset(subset, superset []string) (uncovered string, ok bool, err error) {
+	base, err := ParseIPList(superset)
+	if err != nil {
+		return "", false, err
+	}
+	for _, raw := range subset {
+		prefix, err := ParseIPEntry(raw)
+		if err != nil {
+			return "", false, err
+		}
+		covered := false
+		for _, candidate := range base {
+			if candidate.Bits() <= prefix.Bits() && candidate.Contains(prefix.Addr()) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return raw, false, nil
+		}
+	}
+	return "", true, nil
+}

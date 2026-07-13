@@ -50,17 +50,43 @@ func TestDomainMatcher(t *testing.T) {
 func TestDomainMatcherValidation(t *testing.T) {
 	longLabel := strings.Repeat("a", 64) + ".example.com"
 	longName := strings.Repeat("a.", 127) + "example.com"
-	bad := []string{"*", "*.", "*foo.example.com", "foo.*.example.com", "a..b", "münchen.de", "has space.com", "single", longLabel, longName}
+	bad := []string{"*", "*.", "*foo.example.com", "foo.*.example.com", "a..b", "münchen.de", "has space.com", longLabel, longName}
 	for _, p := range bad {
 		if _, err := NewDomainMatcher([]string{p}); err == nil {
 			t.Errorf("NewDomainMatcher(%q) accepted an invalid pattern", p)
 		}
 	}
-	good := []string{"docs.github.com", "*.github.com", "_dmarc.example.com", "a-b.example.com", "example.com."}
+	good := []string{"docs.github.com", "*.github.com", "_service.example.com", "a-b.example.com", "example.com.", "single", "*.internal", "*.com", "xn--literal"}
 	for _, p := range good {
 		if _, err := NewDomainMatcher([]string{p}); err != nil {
 			t.Errorf("NewDomainMatcher(%q) rejected a valid pattern: %v", p, err)
 		}
+	}
+}
+
+func TestDomainListSubset(t *testing.T) {
+	base := []string{"exact.example.com", "*.allowed.example"}
+	for _, tc := range []struct {
+		name   string
+		list   []string
+		within bool
+	}{
+		{"same exact", []string{"exact.example.com"}, true},
+		{"exact below wildcard", []string{"a.allowed.example"}, true},
+		{"narrower wildcard", []string{"*.a.allowed.example"}, true},
+		{"wildcard apex", []string{"allowed.example"}, false},
+		{"wildcard wider than exact", []string{"*.exact.example.com"}, false},
+		{"outside", []string{"other.example.com"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uncovered, got, err := DomainListSubset(tc.list, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.within {
+				t.Fatalf("DomainListSubset(%v, %v) = %t, uncovered %q, want %t", tc.list, base, got, uncovered, tc.within)
+			}
+		})
 	}
 }
 
@@ -148,6 +174,31 @@ func TestParseIPListCap(t *testing.T) {
 	}
 	if _, err := ParseIPList(dups); err != nil {
 		t.Errorf("ParseIPList with %d duplicates of one entry: %v", len(dups), err)
+	}
+}
+
+func TestIPListSubset(t *testing.T) {
+	base := []string{"10.0.0.0/8", "2001:db8::1"}
+	for _, tc := range []struct {
+		name   string
+		list   []string
+		within bool
+	}{
+		{"address in prefix", []string{"10.1.2.3"}, true},
+		{"narrower prefix", []string{"10.2.0.0/16"}, true},
+		{"same v6 address", []string{"2001:db8::1"}, true},
+		{"wider prefix", []string{"10.0.0.0/7"}, false},
+		{"outside", []string{"11.0.0.1"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uncovered, got, err := IPListSubset(tc.list, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.within {
+				t.Fatalf("IPListSubset(%v, %v) = %t, uncovered %q, want %t", tc.list, base, got, uncovered, tc.within)
+			}
+		})
 	}
 }
 

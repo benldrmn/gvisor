@@ -160,8 +160,8 @@ func asciiLower(s string) string {
 
 // ParseDomainPattern validates a single allowlist pattern and returns its
 // normalized suffix and whether it is a wildcard. It rejects bare "*",
-// misplaced wildcards, non-ASCII (IDNs must be supplied in punycode/A-label
-// form), and malformed labels.
+// misplaced wildcards, non-ASCII, and malformed labels. ASCII names beginning
+// with "xn--" are treated literally. This parser does not perform IDNA checks.
 func ParseDomainPattern(pattern string) (suffix string, wildcard bool, err error) {
 	p := NormalizeName(strings.TrimSpace(pattern))
 	if p == "" {
@@ -193,11 +193,7 @@ func validateDomainName(name, orig string) error {
 	if strings.Contains(name, "*") {
 		return fmt.Errorf("egress domain %q may only use a wildcard as the entire first label (e.g. *.example.com)", orig)
 	}
-	labels := strings.Split(name, ".")
-	if len(labels) < 2 {
-		return fmt.Errorf("egress domain %q must have at least two labels", orig)
-	}
-	for _, label := range labels {
+	for _, label := range strings.Split(name, ".") {
 		if err := validateLabel(label, orig); err != nil {
 			return err
 		}
@@ -205,9 +201,8 @@ func validateDomainName(name, orig string) error {
 	return nil
 }
 
-// validateLabel checks a single DNS label. Underscores are permitted because
-// real queries contain them (_dmarc, _acme-challenge, SRV records, etc.).
-// Non-ASCII is rejected because on-wire QNAMEs are always punycode.
+// validateLabel checks a single DNS label. Underscores are accepted as literal
+// on-wire DNS characters. Non-ASCII configuration strings are rejected.
 func validateLabel(label, orig string) error {
 	if label == "" {
 		return fmt.Errorf("egress domain %q has an empty label", orig)
@@ -222,10 +217,54 @@ func validateLabel(label, orig string) error {
 		case c >= '0' && c <= '9':
 		case c == '-' || c == '_':
 		case c >= 0x80:
-			return fmt.Errorf("egress domain %q must be ASCII (supply the punycode/A-label form)", orig)
+			return fmt.Errorf("egress domain %q must be ASCII", orig)
 		default:
 			return fmt.Errorf("egress domain %q contains an invalid character %q", orig, string(rune(c)))
 		}
 	}
 	return nil
+}
+
+// DomainListSubset reports whether every pattern in subset is covered by a
+// pattern in superset. uncovered is the first pattern that is not covered.
+func DomainListSubset(subset, superset []string) (uncovered string, ok bool, err error) {
+	type pattern struct {
+		suffix   string
+		wildcard bool
+	}
+	base := make([]pattern, 0, len(superset))
+	for _, raw := range superset {
+		suffix, wildcard, err := ParseDomainPattern(raw)
+		if err != nil {
+			return "", false, err
+		}
+		base = append(base, pattern{suffix: suffix, wildcard: wildcard})
+	}
+	for _, raw := range subset {
+		suffix, wildcard, err := ParseDomainPattern(raw)
+		if err != nil {
+			return "", false, err
+		}
+		covered := false
+		for _, candidate := range base {
+			if domainPatternCovered(suffix, wildcard, candidate.suffix, candidate.wildcard) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return raw, false, nil
+		}
+	}
+	return "", true, nil
+}
+
+func domainPatternCovered(suffix string, wildcard bool, baseSuffix string, baseWildcard bool) bool {
+	if !baseWildcard {
+		return !wildcard && suffix == baseSuffix
+	}
+	if !wildcard {
+		return strings.HasSuffix(suffix, "."+baseSuffix)
+	}
+	return suffix == baseSuffix || strings.HasSuffix(suffix, "."+baseSuffix)
 }
