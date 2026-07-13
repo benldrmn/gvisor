@@ -160,7 +160,7 @@ Offload (GSO) to run with a kernel that is newer than 3.17. Add the
 }
 ```
 
-## DNS-based egress allowlist {#egress-allowlist}
+## DNS-derived destination-IP allowlist {#egress-allowlist}
 
 When using the netstack network stack (`--network=sandbox`, the default), the
 Sentry can enforce a destination allowlist on all outbound traffic. You specify
@@ -200,8 +200,10 @@ Two flags control it, and the allowlist becomes active when either is non-empty:
     exact name like `docs.github.com` matches only that name. A wildcard like
     `*.github.com` matches subdomains at any depth (`a.github.com`,
     `a.b.github.com`) but **not** the bare `github.com`. List the apex
-    separately if you need it. Matching is case-insensitive. Supply
-    internationalized names in punycode (A-label) form.
+    separately if you need it. This is an application-level, any-depth suffix
+    match. It does not implement authoritative-DNS wildcard synthesis or stop at
+    DNS zone cuts. Matching is case-insensitive. Patterns are ASCII wire names.
+    an `xn--` label is matched literally and is not IDNA-validated.
 *   `--egress-allow-ips` is a comma-separated list of IPs and CIDRs (IPv4 and
     IPv6). A listed address is allowed on **all** ports and protocols.
 *   Each list is capped at 1024 distinct entries after normalization and
@@ -243,16 +245,41 @@ container author cannot weaken the operator's policy:
 This mirrors how the `--qdisc-tbf-rate`/`--qdisc-tbf-burst` annotations may only
 lower the configured rate limit.
 
+### Threat model {#egress-threat-model}
+
+Enforcement is by destination IP, not by HTTP host or TLS SNI. Once an address
+is learned, every service at that address is reachable, including unrelated
+virtual hosts on a shared CDN IP. Wildcards should therefore be reviewed as IP
+authorization boundaries: `*.example.com` also covers names below delegated
+zone cuts, and a multi-tenant suffix such as `*.github.io` covers every tenant.
+Single-label and broad suffix patterns are accepted because DNS syntax alone
+cannot identify administrative boundaries.
+
+The configured resolver is trusted. It can authorize any address in a response
+for an allowed name. Its statically allowed IP is also reachable on every port
+and protocol, and queries for names outside the domain list still reach it, so
+this feature is not a complete data-exfiltration boundary against a workload
+that can communicate through the resolver.
+
+The default deployment assumes a sandbox-owned address and veth with a trusted
+resolver. Link-local ARP, IGMP, NDP, and MLD needed to operate that link are
+outside the destination policy. Their exemptions are protocol-validated and
+size-bounded, but deployments that put mutually untrusted tenants on one L2
+segment should not treat the allowlist as the only isolation boundary.
+
 ### Limitations {#egress-limitations}
 
 *   Only plain UDP DNS (port 53) is snooped. DNS-over-HTTPS/TLS/QUIC and
-    DNS-over-TCP (including the TC-bit truncation fallback) are not observed,
-    so their resolved addresses are never learned. A response fragmented at the
+    DNS-over-TCP are not observed. Records parsed before the end of a TC-marked
+    UDP response are learned best-effort, but addresses returned only by the TCP
+    retry are not learned. A response fragmented at the
     IP layer (a large EDNS0 answer) is not reassembled for snooping either, so
     its addresses are not learned. Disable encrypted DNS in the workload, or
     list target IPs statically.
 *   Only A/AAAA answers grow the learned set. Other query types (MX, TXT,
-    PTR, etc.) resolve normally but grant no egress.
+    PTR, SRV, etc.) resolve normally but grant no egress. In particular, SRV
+    target addresses present only as additional-section glue are not learned.
+    the client must issue a separate A/AAAA query for the target.
 *   A resolver reachable only over loopback (`127.0.0.53` systemd-resolved,
     `127.0.0.11` Docker) is not snooped, because loopback traffic is not
     filtered. DNS will appear to work but no addresses will be learned.
@@ -265,11 +292,10 @@ lower the configured rate limit.
     are never learned and connections to them are dropped. Resolve allowed
     domains through the normal resolver path, or list their addresses in
     `--egress-allow-ips`.
-*   The allowlist trusts the resolver: an allowed resolver can map an allowed
-    domain to any address. The query/response pinning (server IP, client port,
-    transaction ID, and question name) defends only against off-path spoofers.
 *   Learned addresses are not expired (no TTL honoring) and are lost across
-    checkpoint/restore. The static allowlist is re-derived from the flags of the
+    checkpoint/restore. TTL 0 answers therefore remain authorized for the
+    sandbox lifetime, and reassignment of a domain or address does not revoke a
+    stale authorization. The static allowlist is re-derived from the flags of the
     `runsc restore` invocation, so it reflects whatever policy that invocation
     sets, not necessarily the one active at checkpoint time. A connection that
     was established to a learned address before checkpoint is dropped after
@@ -282,10 +308,8 @@ lower the configured rate limit.
     behavior. Control traffic needed to operate the link (ARP, IPv6 neighbor
     discovery, IGMP/MLD) is exempt from the allowlist, but only to link-local
     destinations (`fe80::/10`, `ff02::/16`, `224.0.0.0/24`) and only for
-    specific message types, with source-routing and IPv6 Router
-    Advertisement/Redirect dropped. A link-local destination is never routed off
-    the local segment, so this exemption cannot reach a destination off the
-    allowlist, whatever socket produced the packet. Global-scope multicast and
+    specific valid, size-bounded message shapes, with source-routing and IPv6
+    Router Advertisement/Redirect dropped. Global-scope multicast and
     legacy IGMPv2/MLDv1 reports addressed to their own group are not exempt;
     allowlist those group addresses if a workload needs them. A destination
     reached by tunneling or proxying through an allowlisted peer is likewise the

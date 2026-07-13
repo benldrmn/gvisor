@@ -19,7 +19,6 @@ package config
 
 import (
 	"fmt"
-	"net/netip"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -656,77 +655,25 @@ func checkEgressAllowlistNarrowing(c *Config, name, value, base, otherValue stri
 // egressDomainsSubset returns an error unless every pattern in annCSV is covered
 // by some pattern in baseCSV (i.e. allows a subset of the base's egress).
 func egressDomainsSubset(annCSV, baseCSV, name string) error {
-	type pat struct {
-		suffix   string
-		wildcard bool
+	uncovered, ok, err := egressallowlist.DomainListSubset(egressallowlist.SplitList(annCSV), egressallowlist.SplitList(baseCSV))
+	if err != nil {
+		return err
 	}
-	var base []pat
-	for _, raw := range egressallowlist.SplitList(baseCSV) {
-		s, w, err := egressallowlist.ParseDomainPattern(raw)
-		if err != nil {
-			return err
-		}
-		base = append(base, pat{s, w})
-	}
-	for _, raw := range egressallowlist.SplitList(annCSV) {
-		s, w, err := egressallowlist.ParseDomainPattern(raw)
-		if err != nil {
-			return err
-		}
-		covered := false
-		for _, b := range base {
-			if domainPatternCovered(s, w, b.suffix, b.wildcard) {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			return fmt.Errorf("%s annotation may only narrow the runtime-configured egress allowlist: domain %q is not within it (enable --%s to override)", name, raw, flagAllowFlagOverride)
-		}
+	if !ok {
+		return fmt.Errorf("%s annotation may only narrow the runtime-configured egress allowlist: domain %q is not within it (enable --%s to override)", name, uncovered, flagAllowFlagOverride)
 	}
 	return nil
-}
-
-// domainPatternCovered reports whether pattern (aSuffix,aWildcard) allows only
-// a subset of what (bSuffix,bWildcard) allows. An exact base covers only the
-// identical exact pattern. A "*." wildcard base covers exact names strictly
-// below it and wildcards at or below it (never the apex, matching the matcher).
-func domainPatternCovered(aSuffix string, aWildcard bool, bSuffix string, bWildcard bool) bool {
-	if !bWildcard {
-		return !aWildcard && aSuffix == bSuffix
-	}
-	if !aWildcard {
-		return strings.HasSuffix(aSuffix, "."+bSuffix)
-	}
-	return aSuffix == bSuffix || strings.HasSuffix(aSuffix, "."+bSuffix)
 }
 
 // egressIPsSubset returns an error unless every IP/CIDR in annCSV is contained
 // within some IP/CIDR in baseCSV.
 func egressIPsSubset(annCSV, baseCSV, name string) error {
-	var base []netip.Prefix
-	for _, raw := range egressallowlist.SplitList(baseCSV) {
-		p, err := egressallowlist.ParseIPEntry(raw)
-		if err != nil {
-			return err
-		}
-		base = append(base, p)
+	uncovered, ok, err := egressallowlist.IPListSubset(egressallowlist.SplitList(annCSV), egressallowlist.SplitList(baseCSV))
+	if err != nil {
+		return fmt.Errorf("%s annotation: %w", name, err)
 	}
-	for _, raw := range egressallowlist.SplitList(annCSV) {
-		ap, err := egressallowlist.ParseIPEntry(raw)
-		if err != nil {
-			return fmt.Errorf("%s annotation: %w", name, err)
-		}
-		covered := false
-		for _, b := range base {
-			if b.Bits() <= ap.Bits() && b.Contains(ap.Addr()) {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			return fmt.Errorf("%s annotation may only narrow the runtime-configured egress IP allowlist: entry %q is not within it (enable --%s to override)", name, raw, flagAllowFlagOverride)
-		}
+	if !ok {
+		return fmt.Errorf("%s annotation may only narrow the runtime-configured egress IP allowlist: entry %q is not within it (enable --%s to override)", name, uncovered, flagAllowFlagOverride)
 	}
 	return nil
 }
