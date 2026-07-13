@@ -15,6 +15,7 @@
 package egressfilter
 
 import (
+	"net/netip"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -34,12 +35,15 @@ const dnsPort = 53
 // maxCNAMEChain bounds how deep a CNAME chain the harvester follows.
 const maxCNAMEChain = 16
 
-// pendingKey identifies an in-flight DNS query. Pinning all three fields raises
+// pendingKey identifies an in-flight DNS query. Pinning all four fields raises
 // the bar for off-path response spoofing to that of a normal resolver.
 type pendingKey struct {
 	// server is the DNS server address (destination of the query, source of the
 	// response).
 	server tcpip.Address
+	// local is the query's source address (response destination address). A
+	// Filter may be shared by multiple NICs, so the UDP port is not sufficient.
+	local tcpip.Address
 	// clientPort is the workload's UDP source port.
 	clientPort uint16
 	// txID is the DNS transaction ID.
@@ -48,6 +52,7 @@ type pendingKey struct {
 
 type pendingEntry struct {
 	qName  string
+	qType  dnsmessage.Type
 	expiry tcpip.MonotonicTime
 }
 
@@ -108,7 +113,7 @@ func (t *pendingTable) maybeSweep(now tcpip.MonotonicTime) {
 // track records a pending query. It returns true if the entry was inserted
 // (or refreshed), false if the table was full. now is the current monotonic
 // time. Expired entries are swept lazily on a full table.
-func (t *pendingTable) track(key pendingKey, qName string, now, expiry tcpip.MonotonicTime) bool {
+func (t *pendingTable) track(key pendingKey, qName string, qType dnsmessage.Type, now, expiry tcpip.MonotonicTime) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	_, existing := t.m[key]
@@ -118,23 +123,23 @@ func (t *pendingTable) track(key pendingKey, qName string, now, expiry tcpip.Mon
 			return false
 		}
 	}
-	t.m[key] = pendingEntry{qName: qName, expiry: expiry}
+	t.m[key] = pendingEntry{qName: qName, qType: qType, expiry: expiry}
 	if !existing {
 		t.count.Add(1)
 	}
 	return true
 }
 
-// consume removes the entry matching both key and qName, reporting whether it
+// consume removes the entry matching key, qName, and qType, reporting whether it
 // was present and live (non-expired). An entry whose name does not match is
 // left in place: an off-path spoofer who guesses the key but not the query
 // name must not be able to evict the entry before the genuine response
 // arrives.
-func (t *pendingTable) consume(key pendingKey, qName string, now tcpip.MonotonicTime) bool {
+func (t *pendingTable) consume(key pendingKey, qName string, qType dnsmessage.Type, now tcpip.MonotonicTime) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, present := t.m[key]
-	if !present || e.qName != qName {
+	if !present || e.qName != qName || e.qType != qType {
 		return false
 	}
 	delete(t.m, key)
@@ -168,33 +173,25 @@ func (f *Filter) trackDNSQuery(pkt *stack.PacketBuffer, dst tcpip.Address, l4pro
 	if udp.DestinationPort() != dnsPort {
 		return
 	}
-	payload := dataBytes(pkt.Data())
-	if payload == nil {
+	sz := pkt.Data().Size()
+	if sz == 0 {
 		return
 	}
-	qName, txID, ok := parseDNSQuery(payload)
+	payload, ok := pkt.Data().PullUp(sz)
+	if !ok {
+		return
+	}
+	qName, qType, txID, ok := parseDNSQuery(payload)
 	if !ok || !f.domains.Match(qName) {
 		return
 	}
+	local := networkSrc(pkt.NetworkProtocolNumber, pkt.NetworkHeader().Slice())
+	if local.Len() == 0 {
+		return
+	}
 	now := f.clock.NowMonotonic()
-	key := pendingKey{server: dst, clientPort: udp.SourcePort(), txID: txID}
-	f.pending.track(key, qName, now, now.Add(queryTTL))
-}
-
-// dataBytes returns a copy of the packet data so callers never retain a view
-// into the live buffer. It returns nil for empty data.
-func dataBytes(data stack.PacketData) []byte {
-	sz := data.Size()
-	if sz == 0 {
-		return nil
-	}
-	buf, ok := data.PullUp(sz)
-	if !ok {
-		return nil
-	}
-	out := make([]byte, len(buf))
-	copy(out, buf)
-	return out
+	key := pendingKey{server: dst, local: local, clientPort: udp.SourcePort(), txID: txID}
+	f.pending.track(key, qName, qType, now, now.Add(queryTTL))
 }
 
 // snoopInbound inspects an inbound packet for a DNS response matching a pending
@@ -220,6 +217,9 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 			return
 		}
 		ipHdr := header.IPv4(clone.NetworkHeader().Slice())
+		if !clone.RXChecksumValidated && !ipHdr.IsChecksumValid() {
+			return
+		}
 		// A fragmented response is not reassembled here, so its payload cannot be
 		// read as DNS; skip it. The address is simply not learned (fail closed).
 		if ipHdr.FragmentOffset() != 0 || ipHdr.Flags()&header.IPv4FlagMoreFragments != 0 {
@@ -227,9 +227,16 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		}
 		l4 = tcpip.TransportProtocolNumber(ipHdr.Protocol())
 	case header.IPv6ProtocolNumber:
-		var ok bool
-		l4, _, _, _, ok = parse.IPv6(clone)
+		var (
+			fragOffset uint16
+			fragMore   bool
+			ok         bool
+		)
+		l4, _, fragOffset, fragMore, ok = parse.IPv6(clone)
 		if !ok {
+			return
+		}
+		if fragOffset != 0 || fragMore {
 			return
 		}
 	}
@@ -245,7 +252,20 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 	}
 
 	src := networkSrc(protocol, clone.NetworkHeader().Slice())
-	if src.Len() == 0 {
+	dst := networkDst(protocol, clone.NetworkHeader().Slice())
+	if src.Len() == 0 || dst.Len() == 0 || clone.Data().Size() > int(^uint16(0)) {
+		return
+	}
+	lengthValid, checksumValid := header.UDPValid(
+		udp,
+		func() uint16 { return clone.Data().Checksum() },
+		uint16(clone.Data().Size()),
+		protocol,
+		src,
+		dst,
+		clone.RXChecksumValidated,
+	)
+	if !lengthValid || !checksumValid {
 		return
 	}
 
@@ -265,13 +285,13 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		return
 	}
 
-	f.learnFromResponse(payload, src, udp.DestinationPort())
+	f.learnFromResponse(payload, src, dst, udp.DestinationPort())
 }
 
 // learnFromResponse parses a DNS response, verifies it against a pending query,
 // and adds any learned addresses to the learned set. server/clientPort are read
 // from the packet. The transaction ID and question come from the payload.
-func (f *Filter) learnFromResponse(payload []byte, server tcpip.Address, clientPort uint16) {
+func (f *Filter) learnFromResponse(payload []byte, server, local tcpip.Address, clientPort uint16) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(payload)
 	if err != nil {
@@ -291,9 +311,12 @@ func (f *Filter) learnFromResponse(payload []byte, server tcpip.Address, clientP
 		return
 	}
 	qName := egressallowlist.NormalizeName(q.Name.String())
+	if q.Class != dnsmessage.ClassINET || (q.Type != dnsmessage.TypeA && q.Type != dnsmessage.TypeAAAA) {
+		return
+	}
 
-	key := pendingKey{server: server, clientPort: clientPort, txID: hdr.ID}
-	if !f.pending.consume(key, qName, f.clock.NowMonotonic()) {
+	key := pendingKey{server: server, local: local, clientPort: clientPort, txID: hdr.ID}
+	if !f.pending.consume(key, qName, q.Type, f.clock.NowMonotonic()) {
 		return
 	}
 	if hdr.RCode != dnsmessage.RCodeSuccess {
@@ -331,6 +354,12 @@ answers:
 			// Includes ErrSectionDone.
 			break
 		}
+		if h.Class != dnsmessage.ClassINET {
+			if err := p.SkipAnswer(); err != nil {
+				break
+			}
+			continue
+		}
 		owner := egressallowlist.NormalizeName(h.Name.String())
 		switch h.Type {
 		case dnsmessage.TypeA:
@@ -344,7 +373,7 @@ answers:
 			if err != nil {
 				break answers
 			}
-			addrs[owner] = append(addrs[owner], tcpip.AddrFrom16(r.AAAA))
+			addrs[owner] = append(addrs[owner], netipToAddr(netip.AddrFrom16(r.AAAA)))
 		case dnsmessage.TypeCNAME:
 			r, err := p.CNAMEResource()
 			if err != nil {
@@ -387,29 +416,29 @@ answers:
 // a DNS query. It requires a single question of class IN and type A or AAAA,
 // the only kind that can yield learnable addresses. ok is false on any
 // malformation.
-func parseDNSQuery(payload []byte) (qName string, txID uint16, ok bool) {
+func parseDNSQuery(payload []byte) (qName string, qType dnsmessage.Type, txID uint16, ok bool) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(payload)
 	if err != nil {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	if hdr.Response || hdr.OpCode != 0 {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	q, err := p.Question()
 	if err != nil {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	if _, err := p.Question(); err != dnsmessage.ErrSectionDone {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	if q.Class != dnsmessage.ClassINET {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	if q.Type != dnsmessage.TypeA && q.Type != dnsmessage.TypeAAAA {
-		return "", 0, false
+		return "", 0, 0, false
 	}
-	return egressallowlist.NormalizeName(q.Name.String()), hdr.ID, true
+	return egressallowlist.NormalizeName(q.Name.String()), q.Type, hdr.ID, true
 }
 
 // networkSrc returns the source address from a parsed network header.
@@ -425,6 +454,21 @@ func networkSrc(protocol tcpip.NetworkProtocolNumber, netHdr []byte) tcpip.Addre
 			return tcpip.Address{}
 		}
 		return header.IPv6(netHdr).SourceAddress()
+	}
+	return tcpip.Address{}
+}
+
+// networkDst returns the destination address from a parsed network header.
+func networkDst(protocol tcpip.NetworkProtocolNumber, netHdr []byte) tcpip.Address {
+	switch protocol {
+	case header.IPv4ProtocolNumber:
+		if len(netHdr) >= header.IPv4MinimumSize {
+			return header.IPv4(netHdr).DestinationAddress()
+		}
+	case header.IPv6ProtocolNumber:
+		if len(netHdr) >= header.IPv6MinimumSize {
+			return header.IPv6(netHdr).DestinationAddress()
+		}
 	}
 	return tcpip.Address{}
 }

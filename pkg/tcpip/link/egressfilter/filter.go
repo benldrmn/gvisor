@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -51,6 +52,8 @@ const (
 // maxIPv6ExtHdrs bounds how many IPv6 extension headers evalV6 will walk before
 // giving up (and dropping). Legitimate egress never chains this many.
 const maxIPv6ExtHdrs = 8
+
+const maxControlPayloadSize = 1280
 
 // dropLogger rate-limits the "dropped a packet" log line so a chatty workload
 // cannot flood the sandbox log. Mirrors the martian-packet logger in
@@ -320,7 +323,7 @@ func (f *Filter) evalV4(pkt *stack.PacketBuffer) egressResult {
 	// reach a disallowed destination. IGMPv3 (the netstack default) uses this
 	// block. A legacy IGMPv2 report addressed to its own group is not exempt and
 	// must be allowlisted.
-	if proto == uint8(header.IGMPProtocolNumber) && header.IsV4LinkLocalMulticastAddress(dst) {
+	if proto == uint8(header.IGMPProtocolNumber) && header.IsV4LinkLocalMulticastAddress(dst) && f.igmpValid(pkt, h, ihl) {
 		return egressResult{v: verdictAllow, dst: dst, l4proto: proto}
 	}
 	return egressResult{v: verdictDropNotAllowed, dst: dst, l4proto: proto}
@@ -368,7 +371,8 @@ func (f *Filter) evalV6(pkt *stack.PacketBuffer) egressResult {
 	}
 	if routingSeen {
 		// A Routing extension header (RH0/SRH) can redirect a packet with an
-		// allowed destination onward to a blocked one.
+		// allowed destination onward to a blocked one. RFC 5095 section 4.2
+		// permits type-specific handling. This policy deliberately drops all types.
 		return egressResult{v: verdictDropProto}
 	}
 
@@ -385,28 +389,61 @@ func (f *Filter) evalV6(pkt *stack.PacketBuffer) egressResult {
 	if upper == uint8(header.ICMPv6ProtocolNumber) &&
 		(header.IsV6LinkLocalMulticastAddress(dst) || header.IsV6LinkLocalUnicastAddress(dst)) &&
 		(nh == uint8(header.ICMPv6ProtocolNumber) || hbhOnly) {
-		if t, ok := f.icmpv6Type(pkt, upperOffset); ok && icmpv6ControlAllowed(t) {
+		if f.icmpv6ControlValid(pkt, h, upperOffset, hbhOnly) {
 			return egressResult{v: verdictAllow, dst: dst, l4proto: upper}
 		}
 	}
 	return egressResult{v: verdictDropNotAllowed, dst: dst, l4proto: upper}
 }
 
-// icmpv6ControlAllowed reports whether an ICMPv6 type is permitted NDP/MLD
-// control traffic. Router Advertisement (134) and Redirect (137) are excluded:
-// a sandbox is a host, and emitting those is an attack on the local link.
-func icmpv6ControlAllowed(t header.ICMPv6Type) bool {
-	switch t {
-	case header.ICMPv6RouterSolicit, // 133
-		header.ICMPv6NeighborSolicit,           // 135
-		header.ICMPv6NeighborAdvert,            // 136
-		header.ICMPv6MulticastListenerQuery,    // 130
-		header.ICMPv6MulticastListenerReport,   // 131
-		header.ICMPv6MulticastListenerDone,     // 132
-		header.ICMPv6MulticastListenerV2Report: // 143
-		return true
+func (f *Filter) igmpValid(pkt *stack.PacketBuffer, ip header.IPv4, offset int) bool {
+	if ip.TTL() != header.IGMPTTL || !ip.IsChecksumValid() || int(ip.TotalLength()) != pkt.Size()-len(pkt.LinkHeader().Slice()) {
+		return false
 	}
-	return false
+	b, ok := f.controlPayload(pkt, offset)
+	if !ok || len(b) < header.IGMPMinimumSize || checksum.Checksum(b, 0) != 0xffff {
+		return false
+	}
+	switch header.IGMP(b).Type() {
+	case header.IGMPv1MembershipReport, header.IGMPv2MembershipReport, header.IGMPLeaveGroup:
+		return len(b) == header.IGMPMinimumSize
+	case header.IGMPv3MembershipReport:
+		return len(b) >= header.IGMPMinimumSize
+	default:
+		return false
+	}
+}
+
+func (f *Filter) icmpv6ControlValid(pkt *stack.PacketBuffer, ip header.IPv6, offset int, hbhOnly bool) bool {
+	if int(ip.PayloadLength())+header.IPv6MinimumSize != pkt.Size()-len(pkt.LinkHeader().Slice()) {
+		return false
+	}
+	b, ok := f.controlPayload(pkt, offset)
+	if !ok || len(b) < header.ICMPv6MinimumSize {
+		return false
+	}
+	icmp := header.ICMPv6(b)
+	if icmp.Code() != 0 || icmp.Checksum() != header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header: icmp,
+		Src:    ip.SourceAddress(),
+		Dst:    ip.DestinationAddress(),
+	}) {
+		return false
+	}
+	switch icmp.Type() {
+	case header.ICMPv6RouterSolicit:
+		return ip.HopLimit() == header.NDPHopLimit && len(b) >= header.ICMPv6HeaderSize+header.NDPRSMinimumSize
+	case header.ICMPv6NeighborSolicit:
+		return ip.HopLimit() == header.NDPHopLimit && len(b) >= header.ICMPv6NeighborSolicitMinimumSize
+	case header.ICMPv6NeighborAdvert:
+		return ip.HopLimit() == header.NDPHopLimit && len(b) >= header.ICMPv6NeighborAdvertMinimumSize
+	case header.ICMPv6MulticastListenerQuery, header.ICMPv6MulticastListenerReport, header.ICMPv6MulticastListenerDone:
+		return hbhOnly && ip.HopLimit() == header.MLDHopLimit && len(b) >= header.ICMPv6HeaderSize+header.MLDMinimumSize
+	case header.ICMPv6MulticastListenerV2Report:
+		return hbhOnly && ip.HopLimit() == header.MLDHopLimit && len(b) >= header.ICMPv6HeaderSize+header.MLDv2ReportMinimumSize
+	default:
+		return false
+	}
 }
 
 // walkV6ExtHdrs walks the IPv6 extension-header chain starting at nextHeader,
@@ -515,23 +552,42 @@ func (f *Filter) extHdrAt(pkt *stack.PacketBuffer, offset, n int) ([]byte, bool)
 	return b[dataOff : dataOff+n], true
 }
 
-// icmpv6Type reads the ICMPv6 message type byte at offset from the start of the
-// network layer. Netstack places most self-generated control messages (NS, RS,
-// MLD) in Data, but builds Neighbor Advertisement with the message in the parsed
-// TransportHeader and Data empty. The TransportHeader is only consulted when a
-// NetworkHeader was parsed, so a packet-socket packet (which has neither) cannot
-// use it to smuggle a type byte past the Data read.
-func (f *Filter) icmpv6Type(pkt *stack.PacketBuffer, offset int) (header.ICMPv6Type, bool) {
-	if len(pkt.NetworkHeader().Slice()) != 0 {
-		if th := pkt.TransportHeader().Slice(); len(th) > 0 {
-			return header.ICMPv6Type(th[0]), true
+func (f *Filter) controlPayload(pkt *stack.PacketBuffer, offset int) ([]byte, bool) {
+	nh := pkt.NetworkHeader().Slice()
+	if len(nh) == 0 {
+		if offset > pkt.Data().Size() || pkt.Data().Size()-offset > maxControlPayloadSize {
+			return nil, false
 		}
+		b, ok := pkt.Data().PullUp(pkt.Data().Size())
+		if !ok {
+			return nil, false
+		}
+		return b[offset:], true
 	}
-	t, ok := f.extHdrAt(pkt, offset, 1)
+	if th := pkt.TransportHeader().Slice(); len(th) != 0 {
+		if len(th)+pkt.Data().Size() > maxControlPayloadSize {
+			return nil, false
+		}
+		if pkt.Data().Size() == 0 {
+			return th, true
+		}
+		data, ok := pkt.Data().PullUp(pkt.Data().Size())
+		if !ok {
+			return nil, false
+		}
+		b := make([]byte, 0, len(th)+len(data))
+		b = append(b, th...)
+		return append(b, data...), true
+	}
+	dataOffset := offset - len(nh)
+	if dataOffset < 0 || dataOffset > pkt.Data().Size() || pkt.Data().Size()-dataOffset > maxControlPayloadSize {
+		return nil, false
+	}
+	b, ok := pkt.Data().PullUp(pkt.Data().Size())
 	if !ok {
-		return 0, false
+		return nil, false
 	}
-	return header.ICMPv6Type(t[0]), true
+	return b[dataOffset:], true
 }
 
 // learnedSet is the dynamic, grow-only set of destination addresses learned
