@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/egressallowlist"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -44,6 +45,8 @@ const (
 	flagAllowFlagOverride       = "allow-flag-override"
 	flagPauseExternalNetworking = "pause-external-networking"
 	flagAllowConnectedOnSave    = "allow-connected-on-save"
+	flagEgressAllowDomains      = "egress-allow-domains"
+	flagEgressAllowIPs          = "egress-allow-ips"
 	flagQDisc                   = "qdisc"
 	flagQDiscTBFRate            = "qdisc-tbf-rate"
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
@@ -172,6 +175,8 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool(flagNetDisconnectOK, true, "Indicates whether open network connections and open unix domain sockets should be disconnected upon save.")
 	flagSet.Bool(flagPauseExternalNetworking, false, "Start the sandbox with external networking disabled. Only supported when using the sandbox network type. The network can be unpaused manually after the sandbox is running.")
 	flagSet.Bool(flagAllowConnectedOnSave, false, "Allow network connections to stay established on save.")
+	flagSet.String(flagEgressAllowDomains, "", fmt.Sprintf("comma-separated egress allowlist of domain patterns, e.g. \"docs.github.com,*.github.com\", whose addresses learned from plain UDP DNS the sandbox may reach. The resolver's IP must also be in --egress-allow-ips. At most %d patterns. Setting this or --egress-allow-ips blocks all other egress. Sandbox networking only. See the networking user guide.", egressallowlist.MaxListEntries))
+	flagSet.String(flagEgressAllowIPs, "", fmt.Sprintf("comma-separated egress allowlist of IPs and CIDRs (IPv4/IPv6), e.g. \"8.8.8.8,10.0.0.0/8\", always allowed on any port. At most %d entries after deduplication. Setting this or --egress-allow-domains blocks all other egress. Sandbox networking only. See the networking user guide.", egressallowlist.MaxListEntries))
 
 	// Flags that control sandbox runtime behavior: accelerator related.
 	flagSet.Bool("nvproxy", false, "LEGACY: enable support for Nvidia GPUs. GPU support gets automatically enabled if Nvidia devices are present in the OCI spec.")
@@ -211,6 +216,8 @@ var overrideAllowlist = map[string]struct {
 	flagOCISeccomp:              {check: checkOciSeccomp},
 	flagPauseExternalNetworking: {},
 	flagAllowConnectedOnSave:    {},
+	flagEgressAllowDomains:      {check: checkEgressAllowDomains},
+	flagEgressAllowIPs:          {check: checkEgressAllowIPs},
 	flagQDisc:                   {check: checkQDisc},
 	flagQDiscTBFRate:            {check: checkQDiscTBFRate},
 	flagQDiscTBFBurst:           {check: checkQDiscTBFBurst},
