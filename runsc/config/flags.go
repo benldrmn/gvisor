@@ -47,6 +47,9 @@ const (
 	flagQDisc                   = "qdisc"
 	flagQDiscTBFRate            = "qdisc-tbf-rate"
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
+	flagIngressQDisc            = "ingress-qdisc"
+	flagIngressQDiscTBFRate     = "ingress-qdisc-tbf-rate"
+	flagIngressQDiscTBFBurst    = "ingress-qdisc-tbf-burst"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -163,6 +166,9 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(queueingDisciplinePtr(QDiscFIFO), flagQDisc, "specifies which queueing discipline to apply by default to the non loopback nics used by the sandbox.")
 	flagSet.Uint64(flagQDiscTBFRate, defaultQDiscTBFRate, "egress rate limit in bytes/sec when --qdisc=tbf.")
 	flagSet.Uint64(flagQDiscTBFBurst, defaultQDiscTBFBurst, "bucket depth in bytes when --qdisc=tbf.")
+	flagSet.Var(queueingDisciplinePtr(QDiscNone), flagIngressQDisc, "specifies the shaping to apply to inbound traffic on the non loopback nics used by the sandbox: none (default), tbf.")
+	flagSet.Uint64(flagIngressQDiscTBFRate, defaultQDiscTBFRate, "ingress rate limit in bytes/sec when --ingress-qdisc=tbf.")
+	flagSet.Uint64(flagIngressQDiscTBFBurst, defaultQDiscTBFBurst, "bucket depth in bytes when --ingress-qdisc=tbf.")
 	flagSet.Int("num-network-channels", 1, "number of underlying channels(FDs) to use for network link endpoints.")
 	flagSet.Int("network-processors-per-channel", 0, "number of goroutines in each channel for processng inbound packets. If 0, the link endpoint will divide GOMAXPROCS evenly among the number of channels specified by num-network-channels.")
 	flagSet.Var(&xdpConfig, "EXPERIMENTAL-xdp", `whether and how to use XDP. Can be one of: "off" (default), "ns", "redirect:<device name>", or "tunnel:<device name>"`)
@@ -211,9 +217,12 @@ var overrideAllowlist = map[string]struct {
 	flagOCISeccomp:              {check: checkOciSeccomp},
 	flagPauseExternalNetworking: {},
 	flagAllowConnectedOnSave:    {},
-	flagQDisc:                   {check: checkQDisc},
+	flagQDisc:                   {check: checkQDiscIsTBF},
 	flagQDiscTBFRate:            {check: checkQDiscTBFRate},
 	flagQDiscTBFBurst:           {check: checkQDiscTBFBurst},
+	flagIngressQDisc:            {check: checkQDiscIsTBF},
+	flagIngressQDiscTBFRate:     {check: checkIngressQDiscTBFRate},
+	flagIngressQDiscTBFBurst:    {check: checkIngressQDiscTBFBurst},
 }
 
 // checkOverlay2 ensures that overlay2 can only be enabled using "memory" or
@@ -243,9 +252,10 @@ func checkOciSeccomp(_ *Config, name string, value string) error {
 	return nil
 }
 
-// checkQDisc ensures that qdisc annotations can only select TBF, which is more
-// restrictive than the default FIFO qdisc.
-func checkQDisc(_ *Config, name string, value string) error {
+// checkQDiscIsTBF ensures that qdisc and ingress-qdisc annotations can only
+// select TBF, which is more restrictive than either default (FIFO on egress,
+// no shaping on ingress).
+func checkQDiscIsTBF(_ *Config, name string, value string) error {
 	var q QueueingDiscipline
 	if err := q.Set(value); err != nil {
 		return err
@@ -256,35 +266,36 @@ func checkQDisc(_ *Config, name string, value string) error {
 	return nil
 }
 
-// checkQDiscTBFRate ensures an annotation can only lower (or match) the
-// runtime-configured egress rate; raising it would weaken operator policy.
-// A runtime-configured rate of 0 means the operator hasn't set a ceiling, so
-// any pod-supplied rate is accepted.
-func checkQDiscTBFRate(c *Config, name string, value string) error {
+// checkTBFCeiling ensures a TBF annotation can only lower (or match) the
+// runtime-configured ceiling; raising it would weaken operator policy. A
+// ceiling of 0 means the operator hasn't set one, so any pod-supplied value
+// is accepted. what names the ceiling ("rate" or "burst") in errors.
+func checkTBFCeiling(ceiling uint64, what, name, value string) error {
 	v, err := strconv.ParseUint(value, 0, 64)
 	if err != nil {
 		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
 	}
-	if c.TBFRate != 0 && v > c.TBFRate {
-		return fmt.Errorf("%s=%d exceeds runtime-configured rate %d; raising the limit requires flag %q to be enabled",
-			name, v, c.TBFRate, flagAllowFlagOverride)
+	if ceiling != 0 && v > ceiling {
+		return fmt.Errorf("%s=%d exceeds runtime-configured %s %d; raising the limit requires flag %q to be enabled",
+			name, v, what, ceiling, flagAllowFlagOverride)
 	}
 	return nil
 }
 
-// checkQDiscTBFBurst ensures an annotation can only lower (or match) the
-// runtime-configured bucket depth. A runtime-configured burst of 0 means the
-// operator hasn't set a ceiling, so any pod-supplied burst is accepted.
+func checkQDiscTBFRate(c *Config, name string, value string) error {
+	return checkTBFCeiling(c.TBFRate, "rate", name, value)
+}
+
 func checkQDiscTBFBurst(c *Config, name string, value string) error {
-	v, err := strconv.ParseUint(value, 0, 64)
-	if err != nil {
-		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
-	}
-	if c.TBFBurst != 0 && v > c.TBFBurst {
-		return fmt.Errorf("%s=%d exceeds runtime-configured burst %d; raising the limit requires flag %q to be enabled",
-			name, v, c.TBFBurst, flagAllowFlagOverride)
-	}
-	return nil
+	return checkTBFCeiling(c.TBFBurst, "burst", name, value)
+}
+
+func checkIngressQDiscTBFRate(c *Config, name string, value string) error {
+	return checkTBFCeiling(c.IngressTBFRate, "rate", name, value)
+}
+
+func checkIngressQDiscTBFBurst(c *Config, name string, value string) error {
+	return checkTBFCeiling(c.IngressTBFBurst, "burst", name, value)
 }
 
 // isFlagExplicitlySet returns whether the given flag name is explicitly set.

@@ -156,6 +156,17 @@ type Config struct {
 	// TBFBurst is the bucket depth in bytes when QDisc=tbf.
 	TBFBurst uint64 `flag:"qdisc-tbf-burst"`
 
+	// IngressQDisc indicates the type of shaping to apply to inbound traffic
+	// on non-loopback interfaces. Only QDiscNone and QDiscTBF are supported.
+	IngressQDisc QueueingDiscipline `flag:"ingress-qdisc"`
+
+	// IngressTBFRate is the ingress rate limit in bytes/sec when
+	// IngressQDisc=tbf.
+	IngressTBFRate uint64 `flag:"ingress-qdisc-tbf-rate"`
+
+	// IngressTBFBurst is the bucket depth in bytes when IngressQDisc=tbf.
+	IngressTBFBurst uint64 `flag:"ingress-qdisc-tbf-burst"`
+
 	// LogPackets indicates that all network packets should be logged.
 	LogPackets bool `flag:"log-packets"`
 
@@ -486,6 +497,23 @@ func (c *Config) Validate() error {
 		if c.TBFBurst == 0 {
 			return fmt.Errorf("qdisc=tbf requires setting qdisc-tbf-burst")
 		}
+	}
+	if c.IngressTBFBurst > maxQDiscTBFBurst {
+		return fmt.Errorf("ingress-qdisc-tbf-burst must be <= %d, got: %d", maxQDiscTBFBurst, c.IngressTBFBurst)
+	}
+	switch c.IngressQDisc {
+	case QDiscNone:
+	case QDiscTBF:
+		if c.IngressTBFRate == 0 {
+			return fmt.Errorf("ingress-qdisc=tbf requires setting ingress-qdisc-tbf-rate")
+		}
+		if c.IngressTBFBurst == 0 {
+			return fmt.Errorf("ingress-qdisc=tbf requires setting ingress-qdisc-tbf-burst")
+		}
+	default:
+		// There is no benefit to queueing inbound packets without a rate
+		// limit, so fifo is not supported on ingress.
+		return fmt.Errorf("ingress-qdisc must be \"none\" or \"tbf\", got: %q", c.IngressQDisc)
 	}
 	// Require profile flags to explicitly opt-in to profiling with
 	// -profile rather than implying it since these options have security

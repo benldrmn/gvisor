@@ -271,6 +271,9 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (boot.CreateLi
 				QDisc:             conf.QDisc,
 				TBFRate:           conf.TBFRate,
 				TBFBurst:          uint32(conf.TBFBurst),
+				IngressQDisc:      conf.IngressQDisc,
+				IngressTBFRate:    conf.IngressTBFRate,
+				IngressTBFBurst:   uint32(conf.IngressTBFBurst),
 				Neighbors:         neighbors,
 				LinkAddress:       linkAddress,
 				Addresses:         addresses,
@@ -288,6 +291,9 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (boot.CreateLi
 				QDisc:                conf.QDisc,
 				TBFRate:              conf.TBFRate,
 				TBFBurst:             uint32(conf.TBFBurst),
+				IngressQDisc:         conf.IngressQDisc,
+				IngressTBFRate:       conf.IngressTBFRate,
+				IngressTBFBurst:      uint32(conf.IngressTBFBurst),
 				Neighbors:            neighbors,
 				LinkAddress:          linkAddress,
 				Addresses:            addresses,
@@ -308,12 +314,12 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 	case config.XDPModeOff:
 	case config.XDPModeNS:
 	case config.XDPModeRedirect:
-		if err := createRedirectInterfacesAndRoutes(conn, conf); err != nil {
+		if err := createRedirectInterfacesAndRoutes(conn, conf, disableIPv6); err != nil {
 			return fmt.Errorf("failed to create XDP redirect interface: %w", err)
 		}
 		return nil
 	case config.XDPModeTunnel:
-		if err := createXDPTunnel(conn, nsPath, conf); err != nil {
+		if err := createXDPTunnel(conn, nsPath, conf, disableIPv6); err != nil {
 			return fmt.Errorf("failed to create XDP tunnel: %w", err)
 		}
 		return nil

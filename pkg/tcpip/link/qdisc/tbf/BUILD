@@ -16,16 +16,19 @@ declare_mutex(
 go_library(
     name = "tbf",
     srcs = [
+        "ingress.go",
         "queue_mutex.go",
         "tbf.go",
     ],
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
+        "//pkg/log",
         "//pkg/sleep",
         "//pkg/sync",
         "//pkg/sync/locking",
         "//pkg/tcpip",
+        "//pkg/tcpip/link/nested",
         "//pkg/tcpip/link/qdisc",
         "//pkg/tcpip/stack",
     ],
@@ -34,7 +37,10 @@ go_library(
 go_test(
     name = "tbf_test",
     size = "small",
-    srcs = ["tbf_test.go"],
+    srcs = [
+        "ingress_test.go",
+        "tbf_test.go",
+    ],
     deps = [
         ":tbf",
         "//pkg/buffer",
