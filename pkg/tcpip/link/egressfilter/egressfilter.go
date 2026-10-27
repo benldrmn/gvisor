@@ -12,14 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package egressfilter provides a link-endpoint wrapper that enforces a
-// destination-IP egress allowlist and grows it by snooping plain UDP DNS
-// responses for a configured set of domains. It sits in the Sentry's link
-// chain, so it sees every outbound packet, including raw and packet-socket
-// traffic that bypasses the transport layer, and is not reachable by any
-// in-sandbox syscall. Encrypted DNS and DNS-over-TCP are not snooped, so
-// addresses they resolve are never learned. See the networking user guide for
-// the full model.
+// Package egressfilter enforces a destination-IP allowlist at the link layer,
+// including raw and packet-socket traffic. It learns addresses for allowed
+// domains from UDP DNS responses.
 package egressfilter
 
 import (
@@ -33,8 +28,8 @@ import (
 // +stateify savable
 type Endpoint struct {
 	nested.Endpoint
-	// filter is shared across every wrapped NIC and reconstructed on restore, so
-	// it is not saved. Learned state is lost on restore by design.
+	// filter is shared by all external NICs and rebuilt on restore.
+	// Learned addresses are not saved.
 	filter *Filter `state:"nosave"`
 }
 
@@ -42,29 +37,24 @@ var _ stack.LinkEndpoint = (*Endpoint)(nil)
 var _ stack.NetworkDispatcher = (*Endpoint)(nil)
 var _ stack.GSOEndpoint = (*Endpoint)(nil)
 
-// New wraps lower so that every egress packet is checked against f and DNS is
-// snooped in both directions. f is internally synchronized and may be shared
-// across multiple NIC endpoints.
+// New wraps lower with f. The filter may be shared across NICs.
 func New(lower stack.LinkEndpoint, f *Filter) *Endpoint {
 	e := &Endpoint{filter: f}
 	e.Endpoint.Init(lower, e)
 	return e
 }
 
-// process evaluates one outbound packet, tracking DNS queries as needed, and
-// reports whether pkt should be forwarded to the lower endpoint.
+// process filters pkt and tracks allowed DNS queries. It reports whether to
+// forward pkt.
 func (e *Endpoint) process(pkt *stack.PacketBuffer) bool {
 	f := e.filter
 	res := f.evaluate(pkt)
 	if res.v != verdictAllow {
 		logDrop(res)
-		// A blocked TCP segment is answered with a RST so the workload's
-		// connect() fails fast instead of hanging on SYN retransmits.
-		// Malformed and protocol-policy drops stay silent (see synthesizeRST).
+		// Reset blocked TCP connections so connect returns ECONNREFUSED.
 		if res.v == verdictDropNotAllowed {
 			if resp, respProto := synthesizeRST(pkt, res.l4proto); resp != nil {
-				// Deliver directly to the upper dispatcher (as loopback does),
-				// bypassing this endpoint's own inbound snoop.
+				// Bypass this endpoint's inbound DNS snooping.
 				e.Endpoint.DeliverNetworkPacket(respProto, resp)
 				resp.DecRef()
 			}
@@ -75,15 +65,11 @@ func (e *Endpoint) process(pkt *stack.PacketBuffer) bool {
 	return true
 }
 
-// WritePackets implements stack.LinkEndpoint. It forwards only the packets
-// that pass the egress policy. Disallowed packets are dropped with a
-// rate-limited log, except that a TCP segment to a blocked destination is
-// answered with a RST (see process).
+// WritePackets implements stack.LinkEndpoint.
 func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	slice := pkts.AsSlice()
 
-	// In the common case nothing is dropped and the original list is
-	// forwarded untouched, with no allocation.
+	// Avoid allocating a new list when no packets are dropped.
 	firstDrop := -1
 	for i, pkt := range slice {
 		if !e.process(pkt) {
@@ -95,10 +81,8 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 		return e.Endpoint.WritePackets(pkts)
 	}
 
-	// Rebuild the list without the dropped packets. PushBack does not take a
-	// reference, so the caller still owns and releases every buffer. origIdx maps
-	// each kept packet to its position in the original list, so a short write from
-	// the lower endpoint is reported as a count into that list.
+	// The caller retains all packet references. origIdx maps short writes back
+	// to the original list, including dropped packets.
 	var allowed stack.PacketBufferList
 	var origIdx []int
 	for i, pkt := range slice[:firstDrop] {
@@ -113,30 +97,24 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	}
 	if allowed.Len() > 0 {
 		if n, err := e.Endpoint.WritePackets(allowed); err != nil {
-			// The lower endpoint wrote n kept packets before failing. Everything
-			// before the first unwritten kept packet in the original list was
-			// written or deliberately dropped, so report that many as handled.
+			// Count written and dropped packets before the first unwritten packet.
 			return origIdx[n], err
 		}
 	}
-	// Dropped packets count as sent: a policy drop is deliberate, and a short
-	// count would make the caller treat it as a link error.
+	// Count policy drops as sent to avoid reporting a link error.
 	return pkts.Len(), nil
 }
 
-// DeliverNetworkPacket implements stack.NetworkDispatcher. Inbound packets are
-// never filtered (the policy is egress-only), but DNS responses are snooped to
-// grow the learned-IP set. Learning happens before delivery so the workload's
-// resolve-then-connect sequence cannot race the learner.
+// DeliverNetworkPacket implements stack.NetworkDispatcher. Learn DNS answers
+// before delivery so the workload can connect as soon as resolution completes.
 func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	f := e.filter
 	if f.pending.nonEmpty() {
-		// Reclaim expired queries (throttled) so a query that never gets a
-		// response does not keep the gate open and tax every inbound packet.
+		// Expire unanswered queries so idle traffic stops triggering DNS parsing.
 		f.pending.maybeSweep(f.clock.NowMonotonic())
 		if f.pending.nonEmpty() {
-			// The NIC sets RXChecksumValidated from link capabilities after this
-			// callback. Use the same decision without mutating the packet.
+			// The NIC sets RXChecksumValidated after this callback. Derive it from
+			// link capabilities here too.
 			rxChecksumValidated := e.Capabilities()&stack.CapabilityRXChecksumOffload != 0
 			f.snoopInbound(protocol, pkt, rxChecksumValidated)
 		}

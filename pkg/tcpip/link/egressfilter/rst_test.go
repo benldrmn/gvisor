@@ -23,13 +23,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// workloadV4 is the source address the netstack-origin TCP builders use for the
-// sandboxed workload, matching the UDP builders in egressfilter_test.go.
 var workloadV4 = tcpip.AddrFrom4([4]byte{192, 168, 1, 2})
 
-// netstackV4TCP builds an outbound netstack-origin IPv4/TCP segment: headers in
-// their parsed slots (so synthesizeRST can read the transport header), no
-// payload, ethernet link header present.
+// netstackV4TCP builds a TCP segment with parsed headers and no payload.
 func netstackV4TCP(t *testing.T, dst [4]byte, srcPort, dstPort uint16, seq, ack uint32, flags header.TCPFlags) *stack.PacketBuffer {
 	t.Helper()
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -89,8 +85,7 @@ func netstackV6TCP(t *testing.T, dst tcpip.Address, srcPort, dstPort uint16, seq
 	return pkt
 }
 
-// writeOne runs a single packet through the endpoint and returns the endpoint's
-// capture dispatcher and lower channel for assertions.
+// writeOne sends pkt through a filter and returns the capture endpoints.
 func writeOne(t *testing.T, f *Filter, pkt *stack.PacketBuffer) (*captureDispatcher, *channel.Endpoint) {
 	t.Helper()
 	child := channel.New(16, 1500, "")
@@ -106,9 +101,6 @@ func writeOne(t *testing.T, f *Filter, pkt *stack.PacketBuffer) (*captureDispatc
 	return d, child
 }
 
-// TestBlockedTCPSynResetV4 verifies a SYN to a non-allowlisted destination is
-// dropped and answered with a well-formed RST+ACK (swapped addresses/ports,
-// seq 0, ack = SYN seq + 1, valid checksums) delivered back up the stack.
 func TestBlockedTCPSynResetV4(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	const clientPort, serverPort = 44000, 443
@@ -161,12 +153,11 @@ func TestBlockedTCPSynResetV4(t *testing.T) {
 	}
 }
 
-// TestBlockedTCPSynResetV6 is the IPv6 analogue of TestBlockedTCPSynResetV4.
 func TestBlockedTCPSynResetV6(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"2001:4860::/32"}})
 	const clientPort, serverPort = 45000, 443
 	const clientISS = 0x55667788
-	dst := mustAddr(t, "2606:4700::1") // not in 2001:4860::/32
+	dst := mustAddr(t, "2606:4700::1")
 	syn := netstackV6TCP(t, dst, clientPort, serverPort, clientISS, 0, header.TCPFlagSyn)
 	defer syn.DecRef()
 
@@ -200,9 +191,6 @@ func TestBlockedTCPSynResetV6(t *testing.T) {
 	}
 }
 
-// TestBlockedTCPAckSegmentUsesAckNum verifies the RFC 9293 reset rule for a
-// segment that already carries an ACK: the RST takes its sequence number from
-// the segment's ACK field and carries no ACK of its own.
 func TestBlockedTCPAckSegmentUsesAckNum(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	const segAck = 0xDEADBEEF
@@ -225,8 +213,6 @@ func TestBlockedTCPAckSegmentUsesAckNum(t *testing.T) {
 	}
 }
 
-// TestIncomingRSTNotReflected verifies a blocked segment that is itself a RST is
-// dropped silently: answering a reset with a reset would create a RST storm.
 func TestIncomingRSTNotReflected(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	seg := netstackV4TCP(t, [4]byte{1, 2, 3, 4}, 44000, 443, 5, 6, header.TCPFlagRst|header.TCPFlagAck)
@@ -241,7 +227,6 @@ func TestIncomingRSTNotReflected(t *testing.T) {
 	}
 }
 
-// TestBlockedUDPNotReset verifies non-TCP drops are not reset.
 func TestBlockedUDPNotReset(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	pkt := netstackV4UDP(t, [4]byte{1, 2, 3, 4}, 40000, 5000, []byte("hello"))
@@ -253,9 +238,6 @@ func TestBlockedUDPNotReset(t *testing.T) {
 	}
 }
 
-// TestPacketSocketTCPNotReset verifies a packet-socket-origin TCP segment (no
-// parsed transport header) is dropped without a RST: reset synthesis is scoped
-// to netstack-origin traffic.
 func TestPacketSocketTCPNotReset(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	tcpHdr := make([]byte, header.TCPMinimumSize)

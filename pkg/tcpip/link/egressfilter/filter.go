@@ -28,45 +28,34 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// Sizing and parsing bounds.
 const (
-	// learnedSetCap bounds the dynamic learned-IP set.
-	learnedSetCap = 65536
-	// pendingTableCap bounds the in-flight DNS query table.
-	pendingTableCap = 4096
-	// queryTTL is how long an in-flight query is honored.
-	queryTTL = 10 * time.Second
-	// maxAnswerRecords bounds answer RRs parsed per response.
-	maxAnswerRecords = 64
-	// maxIPsPerResponse bounds IPs learned from one response.
+	learnedSetCap     = 65536
+	pendingTableCap   = 4096
+	queryTTL          = 10 * time.Second
+	maxAnswerRecords  = 64
 	maxIPsPerResponse = 64
 )
 
-// Loose and strict source-route IPv4 option types (RFC 791). The header
-// package does not define these, since netstack itself never emits them.
+// IPv4 source-route option types from RFC 791.
 const (
-	ipv4OptionLooseSourceRoute  header.IPv4OptionType = 131 // 0x83
-	ipv4OptionStrictSourceRoute header.IPv4OptionType = 137 // 0x89
+	ipv4OptionLooseSourceRoute  header.IPv4OptionType = 131
+	ipv4OptionStrictSourceRoute header.IPv4OptionType = 137
 )
 
-// maxIPv6ExtHdrs bounds how many IPv6 extension headers evalV6 will walk before
-// giving up (and dropping). Legitimate egress never chains this many.
+// maxIPv6ExtHdrs limits extension-header parsing before dropping a packet.
 const maxIPv6ExtHdrs = 8
 
 const maxControlPayloadSize = 1280
 
-// dropLogger rate-limits the "dropped a packet" log line so a chatty workload
-// cannot flood the sandbox log. Mirrors the martian-packet logger in
-// pkg/tcpip/network/ipv4.
+// dropLogger limits per-packet logs to avoid flooding the sandbox log.
 var dropLogger = log.BasicRateLimitedLogger(time.Minute)
 
 // warnLogger rate-limits operational warnings (learned-set full, truncated DNS).
 var warnLogger = log.BasicRateLimitedLogger(time.Minute)
 
-// Config is the parsed egress allowlist.
+// Config specifies the egress allowlist and query clock.
 type Config struct {
-	// Domains are exact ("docs.github.com") or wildcard ("*.github.com")
-	// patterns. DNS responses resolving these grow the learned-IP set.
+	// Domains lists exact names or "*." patterns whose DNS answers are learned.
 	Domains []string
 	// IPs are statically allowed destinations, each an IP or CIDR (v4 or v6).
 	IPs []string
@@ -74,12 +63,8 @@ type Config struct {
 	Clock tcpip.Clock
 }
 
-// Filter is the shared, concurrency-safe egress policy. A single Filter is
-// created per sandbox and shared by every wrapped NIC endpoint.
-//
-// The static allowlist and domain matcher are immutable after NewFilter and
-// read without locking. The learned-IP set and pending-query table are
-// internally synchronized.
+// Filter holds a sandbox's egress policy and DNS state. Multiple NICs may use
+// it concurrently.
 type Filter struct {
 	// Immutable after construction.
 	staticExact map[tcpip.Address]struct{}
@@ -132,12 +117,7 @@ const (
 	verdictDropProto
 )
 
-// parseStaticIPs converts IP/CIDR strings into an exact-address set and a list
-// of subnets. Entries are parsed by the shared egressallowlist package, which
-// canonicalizes v4-in-v6 forms so a packet's IPv4 destination compares equal
-// to a "::ffff:a.b.c.d" configuration entry, deduplicates prefixes, and caps
-// the list. The cap matters here: allowedDst scans the subnet list linearly
-// for every packet that misses the exact and learned sets.
+// parseStaticIPs splits normalized prefixes into exact addresses and subnets.
 func parseStaticIPs(ips []string) (map[tcpip.Address]struct{}, []tcpip.Subnet, error) {
 	prefixes, err := egressallowlist.ParseIPList(ips)
 	if err != nil {
@@ -186,31 +166,24 @@ func (f *Filter) allowedDst(dst tcpip.Address) bool {
 	return false
 }
 
-// egressResult carries the outcome of evaluating a packet. dst and l4proto
-// describe the packet whenever it was parsed far enough to know its
-// destination: verdictAllow and verdictDropNotAllowed always carry them (the
-// caller tracks DNS queries and logs drop reasons without re-parsing). ARP,
-// verdictDropMalformed, and verdictDropProto carry zero values, since those
-// verdicts are decided before or without a destination address.
+// egressResult holds a verdict and, for allowed or blocked IP packets, the
+// destination and transport protocol.
 type egressResult struct {
 	v       verdict
 	dst     tcpip.Address
 	l4proto uint8
 }
 
-// evaluate decides whether an outbound packet may egress. It never mutates pkt
-// and never panics on malformed input.
+// evaluate checks an outbound packet without modifying it.
 func (f *Filter) evaluate(pkt *stack.PacketBuffer) egressResult {
 	eth := pkt.LinkHeader().Slice()
 	var wire tcpip.NetworkProtocolNumber
 	if len(eth) >= header.EthernetMinimumSize {
-		// Ground truth: the EtherType actually on the wire. Never trust
-		// pkt.NetworkProtocolNumber, which is attacker-controlled for
-		// packet-socket egress and not guaranteed to equal the wire EtherType.
+		// Packet sockets control NetworkProtocolNumber, which may differ from
+		// the wire EtherType.
 		wire = header.Ethernet(eth).Type()
 	} else {
-		// L3 mode (no link header, e.g. fdbased with an empty MAC): dispatch on
-		// the IP version nibble of the first payload byte.
+		// Without a link header, use the IP version nibble.
 		b, ok := f.firstByte(pkt)
 		if !ok {
 			return egressResult{v: verdictDropMalformed}
@@ -237,8 +210,7 @@ func (f *Filter) evaluate(pkt *stack.PacketBuffer) egressResult {
 	}
 }
 
-// firstByte returns the first byte of the network-layer payload, reading from
-// the parsed network header when present, or otherwise from the front of Data.
+// firstByte reads the network header, or Data for packet-socket writes.
 func (f *Filter) firstByte(pkt *stack.PacketBuffer) (byte, bool) {
 	if nh := pkt.NetworkHeader().Slice(); len(nh) > 0 {
 		return nh[0], true
@@ -249,16 +221,12 @@ func (f *Filter) firstByte(pkt *stack.PacketBuffer) (byte, bool) {
 	return 0, false
 }
 
-// networkHeaderBytes returns at least n bytes of the network-layer header. It
-// reads from the parsed network header when one is present, and otherwise from
-// the front of Data, where a packet-socket write leaves the whole L3 packet.
-// Returns ok=false when fewer than n bytes are available (fail closed).
+// networkHeaderBytes returns at least n header bytes. Packet-socket writes
+// leave the network header in Data.
 func (f *Filter) networkHeaderBytes(pkt *stack.PacketBuffer, n int) ([]byte, bool) {
 	if nh := pkt.NetworkHeader().Slice(); len(nh) >= n {
 		return nh, true
 	}
-	// The parsed network header, if any, is shorter than n. When there is no
-	// parsed header the L3 packet sits at the front of Data.
 	if len(pkt.NetworkHeader().Slice()) == 0 {
 		if b, ok := pkt.Data().PullUp(n); ok {
 			return b, true
@@ -267,9 +235,7 @@ func (f *Filter) networkHeaderBytes(pkt *stack.PacketBuffer, n int) ([]byte, boo
 	return nil, false
 }
 
-// evalARP allows only well-formed, minimally-sized ARP packets. An oversized or
-// invalid "ARP" frame (as a packet socket can craft) is dropped: it would
-// otherwise be an arbitrary-payload channel to the local link.
+// evalARP permits valid ARP packets with only Ethernet minimum-frame padding.
 func (f *Filter) evalARP(pkt *stack.PacketBuffer) verdict {
 	b, ok := f.networkHeaderBytes(pkt, header.ARPSize)
 	if !ok {
@@ -278,16 +244,13 @@ func (f *Filter) evalARP(pkt *stack.PacketBuffer) verdict {
 	if !header.ARP(b).IsValid() {
 		return verdictDropMalformed
 	}
-	// Bound the total payload: a genuine ARP frame is header.ARPSize (28) bytes,
-	// padded to the 46-byte ethernet minimum. Anything larger is a covert
-	// channel attempt.
+	// Allow padding from the 28-byte ARP message to the Ethernet minimum.
 	if total := len(pkt.NetworkHeader().Slice()) + pkt.Data().Size(); total > 46 {
 		return verdictDropMalformed
 	}
 	return verdictAllow
 }
 
-// evalV4 evaluates an IPv4 packet.
 func (f *Filter) evalV4(pkt *stack.PacketBuffer) egressResult {
 	b, ok := f.networkHeaderBytes(pkt, header.IPv4MinimumSize)
 	if !ok {
@@ -300,7 +263,6 @@ func (f *Filter) evalV4(pkt *stack.PacketBuffer) egressResult {
 	if ihl < header.IPv4MinimumSize || ihl > header.IPv4MaximumHeaderSize {
 		return egressResult{v: verdictDropMalformed}
 	}
-	// Ensure the full header (including options) is available.
 	if ihl > len(b) {
 		b, ok = f.networkHeaderBytes(pkt, ihl)
 		if !ok {
@@ -318,23 +280,16 @@ func (f *Filter) evalV4(pkt *stack.PacketBuffer) egressResult {
 	if f.allowedDst(dst) {
 		return egressResult{v: verdictAllow, dst: dst, l4proto: proto}
 	}
-	// IGMP membership to the link-local control block (224.0.0.0/24) is exempt:
-	// those groups are never routed off the segment, so the exemption cannot
-	// reach a disallowed destination. IGMPv3 (the netstack default) uses this
-	// block. A legacy IGMPv2 report addressed to its own group is not exempt and
-	// must be allowlisted.
+	// Only link-local IGMP destinations are exempt. IGMPv2 reports to other
+	// multicast groups require an allowlist entry.
 	if proto == uint8(header.IGMPProtocolNumber) && header.IsV4LinkLocalMulticastAddress(dst) && f.igmpValid(pkt, h, ihl) {
 		return egressResult{v: verdictAllow, dst: dst, l4proto: proto}
 	}
 	return egressResult{v: verdictDropNotAllowed, dst: dst, l4proto: proto}
 }
 
-// ipv4OptionsAllowed reports whether the IPv4 options blob is free of loose and
-// strict source-routing options, which could redirect a packet with an allowed
-// destination to a blocked one. Other options (e.g. Router Alert, needed by
-// IGMP) are permitted. A malformed options blob is rejected. Parsing uses the
-// header package's option iterator so the rules cannot drift from netstack's
-// own option handling.
+// ipv4OptionsAllowed rejects malformed options and source routes, which could
+// redirect an allowed destination to a blocked one.
 func ipv4OptionsAllowed(opts header.IPv4Options) bool {
 	iter := opts.MakeIterator()
 	for {
@@ -352,7 +307,6 @@ func ipv4OptionsAllowed(opts header.IPv4Options) bool {
 	}
 }
 
-// evalV6 evaluates an IPv6 packet.
 func (f *Filter) evalV6(pkt *stack.PacketBuffer) egressResult {
 	b, ok := f.networkHeaderBytes(pkt, header.IPv6MinimumSize)
 	if !ok {
@@ -370,9 +324,7 @@ func (f *Filter) evalV6(pkt *stack.PacketBuffer) egressResult {
 		return egressResult{v: verdictDropMalformed}
 	}
 	if routingSeen {
-		// A Routing extension header (RH0/SRH) can redirect a packet with an
-		// allowed destination onward to a blocked one. RFC 5095 section 4.2
-		// permits type-specific handling. This policy deliberately drops all types.
+		// Routing headers can redirect an allowed destination to a blocked one.
 		return egressResult{v: verdictDropProto}
 	}
 
@@ -380,12 +332,8 @@ func (f *Filter) evalV6(pkt *stack.PacketBuffer) egressResult {
 		return egressResult{v: verdictAllow, dst: dst, l4proto: upper}
 	}
 
-	// Permit NDP/MLD control traffic to link-local destinations only: a
-	// link-local address (unicast fe80::/10 or multicast ff02::/16) is never
-	// routed off the segment, so exempting it from the allowlist cannot become an
-	// off-link egress channel regardless of the socket that produced the packet.
-	// MLD reports carry a Hop-by-Hop Router Alert header, so accept ICMPv6 either
-	// directly (NextHeader==58) or behind that one Hop-by-Hop header.
+	// Exempt only link-local NDP/MLD traffic. MLD uses a Hop-by-Hop Router Alert
+	// header before ICMPv6.
 	if upper == uint8(header.ICMPv6ProtocolNumber) &&
 		(header.IsV6LinkLocalMulticastAddress(dst) || header.IsV6LinkLocalUnicastAddress(dst)) &&
 		(nh == uint8(header.ICMPv6ProtocolNumber) || hbhOnly) {
@@ -446,22 +394,18 @@ func (f *Filter) icmpv6ControlValid(pkt *stack.PacketBuffer, ip header.IPv6, off
 	}
 }
 
-// walkV6ExtHdrs walks the IPv6 extension-header chain starting at nextHeader,
-// returning the final upper-layer protocol, its offset from the start of the
-// network layer, whether the chain is exactly one Hop-by-Hop header (as MLD
-// uses for Router Alert), and whether any Routing header was seen. It is
-// bounded and never panics. ok is false on truncation.
+// walkV6ExtHdrs returns the upper-layer protocol and offset. It also reports
+// whether only an 8-byte Hop-by-Hop header precedes ICMPv6 and whether any
+// Routing header was seen. Traversal is bounded by maxIPv6ExtHdrs.
 //
-// header.MakeIPv6PayloadIterator implements this walk, but it consumes an
-// owned buffer.Buffer, which would mean cloning every outbound IPv6 packet.
-// This walk instead peeks at the live packet with bounded PullUps.
+// PullUp avoids the buffer clone required by header.MakeIPv6PayloadIterator.
 func (f *Filter) walkV6ExtHdrs(pkt *stack.PacketBuffer, nextHeader uint8) (upper uint8, upperOffset int, hbhOnly, routingSeen bool, ok bool) {
 	const (
-		hbh     = uint8(header.IPv6HopByHopOptionsExtHdrIdentifier)    // 0
-		routing = uint8(header.IPv6RoutingExtHdrIdentifier)            // 43
-		frag    = uint8(header.IPv6FragmentExtHdrIdentifier)           // 44
-		dstOpts = uint8(header.IPv6DestinationOptionsExtHdrIdentifier) // 60
-		ah      = uint8(header.IPv6AuthenticationExtHdrIdentifier)     // 51
+		hbh     = uint8(header.IPv6HopByHopOptionsExtHdrIdentifier)
+		routing = uint8(header.IPv6RoutingExtHdrIdentifier)
+		frag    = uint8(header.IPv6FragmentExtHdrIdentifier)
+		dstOpts = uint8(header.IPv6DestinationOptionsExtHdrIdentifier)
+		ah      = uint8(header.IPv6AuthenticationExtHdrIdentifier)
 	)
 	// Fast path: no extension headers.
 	switch nextHeader {
@@ -511,7 +455,6 @@ func (f *Filter) walkV6ExtHdrs(pkt *stack.PacketBuffer, nextHeader uint8) (upper
 			cur = hdr[0]
 			hbhOnly = false
 		default:
-			// Reached an upper-layer protocol.
 			return cur, offset, hbhOnly, routingSeen, true
 		}
 		extCount++
@@ -521,8 +464,8 @@ func (f *Filter) walkV6ExtHdrs(pkt *stack.PacketBuffer, nextHeader uint8) (upper
 	}
 }
 
-// extHdrAt returns n bytes at the given offset from the start of the network
-// layer, reading across the parsed network header and Data as needed.
+// extHdrAt reads n bytes at a network-layer offset. The bytes must lie wholly
+// within NetworkHeader or Data.
 func (f *Filter) extHdrAt(pkt *stack.PacketBuffer, offset, n int) ([]byte, bool) {
 	nh := pkt.NetworkHeader().Slice()
 	if len(nh) == 0 {
@@ -533,15 +476,11 @@ func (f *Filter) extHdrAt(pkt *stack.PacketBuffer, offset, n int) ([]byte, bool)
 		}
 		return full[offset : offset+n], true
 	}
-	// Netstack origin: the fixed IPv6 header is in nh. Extension headers and
-	// payload are in Data, starting at offset len(nh).
 	if offset < len(nh) {
 		if offset+n <= len(nh) {
 			return nh[offset : offset+n], true
 		}
-		// The chunk straddles the header/data boundary. Reading across it is
-		// not worth the complexity, so require the whole chunk to live in Data
-		// (the common case, since nh is exactly 40 bytes).
+		// Reads spanning NetworkHeader and Data are unsupported.
 		return nil, false
 	}
 	dataOff := offset - len(nh)
@@ -590,15 +529,14 @@ func (f *Filter) controlPayload(pkt *stack.PacketBuffer, offset int) ([]byte, bo
 	return b[dataOffset:], true
 }
 
-// learnedSet is the dynamic, grow-only set of destination addresses learned
-// from DNS responses. Reads (per egress packet) take a read lock and writes
-// (per DNS response) take a write lock. It is capped: once full, it stops
-// accepting new entries but keeps serving existing ones.
+// learnedSet holds DNS-learned addresses without expiry or eviction.
+// It stops accepting new addresses at capacity.
 type learnedSet struct {
-	mu  sync.RWMutex
+	mu sync.RWMutex
+	// m is protected by mu.
 	m   map[tcpip.Address]struct{}
 	cap int
-	// full is set once the cap is reached, so the warning logs only once.
+	// full suppresses repeated capacity warnings. Protected by mu.
 	full bool
 }
 
@@ -614,8 +552,8 @@ func (l *learnedSet) contains(addr tcpip.Address) bool {
 	return ok
 }
 
-// addBatch inserts the given addresses, stopping at the cap. It reports
-// whether this call was the one that hit the cap, so the caller warns once.
+// addBatch inserts addresses up to capacity. It returns true only on the first
+// attempt to exceed capacity.
 func (l *learnedSet) addBatch(addrs []tcpip.Address) (hitCap bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -633,17 +571,12 @@ func (l *learnedSet) addBatch(addrs []tcpip.Address) (hitCap bool) {
 	return false
 }
 
-// logDrop emits a rate-limited, reason-carrying log line to help operators
-// diagnose blocked connections. res carries the destination (when known) so
-// no re-parse is needed.
 func logDrop(res egressResult) {
 	if res.dst.Len() == 0 {
 		dropLogger.Infof("egressfilter: dropped egress packet (%s)", dropReason(res.v))
 		return
 	}
 	if res.l4proto == uint8(header.UDPProtocolNumber) {
-		// The most common misconfiguration: the workload's DNS resolver is not
-		// in the static allowlist, so its queries are dropped.
 		dropLogger.Infof("egressfilter: dropped egress packet to %s (%s). If this is your DNS resolver, add it to --egress-allow-ips", res.dst, dropReason(res.v))
 		return
 	}

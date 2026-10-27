@@ -39,8 +39,6 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// --- Static IP set ---
-
 func TestStaticIPSet(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"8.8.8.8", "10.0.0.0/8", "2001:db8::1", "2001:4860::/32"}})
 	allow := []string{"8.8.8.8", "10.1.2.3", "10.255.255.255", "2001:db8::1", "2001:4860:1::99"}
@@ -65,8 +63,6 @@ func TestNewFilterRejectsBadIPs(t *testing.T) {
 	}
 }
 
-// --- Decision table via evaluate() over crafted packets ---
-
 func TestEvaluateDecisionTable(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"93.184.216.34", "2606:2800:220::1"}})
 
@@ -80,12 +76,7 @@ func TestEvaluateDecisionTable(t *testing.T) {
 		{"v4 denied dst", ethV4(t, [4]byte{1, 2, 3, 4}, 6, nil), verdictDropNotAllowed},
 		{"v6 allowed dst", ethV6(t, mustAddr(t, "2606:2800:220::1"), 6, nil), verdictAllow},
 		{"v6 denied dst", ethV6(t, mustAddr(t, "2606:2800:220::2"), 6, nil), verdictDropNotAllowed},
-		// ICMP echo has no control-traffic exemption (unlike IGMP/NDP/MLD), so
-		// a ping to a blocked destination is dropped like any other egress.
 		{"v4 icmp echo denied dst", ethV4ICMPEcho(t, [4]byte{1, 2, 3, 4}), verdictDropNotAllowed},
-		// A Routing extension header can redirect a packet with an allowed
-		// destination onward to a blocked one, so it is dropped even though the
-		// destination here is allowlisted (the v6 twin of the source-route case).
 		{"v6 routing header to allowed dst", ethV6WithRouting(t, mustAddr(t, "2606:2800:220::1")), verdictDropProto},
 		{"arp oversized", ethARP(t, true), verdictDropMalformed},
 		{"unknown ethertype", ethFrame(t, 0x9999, make([]byte, 20), true), verdictDropProto},
@@ -101,12 +92,6 @@ func TestEvaluateDecisionTable(t *testing.T) {
 	}
 }
 
-// TestOnLinkControlTrafficExemptFromDestinationAllowlist checks the exemption
-// for control traffic needed to operate the link: ARP, IPv6 neighbor discovery,
-// and IGMP/MLD membership to link-local control groups. The exemption is
-// protocol-specific (a non-control protocol to the same address is still
-// dropped) and bounded by destination scope, not by origin, so it is exercised
-// here with workload-shaped (packet-socket) frames.
 func TestOnLinkControlTrafficExemptFromDestinationAllowlist(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9", "2001:db8::1"}})
 
@@ -214,11 +199,6 @@ func TestInvalidControlHeadersNotExempt(t *testing.T) {
 	}
 }
 
-// TestControlTrafficToRoutableDestinationNotExempt is the security regression
-// for the control-traffic exemption: a permitted control protocol/type does not
-// grant egress to a routable (non-link-local) destination. A workload with raw
-// or packet sockets could otherwise craft an IGMP or ICMPv6 message to a global
-// multicast group and use it as an egress channel that leaves the segment.
 func TestControlTrafficToRoutableDestinationNotExempt(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 
@@ -245,13 +225,11 @@ func TestControlTrafficToRoutableDestinationNotExempt(t *testing.T) {
 	}
 }
 
-// TestPacketSocketBypassClosed is the key security regression: a packet-socket
-// frame whose NetworkHeader is empty (L3 sits in Data) and whose EtherType
-// claims IPv4 must still have its destination filtered from the Data bytes.
+// TestPacketSocketBypassClosed checks filtering when the network header is in
+// Data, as on packet-socket writes.
 func TestPacketSocketBypassClosed(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 
-	// Denied destination in a packet-socket-shaped frame is dropped.
 	denied := ethV4Cooked(t, [4]byte{1, 2, 3, 4})
 	defer denied.DecRef()
 	if got := f.evaluate(denied).v; got != verdictDropNotAllowed {
@@ -261,8 +239,6 @@ func TestPacketSocketBypassClosed(t *testing.T) {
 		t.Fatalf("test setup wrong: NetworkHeader should be empty, got %d bytes", len(nh))
 	}
 
-	// Allowed destination in the same shape passes (proves we actually read
-	// the Data, not that we drop everything).
 	allowed := ethV4Cooked(t, [4]byte{9, 9, 9, 9})
 	defer allowed.DecRef()
 	if got := f.evaluate(allowed).v; got != verdictAllow {
@@ -270,8 +246,6 @@ func TestPacketSocketBypassClosed(t *testing.T) {
 	}
 }
 
-// TestSourceRouteDropped verifies that an IPv4 packet to an allowed destination
-// carrying a loose source-route option is dropped.
 func TestSourceRouteDropped(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	pkt := ethV4WithOptions(t, [4]byte{9, 9, 9, 9}, []byte{
@@ -285,16 +259,12 @@ func TestSourceRouteDropped(t *testing.T) {
 	}
 }
 
-// --- IPv6 NDP ---
-
-// TestNeighborAdvertAllowedNetstackOrigin checks that a solicited Neighbor
-// Advertisement in netstack's own packet shape is allowed. Unlike NS/RS/MLD,
-// netstack builds an NA with the ICMPv6 message in the TransportHeader and Data
-// empty, so the type byte must be read from there.
+// TestNeighborAdvertAllowedNetstackOrigin uses the netstack NA layout:
+// ICMPv6 in TransportHeader with empty Data.
 func TestNeighborAdvertAllowedNetstackOrigin(t *testing.T) {
-	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}}) // NA's dst is not in this list
-	dst := mustAddr(t, "fe80::1")                           // the solicitor's link-local address
-	src := mustAddr(t, "fe80::2")                           // the sandbox's own link-local address
+	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
+	dst := mustAddr(t, "fe80::1")
+	src := mustAddr(t, "fe80::2")
 	pkt := netstackV6NeighborAdvert(t, src, dst)
 	defer pkt.DecRef()
 	if got := f.evaluate(pkt).v; got != verdictAllow {
@@ -302,8 +272,6 @@ func TestNeighborAdvertAllowedNetstackOrigin(t *testing.T) {
 	}
 }
 
-// TestNeighborAdvertPacketSocketTransportHeaderIgnored checks that a forged
-// parsed transport header cannot override packet-socket data.
 func TestNeighborAdvertPacketSocketTransportHeaderIgnored(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	dst := mustAddr(t, "fe80::1")
@@ -315,7 +283,7 @@ func TestNeighborAdvertPacketSocketTransportHeaderIgnored(t *testing.T) {
 	frame := append(eth, buildV6(dst, uint8(header.ICMPv6ProtocolNumber), icmp)...)
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: 1, // room for the forged TransportHeader push below
+		ReserveHeaderBytes: 1,
 		Payload:            buffer.MakeWithData(frame),
 	})
 	defer pkt.DecRef()
@@ -332,9 +300,7 @@ func TestNeighborAdvertPacketSocketTransportHeaderIgnored(t *testing.T) {
 	}
 }
 
-// netstackV6NeighborAdvert builds a solicited Neighbor Advertisement in the
-// exact shape netstack's own IPv6 endpoint constructs one: NetworkHeader
-// parsed, ICMPv6 message in TransportHeader, Data empty.
+// netstackV6NeighborAdvert builds an NA with parsed headers and empty Data.
 func netstackV6NeighborAdvert(t *testing.T, src, dst tcpip.Address) *stack.PacketBuffer {
 	t.Helper()
 	naSize := header.ICMPv6NeighborAdvertMinimumSize
@@ -362,8 +328,6 @@ func netstackV6NeighborAdvert(t *testing.T, src, dst tcpip.Address) *stack.Packe
 	return pkt
 }
 
-// --- End-to-end through the Endpoint + channel ---
-
 func TestWritePacketsFiltersBatch(t *testing.T) {
 	f := newTestFilter(t, Config{IPs: []string{"9.9.9.9"}})
 	child := channel.New(16, 1500, "")
@@ -375,8 +339,6 @@ func TestWritePacketsFiltersBatch(t *testing.T) {
 		ethV4(t, [4]byte{1, 1, 1, 1}, 6, nil), // drop
 		ethV4(t, [4]byte{9, 9, 9, 9}, 6, nil), // allow
 	}
-	// The caller always retains ownership of every packet (channel.Write clones
-	// what it queues), so DecRef them all at the end.
 	defer func() {
 		for _, p := range pkts {
 			p.DecRef()
@@ -398,7 +360,7 @@ func TestWritePacketsFiltersBatch(t *testing.T) {
 	if got := child.NumQueued(); got != wantQueued {
 		t.Errorf("child queued %d packets, want %d", got, wantQueued)
 	}
-	child.Drain() // DecRefs the channel's clones of the allowed packets.
+	child.Drain()
 }
 
 func TestWritePacketsAllAllowedZeroDrop(t *testing.T) {
@@ -428,8 +390,7 @@ func TestWritePacketsAllAllowedZeroDrop(t *testing.T) {
 	child.Drain()
 }
 
-// TestLearnFlow drives a full resolve-then-connect: an outbound query to an allowed
-// resolver, an inbound response, and then egress to the learned address.
+// TestLearnFlow checks egress to an address learned from an allowed name.
 func TestLearnFlow(t *testing.T) {
 	clock := faketime.NewManualClock()
 	f := newTestFilter(t, Config{
@@ -443,7 +404,7 @@ func TestLearnFlow(t *testing.T) {
 
 	learnedIP := [4]byte{151, 101, 1, 1}
 
-	// 1. Outbound DNS query to the allowed resolver.
+	// Send a query to the allowed resolver.
 	query := buildQuery(t, 0xABCD, "docs.github.com.", dnsmessage.TypeA)
 	qpkt := netstackV4UDP(t, [4]byte{8, 8, 8, 8}, 40000, 53, query)
 	defer qpkt.DecRef()
@@ -457,7 +418,7 @@ func TestLearnFlow(t *testing.T) {
 		t.Fatalf("expected 1 pending query, got %d", f.pending.count.Load())
 	}
 
-	// 2. Inbound response resolving the name to learnedIP.
+	// Resolve the name to learnedIP.
 	resp := buildResponse(t, 0xABCD, "docs.github.com.", []dnsmessage.Resource{
 		aResource(t, "docs.github.com.", learnedIP),
 	})
@@ -469,7 +430,7 @@ func TestLearnFlow(t *testing.T) {
 		t.Fatal("address was not learned from the DNS response")
 	}
 
-	// 3. Egress to the learned address is now allowed.
+	// Check egress to the learned address.
 	epkt := ethV4(t, learnedIP, 6, nil)
 	defer epkt.DecRef()
 	if got := f.evaluate(epkt).v; got != verdictAllow {
@@ -477,8 +438,6 @@ func TestLearnFlow(t *testing.T) {
 	}
 }
 
-// TestLearnSpoofRejected verifies that a response with a mismatched transaction
-// ID does not cause learning.
 func TestLearnSpoofRejected(t *testing.T) {
 	clock := faketime.NewManualClock()
 	f := newTestFilter(t, Config{Domains: []string{"docs.github.com"}, IPs: []string{"8.8.8.8"}, Clock: clock})
@@ -494,7 +453,7 @@ func TestLearnSpoofRejected(t *testing.T) {
 	ep.WritePackets(qlist)
 	child.Drain()
 
-	// Response with the WRONG transaction ID.
+	// Use a different transaction ID from the query.
 	resp := buildResponse(t, 0x2222, "docs.github.com.", []dnsmessage.Resource{
 		aResource(t, "docs.github.com.", [4]byte{6, 6, 6, 6}),
 	})
@@ -507,10 +466,6 @@ func TestLearnSpoofRejected(t *testing.T) {
 	}
 }
 
-// TestLearnSpoofWrongServerOrPort checks the other two pinned tuple fields: a
-// response with the correct txID and question but from the wrong server address,
-// or to the wrong client port, does not match the pending query and is not
-// learned.
 func TestLearnSpoofWrongServerOrPort(t *testing.T) {
 	badIP := tcpip.AddrFrom4([4]byte{6, 6, 6, 6})
 	for _, tc := range []struct {
@@ -622,8 +577,6 @@ func TestIPv6DNSFragmentHandling(t *testing.T) {
 	}
 }
 
-// --- DNS query handling ---
-
 // captureDispatcher records packets delivered up the stack, flattened so no
 // references are retained.
 type captureDispatcher struct {
@@ -640,11 +593,8 @@ func (d *captureDispatcher) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumb
 
 func (d *captureDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}
 
-// TestDNSQueryForwarding verifies that queries to an allowed resolver are
-// always forwarded, never answered by the filter, and that only A/AAAA queries
-// for allowlisted names are tracked for learning. In particular, a query for a
-// name outside the domain allowlist must still resolve: its addresses may fall
-// within the static IP allowlist.
+// TestDNSQueryForwarding checks that all queries are forwarded but only A/AAAA
+// queries for allowed names are tracked.
 func TestDNSQueryForwarding(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -693,11 +643,6 @@ func TestDNSQueryForwarding(t *testing.T) {
 	}
 }
 
-// TestBlockedNameResolvingToStaticIP drives the full flow for a name outside
-// the domain allowlist whose address lies inside a statically allowed CIDR:
-// the query is forwarded, the response is not learned from (even with the
-// snoop gate held open by a concurrent tracked query), and egress to the
-// resolved address succeeds via the static allowlist alone.
 func TestBlockedNameResolvingToStaticIP(t *testing.T) {
 	f := newTestFilter(t, Config{
 		Domains: []string{"docs.github.com"},
@@ -712,9 +657,7 @@ func TestBlockedNameResolvingToStaticIP(t *testing.T) {
 	resolver := [4]byte{8, 8, 8, 8}
 	staticIP := [4]byte{10, 3, 7, 9}
 
-	// An allowlisted query on another port keeps the inbound snoop gate open,
-	// so the blocked name's response below is actually parsed and rejected
-	// rather than skipped because nothing is pending.
+	// Keep a query pending so the unrelated response reaches the DNS parser.
 	tracked := buildQuery(t, 0x1111, "docs.github.com.", dnsmessage.TypeA)
 	tpkt := netstackV4UDP(t, resolver, 41000, 53, tracked)
 	defer tpkt.DecRef()
@@ -724,7 +667,7 @@ func TestBlockedNameResolvingToStaticIP(t *testing.T) {
 		t.Fatalf("tracked query WritePackets: %v", err)
 	}
 
-	// The blocked-name query is forwarded, unanswered, and untracked.
+	// The unlisted name must resolve without being tracked.
 	query := buildQuery(t, 0x7777, "db.internal.corp.", dnsmessage.TypeA)
 	qpkt := netstackV4UDP(t, resolver, 40000, 53, query)
 	defer qpkt.DecRef()
@@ -744,8 +687,7 @@ func TestBlockedNameResolvingToStaticIP(t *testing.T) {
 		t.Fatalf("pending count = %d, want 1 (only the allowlisted query tracked)", got)
 	}
 
-	// The response resolves the blocked name into the allowed CIDR. It must
-	// not grow the learned set: only tracked queries may grant learning.
+	// A static allowlist match must not add to the learned set.
 	resp := buildResponse(t, 0x7777, "db.internal.corp.", []dnsmessage.Resource{
 		aResource(t, "db.internal.corp.", staticIP),
 	})
@@ -759,23 +701,18 @@ func TestBlockedNameResolvingToStaticIP(t *testing.T) {
 		t.Errorf("pending count = %d, want 1 (unrelated response must not consume the tracked entry)", got)
 	}
 
-	// Egress to the resolved address is allowed, via the static CIDR alone.
 	epkt := ethV4(t, staticIP, 6, nil)
 	defer epkt.DecRef()
 	if got := f.evaluate(epkt).v; got != verdictAllow {
 		t.Errorf("egress to statically allowed resolved IP: evaluate = %v, want allow", got)
 	}
 
-	// A destination outside both lists stays blocked, so the pass above is
-	// attributable to the static CIDR, not an accidentally open filter.
 	bpkt := ethV4(t, [4]byte{11, 1, 1, 1}, 6, nil)
 	defer bpkt.DecRef()
 	if got := f.evaluate(bpkt).v; got != verdictDropNotAllowed {
 		t.Errorf("egress outside allowlists: evaluate = %v, want drop", got)
 	}
 }
-
-// --- helpers ---
 
 func mustAddr(t *testing.T, s string) tcpip.Address {
 	t.Helper()
@@ -786,9 +723,8 @@ func mustAddr(t *testing.T, s string) tcpip.Address {
 	return netipToAddr(a)
 }
 
-// ethFrame builds a PacketBuffer for a frame with the given EtherType and L3
-// payload. If consumeLink, the ethernet header is consumed into the link-header
-// slot (packet-socket / inbound shape), leaving NetworkHeader empty.
+// ethFrame builds an Ethernet frame with L3 in Data. consumeLink moves the
+// Ethernet header into LinkHeader.
 func ethFrame(t *testing.T, etherType uint16, l3 []byte, consumeLink bool) *stack.PacketBuffer {
 	t.Helper()
 	eth := make([]byte, header.EthernetMinimumSize)
@@ -913,29 +849,24 @@ func validICMPv6ControlPacket(t *testing.T, messageType header.ICMPv6Type, parse
 	return pkt
 }
 
-// ethV4ICMPEcho builds an IPv4 ICMP echo request to dst.
 func ethV4ICMPEcho(t *testing.T, dst [4]byte) *stack.PacketBuffer {
 	icmp := make([]byte, header.ICMPv4MinimumSize)
 	header.ICMPv4(icmp).SetType(header.ICMPv4Echo)
 	return ethV4(t, dst, uint8(header.ICMPv4ProtocolNumber), icmp)
 }
 
-// ethV6WithRouting builds an IPv6 frame carrying a minimal Routing extension
-// header (next header TCP), used to check that the filter drops it.
 func ethV6WithRouting(t *testing.T, dst tcpip.Address) *stack.PacketBuffer {
 	routing := uint8(header.IPv6RoutingExtHdrIdentifier)
 	rh := []byte{uint8(header.TCPProtocolNumber), 0, 0, 0, 0, 0, 0, 0}
 	return ethFrame(t, 0x86dd, buildV6(dst, routing, rh), true)
 }
 
-// ethV4Cooked builds a cooked-packet-socket-shaped IPv4 frame: L3 in Data,
-// NetworkHeader empty, EtherType claims IPv4.
+// ethV4Cooked builds a cooked packet-socket frame with L3 in Data.
 func ethV4Cooked(t *testing.T, dst [4]byte) *stack.PacketBuffer {
 	return ethFrame(t, 0x0800, buildV4(dst, 6, nil, nil), true)
 }
 
-// arpEtherTypeCarryingIPv4 crafts a frame whose EtherType is ARP but whose
-// payload is an IPv4 packet: it must be rejected as a malformed ARP.
+// arpEtherTypeCarryingIPv4 labels an IPv4 packet as ARP.
 func arpEtherTypeCarryingIPv4(t *testing.T, dst [4]byte) *stack.PacketBuffer {
 	return ethFrame(t, 0x0806, buildV4(dst, 6, nil, nil), true)
 }
@@ -943,8 +874,7 @@ func arpEtherTypeCarryingIPv4(t *testing.T, dst [4]byte) *stack.PacketBuffer {
 // ethARP builds a minimal valid ARP frame, optionally oversized.
 func ethARP(t *testing.T, oversized bool) *stack.PacketBuffer {
 	arp := make([]byte, header.ARPSize)
-	// Encode a syntactically valid ARP request: HW type 1 (eth), proto 0x0800,
-	// HW addr len 6, proto addr len 4, op 1.
+	// Ethernet/IPv4 ARP request.
 	binary.BigEndian.PutUint16(arp[0:2], 1)
 	binary.BigEndian.PutUint16(arp[2:4], 0x0800)
 	arp[4] = 6
@@ -957,8 +887,7 @@ func ethARP(t *testing.T, oversized bool) *stack.PacketBuffer {
 	return ethFrame(t, 0x0806, l3, true)
 }
 
-// netstackV4UDP builds an outbound netstack-origin IPv4/UDP packet: headers in
-// their parsed slots, payload in Data, ethernet link header present.
+// netstackV4UDP builds a UDP packet with parsed headers and payload in Data.
 func netstackV4UDP(t *testing.T, dst [4]byte, srcPort, dstPort uint16, payload []byte) *stack.PacketBuffer {
 	t.Helper()
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -981,9 +910,7 @@ func netstackV4UDP(t *testing.T, dst [4]byte, srcPort, dstPort uint16, payload [
 	return pkt
 }
 
-// inboundV4UDP builds an inbound IPv4/UDP packet as delivered to
-// DeliverNetworkPacket: the link header has already been consumed, so the L3
-// packet is at the front of Data.
+// inboundV4UDP builds a UDP packet with LinkHeader consumed and L3 in Data.
 func inboundV4UDP(t *testing.T, src, dst [4]byte, srcPort, dstPort uint16, payload []byte) *stack.PacketBuffer {
 	t.Helper()
 	udpBytes := make([]byte, header.UDPMinimumSize+len(payload))

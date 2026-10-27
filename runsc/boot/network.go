@@ -208,15 +208,10 @@ type CreateLinksAndRoutesArgs struct {
 	// IsRestore indicates whether this is part of a restore flow.
 	IsRestore bool
 
-	// EgressAllowDomains is a comma-separated list of domain patterns whose
-	// DNS-resolved addresses are allowed as egress destinations. See
-	// config.Config.EgressAllowDomains.
+	// EgressAllowDomains is copied from config.Config.EgressAllowDomains.
 	EgressAllowDomains string
 
-	// EgressAllowIPs is a comma-separated list of IPs/CIDRs allowed as egress
-	// destinations. See config.Config.EgressAllowIPs. When either egress
-	// allowlist field is non-empty, an egress filter is installed on every
-	// external NIC and all other egress is blocked.
+	// EgressAllowIPs is copied from config.Config.EgressAllowIPs.
 	EgressAllowIPs string
 }
 
@@ -316,9 +311,7 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 		return fmt.Errorf("args.FilePayload.Files has %d FDs but we need %d entries based on FDBasedLinks, XDPLinks, and PCAP", got, wantFDs)
 	}
 
-	// Build a single egress filter shared by every external NIC. It enforces a
-	// destination-IP allowlist and grows it by snooping DNS. A nil filter means
-	// the feature is off and NIC wrapping is skipped.
+	// Share the egress policy and learned addresses across external NICs.
 	var egressFilter *egressfilter.Filter
 	if args.EgressAllowDomains != "" || args.EgressAllowIPs != "" {
 		domains := egressallowlist.SplitList(args.EgressAllowDomains)
@@ -432,8 +425,7 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 				linkEP = sniffer.New(linkEP)
 			}
 
-			// Install the egress filter below the qdisc and above the sniffer so
-			// it sees every outbound packet and drops before the pcap capture.
+			// Filter before capture and after queueing.
 			if egressFilter != nil {
 				linkEP = egressfilter.New(linkEP, egressFilter)
 			}
@@ -537,8 +529,7 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 			linkEP = sniffer.New(linkEP)
 		}
 
-		// Install the egress filter below the qdisc and above the sniffer so it
-		// sees every outbound packet and drops before the pcap capture.
+		// Filter before capture and after queueing.
 		if egressFilter != nil {
 			linkEP = egressfilter.New(linkEP, egressFilter)
 		}

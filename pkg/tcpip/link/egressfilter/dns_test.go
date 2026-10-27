@@ -22,7 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 )
 
-// mustName builds a dnsmessage.Name, failing the test on error.
 func mustName(t *testing.T, s string) dnsmessage.Name {
 	t.Helper()
 	n, err := dnsmessage.NewName(s)
@@ -32,7 +31,6 @@ func mustName(t *testing.T, s string) dnsmessage.Name {
 	return n
 }
 
-// buildQuery builds a DNS query wire message.
 func buildQuery(t *testing.T, id uint16, name string, qtype dnsmessage.Type) []byte {
 	t.Helper()
 	msg := dnsmessage.Message{
@@ -50,7 +48,6 @@ func buildQuery(t *testing.T, id uint16, name string, qtype dnsmessage.Type) []b
 	return b
 }
 
-// aResource builds an A answer record.
 func aResource(t *testing.T, owner string, ip [4]byte) dnsmessage.Resource {
 	t.Helper()
 	return dnsmessage.Resource{
@@ -59,7 +56,6 @@ func aResource(t *testing.T, owner string, ip [4]byte) dnsmessage.Resource {
 	}
 }
 
-// aaaaResource builds an AAAA answer record.
 func aaaaResource(t *testing.T, owner string, ip [16]byte) dnsmessage.Resource {
 	t.Helper()
 	return dnsmessage.Resource{
@@ -68,7 +64,6 @@ func aaaaResource(t *testing.T, owner string, ip [16]byte) dnsmessage.Resource {
 	}
 }
 
-// cnameResource builds a CNAME answer record.
 func cnameResource(t *testing.T, owner, target string) dnsmessage.Resource {
 	t.Helper()
 	return dnsmessage.Resource{
@@ -77,7 +72,6 @@ func cnameResource(t *testing.T, owner, target string) dnsmessage.Resource {
 	}
 }
 
-// buildResponse builds a DNS response with the given question and answers.
 func buildResponse(t *testing.T, id uint16, qname string, answers []dnsmessage.Resource) []byte {
 	return buildResponseQuestion(t, id, qname, dnsmessage.TypeA, dnsmessage.ClassINET, answers)
 }
@@ -159,10 +153,8 @@ func TestParseDNSQueryRejects(t *testing.T) {
 	}
 }
 
-// TestParseDNSQueryRejectsLiteralDotLabel pins x/net/dnsmessage's rejection of
-// a wire-format label containing a literal dot. The string matcher treats dots
-// as label boundaries, so accepting this name would let "a.b.github.com" match
-// a packet whose first label is actually "a.b".
+// TestParseDNSQueryRejectsLiteralDotLabel checks that dnsmessage rejects dots
+// within wire labels, which the matcher would mistake for label boundaries.
 func TestParseDNSQueryRejectsLiteralDotLabel(t *testing.T) {
 	// Header: ID 1, one question. QNAME labels: "a.b", "github", "com".
 	b := []byte{
@@ -185,7 +177,7 @@ func TestHarvestChain(t *testing.T) {
 		cnameResource(t, "docs.github.com.", "github.map.fastly.net."),
 		aResource(t, "github.map.fastly.net.", ip1),
 		aResource(t, "github.map.fastly.net.", ip2),
-		// An unrelated A record a hostile resolver stuffed in: must be ignored.
+		// Ignore answers unrelated to the query.
 		aResource(t, "evil.example.com.", [4]byte{6, 6, 6, 6}),
 	}
 	resp := buildResponse(t, 1, "docs.github.com.", answers)
@@ -339,7 +331,7 @@ func TestLearnResponsePinsQuestionAndLocalAddress(t *testing.T) {
 func TestHarvestApexFlattened(t *testing.T) {
 	f := newTestFilter(t, Config{})
 	ip := [4]byte{140, 82, 121, 3}
-	// Apex A record directly at the queried name (ALIAS/flattening), no CNAME.
+	// A flattened answer has no CNAME.
 	resp := buildResponse(t, 1, "github.com.", []dnsmessage.Resource{
 		aResource(t, "github.com.", ip),
 	})
@@ -353,9 +345,6 @@ func TestHarvestApexFlattened(t *testing.T) {
 	}
 }
 
-// TestHarvestTruncatedKeepsPartial verifies best-effort learning: a response
-// cut mid-record (as TC-bit truncation produces) keeps the addresses that
-// parsed before the cut.
 func TestHarvestTruncatedKeepsPartial(t *testing.T) {
 	f := newTestFilter(t, Config{})
 	ip1 := [4]byte{151, 101, 1, 1}
@@ -378,8 +367,6 @@ func TestHarvestTruncatedKeepsPartial(t *testing.T) {
 	}
 }
 
-// TestHarvestCNAMELoop checks that a CNAME loop (a -> b -> a) terminates via the
-// seen-set and depth cap and still collects the address reachable from the name.
 func TestHarvestCNAMELoop(t *testing.T) {
 	f := newTestFilter(t, Config{})
 	ip := [4]byte{1, 2, 3, 4}
@@ -406,8 +393,7 @@ func TestHarvestCNAMELoop(t *testing.T) {
 
 func TestHarvestOffChainIgnored(t *testing.T) {
 	f := newTestFilter(t, Config{})
-	// CNAME chain that does NOT start at qname. The A record's owner is not
-	// reachable from qname, so nothing should be learned.
+	// The CNAME chain is unrelated to qname.
 	resp := buildResponse(t, 1, "docs.github.com.", []dnsmessage.Resource{
 		cnameResource(t, "other.example.com.", "target.example.com."),
 		aResource(t, "target.example.com.", [4]byte{1, 2, 3, 4}),
@@ -466,9 +452,6 @@ func TestPendingTableTrackConsume(t *testing.T) {
 	}
 }
 
-// TestPendingTableWrongNameNotEvicted verifies that a response matching the
-// key but not the question name (as an off-path spoofer who guessed the txID
-// could send) does not evict the entry, so the genuine response still learns.
 func TestPendingTableWrongNameNotEvicted(t *testing.T) {
 	clock := faketime.NewManualClock()
 	var tbl pendingTable
@@ -503,7 +486,6 @@ func TestPendingTableStaleEntrySwept(t *testing.T) {
 	tbl.init(4)
 	now := clock.NowMonotonic()
 	key := pendingKey{server: tcpip.AddrFrom4([4]byte{8, 8, 8, 8}), clientPort: 5353, txID: 7}
-	// Track a query that will never receive a matching response.
 	tbl.track(key, "a.example.com", dnsmessage.TypeA, now, now.Add(queryTTL))
 	if !tbl.nonEmpty() {
 		t.Fatal("nonEmpty=false after track")
@@ -513,18 +495,13 @@ func TestPendingTableStaleEntrySwept(t *testing.T) {
 	if !tbl.nonEmpty() {
 		t.Fatal("sweep removed a live (unexpired) entry")
 	}
-	// After expiry, a sweep reclaims it so the gate returns to zero even though
-	// no response ever arrived.
+	// Expiry must stop DNS parsing even if no response arrives.
 	tbl.maybeSweep(now.Add(queryTTL + pendingSweepInterval + 1))
 	if tbl.nonEmpty() {
 		t.Error("stale (expired, unanswered) entry was not swept: inbound gate stuck open")
 	}
 }
 
-// TestLearnedSetCap verifies the learned-IP set stops accepting new addresses
-// at its cap (keeping the ones already learned) and reports hitting the cap
-// exactly once, so a resolver returning unbounded addresses cannot grow the
-// allowlist without limit.
 func TestLearnedSetCap(t *testing.T) {
 	var l learnedSet
 	l.init(2)
@@ -541,7 +518,7 @@ func TestLearnedSetCap(t *testing.T) {
 	if l.contains(a3) {
 		t.Error("address over the cap must not be learned")
 	}
-	// The cap is reported only once, so the operator warning does not repeat.
+	// Report capacity exhaustion only once.
 	if hitCap := l.addBatch([]tcpip.Address{a3}); hitCap {
 		t.Error("hitCap must be reported only on the call that first fills the set")
 	}
@@ -559,7 +536,7 @@ func TestPendingTableCapRefusesButKeepsLive(t *testing.T) {
 	if !tbl.track(k1, "one", dnsmessage.TypeA, now, exp) || !tbl.track(k2, "two", dnsmessage.TypeA, now, exp) {
 		t.Fatal("failed to fill table")
 	}
-	// Table full of live entries: a third must be refused (not evicting a live one).
+	// Do not evict live queries when full.
 	if tbl.track(k3, "three", dnsmessage.TypeA, now, exp) {
 		t.Error("track accepted a third entry over a full table of live entries")
 	}

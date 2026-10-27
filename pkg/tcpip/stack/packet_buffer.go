@@ -428,10 +428,8 @@ func (pk *PacketBuffer) Network() header.Network {
 	}
 }
 
-// TrimmedNetworkClone builds an independent PacketBuffer containing the
-// network-layer packet and below, trimmed of virtio and link headers, so
-// header-mutating parse helpers can run on it without disturbing pk. The
-// caller must DecRef the result.
+// TrimmedNetworkClone returns a clone with virtio and link headers removed and
+// the network packet in Data, ready for parsing. The caller must DecRef it.
 func (pk *PacketBuffer) TrimmedNetworkClone() *PacketBuffer {
 	buf := pk.ToBuffer()
 	buf.TrimFront(int64(len(pk.VirtioNetHeader().Slice())))

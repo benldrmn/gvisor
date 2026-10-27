@@ -24,28 +24,12 @@ import (
 // responseTTL is the IP TTL / hop limit of a synthesized reset.
 const responseTTL = 64
 
-// synthesizeRST builds an inbound-shaped IP/TCP RST for a blocked outbound TCP
-// segment, as if the destination refused the connection, so the workload's
-// connect() fails fast (ECONNREFUSED) instead of hanging on SYN retransmits
-// until its own timeout. pkt is the dropped outbound packet and is never
-// mutated.
+// synthesizeRST builds an inbound reset for a blocked outbound TCP segment,
+// following RFC 9293 section 3.10.7.1. It leaves pkt unchanged and returns nil
+// for non-TCP packets, resets, or missing or invalid headers.
 //
-// It acts only on a segment whose network and transport headers are already
-// parsed, which for TCP means one the sentry's own TCP endpoint built. A raw or
-// packet-socket sender leaves its transport header in Data, so the too-short
-// check below returns nil. Such a sender manages its own retransmits and would
-// not consume an injected RST anyway. It also returns nil for non-TCP, a
-// segment that is itself a RST (never answer a reset with a reset), a too-short
-// transport header, or an unrecoverable address.
-//
-// The seq/ack of the reset follow RFC 9293 section 3.10.7.1 (reset generation
-// for a CLOSED connection), matching the transport stack's own replyWithReset.
-// If the incoming segment carries an ACK, the reset takes its sequence number
-// from that ACK and carries no ACK of its own. Otherwise the reset has sequence
-// number zero and acknowledges the incoming segment's sequence number plus its
-// logical length (payload plus one each for SYN and FIN).
-//
-// The caller owns the returned packet and must DecRef it after delivery.
+// It requires parsed transport headers, excluding raw and packet sockets.
+// The caller must DecRef a returned packet.
 func synthesizeRST(pkt *stack.PacketBuffer, l4proto uint8) (*stack.PacketBuffer, tcpip.NetworkProtocolNumber) {
 	if l4proto != uint8(header.TCPProtocolNumber) {
 		return nil, 0
@@ -53,7 +37,6 @@ func synthesizeRST(pkt *stack.PacketBuffer, l4proto uint8) (*stack.PacketBuffer,
 	nh := pkt.NetworkHeader().Slice()
 	th := pkt.TransportHeader().Slice()
 	if len(nh) == 0 || len(th) < header.TCPMinimumSize {
-		// No parsed headers (raw or packet-socket write) or a truncated segment.
 		return nil, 0
 	}
 	seg := header.TCP(th)
@@ -61,9 +44,7 @@ func synthesizeRST(pkt *stack.PacketBuffer, l4proto uint8) (*stack.PacketBuffer,
 		return nil, 0
 	}
 
-	// srcAddr/dstAddr are the outbound packet's own addresses: srcAddr is the
-	// workload, dstAddr the blocked peer. The RST is delivered inbound, so it
-	// travels from the peer (dstAddr) back to the workload (srcAddr).
+	// The reset reverses the outbound packet's addresses and ports.
 	var srcAddr, dstAddr tcpip.Address
 	var netProto tcpip.NetworkProtocolNumber
 	switch header.IPVersion(nh) {
@@ -91,8 +72,7 @@ func synthesizeRST(pkt *stack.PacketBuffer, l4proto uint8) (*stack.PacketBuffer,
 		seqNum = seg.AckNumber()
 	} else {
 		flags |= header.TCPFlagAck
-		// logicalLen: payload plus one each for SYN and FIN. The payload of a
-		// netstack-origin segment is Data (the transport header is in th).
+		// SYN and FIN each consume one sequence number.
 		logicalLen := uint32(pkt.Data().Size())
 		if seg.Flags().Contains(header.TCPFlagSyn) {
 			logicalLen++

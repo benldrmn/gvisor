@@ -29,20 +29,16 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// dnsPort is the well-known port for plain DNS over UDP.
 const dnsPort = 53
 
-// maxCNAMEChain bounds how deep a CNAME chain the harvester follows.
 const maxCNAMEChain = 16
 
-// pendingKey identifies an in-flight DNS query. Pinning all four fields raises
-// the bar for off-path response spoofing to that of a normal resolver.
+// pendingKey identifies an in-flight DNS query.
 type pendingKey struct {
-	// server is the DNS server address (destination of the query, source of the
-	// response).
+	// server is the DNS server address.
 	server tcpip.Address
-	// local is the query's source address (response destination address). A
-	// Filter may be shared by multiple NICs, so the UDP port is not sufficient.
+	// local is the query's source address, needed to distinguish NICs sharing
+	// a Filter.
 	local tcpip.Address
 	// clientPort is the workload's UDP source port.
 	clientPort uint16
@@ -56,26 +52,20 @@ type pendingEntry struct {
 	expiry tcpip.MonotonicTime
 }
 
-// pendingSweepInterval bounds how often expired entries are reclaimed by the
-// lazy sweep, so the inbound-snoop gate returns to zero within one interval
-// after the last live query expires.
+// pendingSweepInterval is the minimum interval between expiry sweeps.
 const pendingSweepInterval = 10 * time.Second
 
-// pendingTable tracks in-flight DNS queries whose names are on the allowlist.
-// It is bounded. When full it refuses new entries rather than evicting live
-// ones, so a query flood can only deny the workload its own future learning.
-//
-// count is maintained under mu but read locklessly by the inbound gate. It is
-// always >= the number of live entries, so a positive count never misses a real
-// response. It may transiently over-count expired-but-unswept entries, which
-// maybeSweep reclaims within pendingSweepInterval.
+// pendingTable tracks queries for allowed names. When full, it refuses new
+// queries without evicting live ones.
 type pendingTable struct {
-	mu    sync.Mutex
-	m     map[pendingKey]pendingEntry
-	cap   int
+	mu sync.Mutex
+	// m is protected by mu.
+	m   map[pendingKey]pendingEntry
+	cap int
+	// count includes expired entries until swept. Updated under mu and read
+	// atomically to skip DNS parsing when no queries are pending.
 	count atomicbitops.Int64
-	// nextSweepNanos is the monotonic time (nanoseconds) of the next allowed
-	// sweep, used to throttle maybeSweep without locking on every inbound packet.
+	// nextSweepNanos throttles expiry sweeps without taking mu on every packet.
 	nextSweepNanos atomicbitops.Int64
 }
 
@@ -84,16 +74,12 @@ func (t *pendingTable) init(capacity int) {
 	t.cap = capacity
 }
 
-// nonEmpty reports whether any query might be in flight. It is safe to call
-// without holding mu.
+// nonEmpty reports whether queries may be pending without taking mu.
 func (t *pendingTable) nonEmpty() bool {
 	return t.count.Load() > 0
 }
 
-// maybeSweep reclaims expired entries at most once per pendingSweepInterval. It
-// is called from the inbound path so that, even if a tracked query never gets a
-// matching response, count (and thus the snoop gate) returns to zero shortly
-// after the query's TTL, restoring the idle fast path.
+// maybeSweep reclaims expired entries at most once per pendingSweepInterval.
 func (t *pendingTable) maybeSweep(now tcpip.MonotonicTime) {
 	if t.count.Load() == 0 {
 		return
@@ -110,9 +96,7 @@ func (t *pendingTable) maybeSweep(now tcpip.MonotonicTime) {
 	t.mu.Unlock()
 }
 
-// track records a pending query. It returns true if the entry was inserted
-// (or refreshed), false if the table was full. now is the current monotonic
-// time. Expired entries are swept lazily on a full table.
+// track inserts or refreshes a query, returning false if the table is full.
 func (t *pendingTable) track(key pendingKey, qName string, qType dnsmessage.Type, now, expiry tcpip.MonotonicTime) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -130,11 +114,8 @@ func (t *pendingTable) track(key pendingKey, qName string, qType dnsmessage.Type
 	return true
 }
 
-// consume removes the entry matching key, qName, and qType, reporting whether it
-// was present and live (non-expired). An entry whose name does not match is
-// left in place: an off-path spoofer who guesses the key but not the query
-// name must not be able to evict the entry before the genuine response
-// arrives.
+// consume removes a matching query and reports whether it was unexpired.
+// Mismatched questions leave the entry available for a valid response.
 func (t *pendingTable) consume(key pendingKey, qName string, qType dnsmessage.Type, now tcpip.MonotonicTime) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -156,11 +137,8 @@ func (t *pendingTable) sweepExpiredLocked(now tcpip.MonotonicTime) {
 	}
 }
 
-// trackDNSQuery records an outbound plain UDP DNS query for an allowlisted
-// name so the matching response can be learned from. Queries for other names
-// are not tracked: they grant no egress by themselves, but they are forwarded
-// so a name resolving into the static IP allowlist still works. It never
-// mutates pkt.
+// trackDNSQuery records an allowed UDP DNS query without modifying pkt.
+// Queries for other names are forwarded without enabling learning.
 func (f *Filter) trackDNSQuery(pkt *stack.PacketBuffer, dst tcpip.Address, l4proto uint8) {
 	if l4proto != uint8(header.UDPProtocolNumber) || f.domains.Empty() {
 		return
@@ -194,12 +172,11 @@ func (f *Filter) trackDNSQuery(pkt *stack.PacketBuffer, dst tcpip.Address, l4pro
 	f.pending.track(key, qName, qType, now, now.Add(queryTTL))
 }
 
-// snoopInbound inspects an inbound packet for a DNS response matching a pending
-// query and, if found, learns its addresses. It never mutates or drops pkt and
-// never panics. Learning happens before the caller delivers the packet up, so
-// the workload's resolve-then-connect sequence cannot race the learner.
+// snoopInbound learns addresses from responses to pending queries without
+// modifying pkt.
 //
-// rxChecksumValidated must match the receiving NIC's checksum offload decision.
+// Preconditions: rxChecksumValidated matches the receiving NIC's checksum
+// offload decision.
 func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, rxChecksumValidated bool) {
 	switch protocol {
 	case header.IPv4ProtocolNumber, header.IPv6ProtocolNumber:
@@ -207,8 +184,7 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		return
 	}
 
-	// Clone the packet so the mutating parse helpers never disturb the original
-	// that will be delivered up the stack.
+	// Parse a clone to preserve the original packet for the stack.
 	clone := pkt.TrimmedNetworkClone()
 	defer clone.DecRef()
 
@@ -222,8 +198,7 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		if !rxChecksumValidated && !ipHdr.IsChecksumValid() {
 			return
 		}
-		// A fragmented response is not reassembled here, so its payload cannot be
-		// read as DNS; skip it. The address is simply not learned (fail closed).
+		// Fragmented responses require reassembly before DNS parsing.
 		if ipHdr.FragmentOffset() != 0 || ipHdr.Flags()&header.IPv4FlagMoreFragments != 0 {
 			return
 		}
@@ -273,9 +248,7 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 
 	data := clone.Data()
 	sz := data.Size()
-	// Read only the bytes the UDP length field claims, not trailing padding or
-	// anything a sender appended past the datagram, so the snoop sees exactly
-	// what the UDP layer will deliver.
+	// Ignore bytes past the UDP length, matching delivery to the socket.
 	if udpLen := int(udp.Length()); udpLen >= header.UDPMinimumSize && udpLen-header.UDPMinimumSize < sz {
 		sz = udpLen - header.UDPMinimumSize
 	}
@@ -290,9 +263,7 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 	f.learnFromResponse(payload, src, dst, udp.DestinationPort())
 }
 
-// learnFromResponse parses a DNS response, verifies it against a pending query,
-// and adds any learned addresses to the learned set. server/clientPort are read
-// from the packet. The transaction ID and question come from the payload.
+// learnFromResponse adds addresses from a response matching a pending query.
 func (f *Filter) learnFromResponse(payload []byte, server, local tcpip.Address, clientPort uint16) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(payload)
@@ -303,13 +274,11 @@ func (f *Filter) learnFromResponse(payload []byte, server, local tcpip.Address, 
 		return
 	}
 
-	// Read the single question to recover the queried name and pin the txID.
 	q, err := p.Question()
 	if err != nil {
 		return
 	}
 	if _, err := p.Question(); err != dnsmessage.ErrSectionDone {
-		// Real responses echo exactly one question.
 		return
 	}
 	qName := egressallowlist.NormalizeName(q.Name.String())
@@ -326,7 +295,7 @@ func (f *Filter) learnFromResponse(payload []byte, server, local tcpip.Address, 
 	}
 	if hdr.Truncated {
 		warnLogger.Warningf("egressfilter: DNS response for %q was truncated (TC bit), so its TCP-retried addresses will not be learned", qName)
-		// Still learn best-effort from any answers present before truncation.
+		// Learn any complete answers before the truncation.
 	}
 
 	ips := f.harvest(&p, qName)
@@ -338,12 +307,9 @@ func (f *Filter) learnFromResponse(payload []byte, server, local tcpip.Address, 
 	}
 }
 
-// harvest walks the ANSWER section, collecting A/AAAA addresses whose owner name
-// is reachable from qName through this response's CNAME chain. Authority and
-// additional sections are never read. It is bounded in records, IPs, and chain
-// depth, and never panics. Learning is best-effort: a parse error mid-section
-// (e.g. a TC-truncated response cut inside a record) keeps the records already
-// collected.
+// harvest collects A/AAAA answers reachable from qName through CNAMEs.
+// It ignores authority and additional sections and keeps complete records if
+// parsing fails later in the answer section.
 func (f *Filter) harvest(p *dnsmessage.Parser, qName string) []tcpip.Address {
 	type addrList []tcpip.Address
 	addrs := make(map[string]addrList)
@@ -389,8 +355,7 @@ answers:
 		}
 	}
 
-	// Walk the chain from qName, collecting the addresses of every reachable
-	// name. Loop-safe via the seen set and the depth cap.
+	// Follow CNAMEs with a depth limit and cycle detection.
 	var out []tcpip.Address
 	seen := make(map[string]struct{})
 	cur := qName
@@ -414,10 +379,8 @@ answers:
 	return out
 }
 
-// parseDNSQuery extracts the normalized question name and transaction ID from
-// a DNS query. It requires a single question of class IN and type A or AAAA,
-// the only kind that can yield learnable addresses. ok is false on any
-// malformation.
+// parseDNSQuery accepts a single IN A/AAAA question and returns its normalized
+// name, type, and transaction ID.
 func parseDNSQuery(payload []byte) (qName string, qType dnsmessage.Type, txID uint16, ok bool) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(payload)
@@ -443,7 +406,6 @@ func parseDNSQuery(payload []byte) (qName string, qType dnsmessage.Type, txID ui
 	return egressallowlist.NormalizeName(q.Name.String()), q.Type, hdr.ID, true
 }
 
-// networkSrc returns the source address from a parsed network header.
 func networkSrc(protocol tcpip.NetworkProtocolNumber, netHdr []byte) tcpip.Address {
 	switch protocol {
 	case header.IPv4ProtocolNumber:
@@ -460,7 +422,6 @@ func networkSrc(protocol tcpip.NetworkProtocolNumber, netHdr []byte) tcpip.Addre
 	return tcpip.Address{}
 }
 
-// networkDst returns the destination address from a parsed network header.
 func networkDst(protocol tcpip.NetworkProtocolNumber, netHdr []byte) tcpip.Address {
 	switch protocol {
 	case header.IPv4ProtocolNumber:

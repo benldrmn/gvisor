@@ -31,13 +31,13 @@ func TestDomainMatcher(t *testing.T) {
 		want bool
 	}{
 		{"docs.github.com", true},
-		{"DOCS.GITHUB.COM", true}, // caller normalizes, test normalized input
+		{"DOCS.GITHUB.COM", true},
 		{"a.github.com", true},
 		{"a.b.github.com", true},
-		{"github.com", false},      // wildcard excludes apex
-		{"evilgithub.com", false},  // not a subdomain
-		{"example.com", true},      // exact, case-folded at config time
-		{"sub.example.com", false}, // exact does not imply subdomains
+		{"github.com", false},
+		{"evilgithub.com", false},
+		{"example.com", true},
+		{"sub.example.com", false},
 		{"notgithub.com", false},
 	}
 	for _, c := range cases {
@@ -97,12 +97,12 @@ func TestParseIPEntry(t *testing.T) {
 	}{
 		{"8.8.8.8", "8.8.8.8/32"},
 		{"10.0.0.0/8", "10.0.0.0/8"},
-		{"10.1.2.3/8", "10.0.0.0/8"}, // masked to the network address
+		{"10.1.2.3/8", "10.0.0.0/8"},
 		{"2001:db8::1", "2001:db8::1/128"},
 		{"2001:4860::/32", "2001:4860::/32"},
-		{"::ffff:8.8.8.8", "8.8.8.8/32"},     // v4-in-v6 unmapped
-		{"::ffff:8.8.8.0/120", "8.8.8.0/24"}, // prefix re-expressed over v4
-		{" 8.8.4.4 ", "8.8.4.4/32"},          // surrounding whitespace
+		{"::ffff:8.8.8.8", "8.8.8.8/32"},
+		{"::ffff:8.8.8.0/120", "8.8.8.0/24"},
+		{" 8.8.4.4 ", "8.8.4.4/32"},
 	}
 	for _, c := range cases {
 		got, err := ParseIPEntry(c.raw)
@@ -129,9 +129,9 @@ func TestParseIPList(t *testing.T) {
 	got, err := ParseIPList([]string{
 		"8.8.8.8",
 		"10.0.0.0/8",
-		"", " ", // blanks are skipped
-		"10.1.2.3/8",     // masks to 10.0.0.0/8, duplicate
-		"::ffff:8.8.8.8", // unmaps to 8.8.8.8, duplicate
+		"", " ",
+		"10.1.2.3/8",
+		"::ffff:8.8.8.8",
 		"2001:db8::1",
 	})
 	if err != nil {
@@ -166,8 +166,7 @@ func TestParseIPListCap(t *testing.T) {
 	if _, err := ParseIPList(distinct(MaxListEntries + 1)); err == nil {
 		t.Errorf("ParseIPList accepted %d distinct entries, cap is %d", MaxListEntries+1, MaxListEntries)
 	}
-	// Duplicates collapse before the cap is applied, so a repetitive list that
-	// allows little is not rejected.
+	// Duplicate entries do not count toward the limit.
 	dups := make([]string, MaxListEntries+100)
 	for i := range dups {
 		dups[i] = "10.0.0.0/8"
@@ -216,7 +215,7 @@ func TestDomainMatcherCap(t *testing.T) {
 	if _, err := NewDomainMatcher(distinct(MaxListEntries + 1)); err == nil {
 		t.Errorf("NewDomainMatcher accepted %d distinct patterns, cap is %d", MaxListEntries+1, MaxListEntries)
 	}
-	// Duplicates collapse in the matcher's maps and do not count toward the cap.
+	// Duplicate patterns do not count toward the limit.
 	dups := make([]string, MaxListEntries+100)
 	for i := range dups {
 		dups[i] = "dup.example.com"

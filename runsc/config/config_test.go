@@ -243,8 +243,7 @@ func TestInvalidFlags(t *testing.T) {
 }
 
 func TestValidationFail(t *testing.T) {
-	// The EXPERIMENTAL-xdp flag binds to a package global. Reset it after this
-	// test so the redirect-mode case below does not leak into later tests.
+	// EXPERIMENTAL-xdp changes package-global state.
 	defer func() { xdpConfig = XDP{} }()
 	for _, tc := range []struct {
 		name  string
@@ -410,10 +409,7 @@ func TestValidationFail(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// EXPERIMENTAL-xdp binds to the package-global xdpConfig (see
-			// flags.go), so a fresh FlagSet per case does not isolate it. Save
-			// and restore around every case so no case can leak XDP state into
-			// another, regardless of table order.
+			// A fresh FlagSet does not isolate the package-global XDP setting.
 			savedXDPConfig := xdpConfig
 			t.Cleanup(func() { xdpConfig = savedXDPConfig })
 
@@ -659,8 +655,6 @@ func TestOverrideAllowlist(t *testing.T) {
 	}
 }
 
-// newConfigWithEgress returns a Config with the operator-configured egress
-// allowlist flags set, plus its flag set for use with Override.
 func newConfigWithEgress(t *testing.T, domains, ips string) (*Config, *flag.FlagSet) {
 	t.Helper()
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -675,9 +669,7 @@ func newConfigWithEgress(t *testing.T, domains, ips string) (*Config, *flag.Flag
 			t.Fatalf("setting egress-allow-ips: %v", err)
 		}
 	}
-	// The EXPERIMENTAL-xdp flag binds to a package global, so reset it to avoid
-	// inheriting a value another test left behind (which would trip the
-	// egress+XDP-mode validation).
+	// Clear XDP state left by other tests.
 	if err := testFlags.Lookup("EXPERIMENTAL-xdp").Value.Set("off"); err != nil {
 		t.Fatalf("resetting EXPERIMENTAL-xdp: %v", err)
 	}
@@ -688,8 +680,6 @@ func newConfigWithEgress(t *testing.T, domains, ips string) (*Config, *flag.Flag
 	return c, testFlags
 }
 
-// TestOverrideEgressAllowlist verifies that OCI annotations may only narrow the
-// operator-configured egress allowlist, never widen it.
 func TestOverrideEgressAllowlist(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -699,15 +689,10 @@ func TestOverrideEgressAllowlist(t *testing.T) {
 		value     string
 		wantErr   string
 	}{
-		// Operator configured nothing: any annotation only strengthens.
 		{name: "from-empty-add-domains", flag: "egress-allow-domains", value: "*.foo.com"},
 		{name: "from-empty-add-ips", flag: "egress-allow-ips", value: "1.2.3.4"},
 
-		// Operator configured an allowlist: annotations must be a subset.
-		// opIPs is set on every domains case below because Validate rejects a
-		// domains-only config outright (see TestValidationFail/egress-domains-without-ips):
-		// with no static IP, the resolver itself could never be reached, so the
-		// operator baseline can never be domains-only in practice.
+		// Domain rules need a statically allowed resolver.
 		{name: "exact-in-base", opDomains: "docs.example.com,*.github.com", opIPs: "8.8.8.8", flag: "egress-allow-domains", value: "docs.example.com"},
 		{name: "exact-under-wildcard", opDomains: "*.github.com", opIPs: "8.8.8.8", flag: "egress-allow-domains", value: "api.github.com"},
 		{name: "wildcard-equal", opDomains: "*.github.com", opIPs: "8.8.8.8", flag: "egress-allow-domains", value: "*.github.com"},
@@ -716,10 +701,8 @@ func TestOverrideEgressAllowlist(t *testing.T) {
 		{name: "apex-not-under-wildcard", opDomains: "*.github.com", opIPs: "8.8.8.8", flag: "egress-allow-domains", value: "github.com", wantErr: "may only narrow"},
 		{name: "wildcard-not-under-exact", opDomains: "api.github.com", opIPs: "8.8.8.8", flag: "egress-allow-domains", value: "*.github.com", wantErr: "may only narrow"},
 
-		// Adding domains when the operator only configured IPs widens the policy.
 		{name: "add-domains-when-only-ips", opIPs: "8.8.8.8", flag: "egress-allow-domains", value: "x.com", wantErr: "may only narrow"},
 
-		// IP subset checks.
 		{name: "ip-in-base-cidr", opIPs: "10.0.0.0/8", flag: "egress-allow-ips", value: "10.1.2.3"},
 		{name: "cidr-subset", opIPs: "10.0.0.0/8", flag: "egress-allow-ips", value: "10.1.0.0/16"},
 		{name: "ip-equal", opIPs: "8.8.8.8", flag: "egress-allow-ips", value: "8.8.8.8"},
@@ -730,15 +713,7 @@ func TestOverrideEgressAllowlist(t *testing.T) {
 		{name: "v4-in-v6-covered", opIPs: "::ffff:10.0.0.0/104", flag: "egress-allow-ips", value: "10.1.2.3"},
 		{name: "add-ips-when-domains-narrower", opDomains: "a.com", opIPs: "9.9.9.9", flag: "egress-allow-ips", value: "1.2.3.4", wantErr: "may only narrow"},
 
-		// Clearing domains while IPs remain is fine (falls back to a pure
-		// static-IP allowlist). Clearing IPs while domains remain is NOT fine,
-		// even though domains stays non-empty: with no static IP the resolver
-		// itself could never be reached, so the annotation is rejected as if it
-		// had cleared the whole allowlist (checkEgressAllowIPs's asymmetric
-		// check below). Clearing the last populated dimension entirely would
-		// also deactivate the filter (allow-all) and must be rejected.
-		// (Domains-only cannot be "the last populated dimension" here since
-		// Validate never admits a domains-only baseline in the first place.)
+		// Clearing IPs would leave DNS unreachable or disable filtering entirely.
 		{name: "clear-domains-ips-remain", opDomains: "*.github.com", opIPs: "8.8.8.8", flag: "egress-allow-domains", value: ""},
 		{name: "clear-ips-domains-remain", opDomains: "*.github.com", opIPs: "8.8.8.8", flag: "egress-allow-ips", value: "", wantErr: "leaving no reachable DNS resolver"},
 		{name: "clear-only-ips", opIPs: "10.0.0.0/8", flag: "egress-allow-ips", value: "", wantErr: "would clear the egress allowlist"},
@@ -758,22 +733,15 @@ func TestOverrideEgressAllowlist(t *testing.T) {
 	}
 }
 
-// TestOverrideEgressBaselineFrozen verifies that a successful narrowing override
-// does not become the new ceiling: the baseline stays the operator's original
-// across multiple overrides, regardless of order.
 func TestOverrideEgressBaselineFrozen(t *testing.T) {
 	c, testFlags := newConfigWithEgress(t, "*.github.com", "10.0.0.0/8")
-	// Narrow domains to a single subdomain.
 	if err := c.Override(testFlags, "egress-allow-domains", "api.github.com", false); err != nil {
 		t.Fatalf("first narrow failed: %v", err)
 	}
-	// A second override may still widen back to any subset of the ORIGINAL
-	// baseline (*.github.com), proving the baseline was not reset to
-	// api.github.com by the first override.
+	// Each override is checked against the original policy.
 	if err := c.Override(testFlags, "egress-allow-domains", "other.github.com", false); err != nil {
 		t.Errorf("second override against original baseline failed: %v", err)
 	}
-	// But still cannot escape the original baseline.
 	if err := c.Override(testFlags, "egress-allow-domains", "evil.com", false); err == nil {
 		t.Error("override escaped the original baseline")
 	}

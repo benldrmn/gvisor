@@ -20,11 +20,9 @@ import (
 	"strings"
 )
 
-// ParseIPEntry parses a single allowlist entry, an IP address or a CIDR, into
-// a normalized netip.Prefix. A bare address becomes a full-length prefix.
-// Addresses are canonicalized (v4-in-v6 unmapped, prefix length re-expressed
-// over the 32-bit form) so an IPv4 destination compares equal to a
-// "::ffff:a.b.c.d" entry. Zoned addresses are rejected.
+// ParseIPEntry parses an IP address or CIDR into a masked prefix. It unmaps
+// IPv4-mapped IPv6 addresses and adjusts prefix lengths. Bare addresses become
+// full-length prefixes. It rejects zones.
 func ParseIPEntry(raw string) (netip.Prefix, error) {
 	raw = strings.TrimSpace(raw)
 	if strings.Contains(raw, "/") {
@@ -52,11 +50,9 @@ func ParseIPEntry(raw string) (netip.Prefix, error) {
 	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
-// ParseIPList parses a list of IP/CIDR entries into normalized, deduplicated
-// prefixes, preserving first-seen order. Blank entries are skipped. It fails if
-// any entry is invalid or if more than MaxListEntries distinct prefixes remain
-// after deduplication. Deduplication runs first so a list with repeated entries
-// is judged by what it actually allows.
+// ParseIPList returns normalized, deduplicated prefixes in first-seen order.
+// It skips blanks and rejects invalid entries or more than MaxListEntries
+// distinct prefixes.
 func ParseIPList(entries []string) ([]netip.Prefix, error) {
 	seen := make(map[netip.Prefix]struct{}, len(entries))
 	var out []netip.Prefix

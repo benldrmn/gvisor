@@ -163,7 +163,7 @@ func TestDNSReceiveChecksumOffload(t *testing.T) {
 	}
 	udpHeader := header.UDP(raw[header.IPv4MinimumSize:])
 	udpHeader.SetChecksum(header.PseudoHeaderChecksum(header.UDPProtocolNumber, server, local, udpHeader.Length()))
-	// The readv and XDP ingress paths set capability metadata only at the NIC.
+	// Match readv/XDP ingress: the NIC sets RXChecksumValidated after the filter.
 	if pkt.RXChecksumValidated {
 		t.Fatal("unexpected pre-set checksum metadata")
 	}

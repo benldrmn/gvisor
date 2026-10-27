@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package egressallowlist provides parsing and matching for egress allowlist
-// entries (domain patterns and IP/CIDR entries). It is the single source of
-// truth shared by runsc flag validation and the Sentry's egress filter, so a
-// value that passes flag validation cannot later fail in the Sentry.
+// Package egressallowlist parses and matches domain and IP allowlists for runsc
+// configuration and the Sentry's egress filter.
 package egressallowlist
 
 import (
@@ -24,33 +22,26 @@ import (
 )
 
 const (
-	// maxDomainNameLen is the maximum length of a domain name in presentation
-	// form that we accept in a pattern, per RFC 1035 (255 octets on the wire,
-	// which is at most 253 presentation characters).
+	// maxDomainNameLen excludes the trailing dot. RFC 1035 limits wire names to
+	// 255 octets, leaving 253 presentation characters.
 	maxDomainNameLen = 253
 	// maxLabelLen is the maximum length of a single DNS label, per RFC 1035.
 	maxLabelLen = 63
 
-	// MaxListEntries bounds each egress allowlist (IP/CIDR and domain), counted
-	// after normalization and deduplication. The CIDR list is scanned linearly on
-	// the packet hot path and OCI annotations can supply it, so it must not grow
-	// without bound. The limit is far above any hand-written policy.
+	// MaxListEntries limits distinct entries in each normalized allowlist.
+	// This bounds the per-packet scan of CIDR entries.
 	MaxListEntries = 1024
 )
 
-// DomainMatcher decides whether a DNS name is on the allowlist. Both exact
-// names ("docs.github.com") and wildcards ("*.github.com") are supported. A
-// wildcard matches subdomains at any depth (a.b.github.com) but never the apex
-// (github.com). List the apex separately to allow it.
+// DomainMatcher matches exact names and "*." patterns. Wildcards match
+// subdomains at any depth, but not the suffix itself.
 //
-// The zero value matches nothing. It is immutable after construction and safe
-// for concurrent reads without locking.
+// The zero value matches nothing. After construction, a DomainMatcher is
+// immutable and safe for concurrent use.
 type DomainMatcher struct {
 	// exact holds normalized exact names, e.g. "docs.github.com".
 	exact map[string]struct{}
-	// wildcard holds the normalized suffix of a "*." pattern, e.g. the pattern
-	// "*.github.com" is stored as "github.com". A name n matches iff n ends
-	// with "." + suffix (guaranteeing a label boundary and depth >= 1).
+	// wildcard holds pattern suffixes without the "*." prefix.
 	wildcard map[string]struct{}
 }
 
@@ -81,9 +72,7 @@ func NewDomainMatcher(patterns []string) (DomainMatcher, error) {
 	return m, nil
 }
 
-// SplitList splits a comma-separated flag or annotation value into non-empty,
-// trimmed entries. It is the shared splitting rule for flag validation,
-// annotation override checks, and the Sentry's filter construction.
+// SplitList splits a comma-separated value into non-empty, trimmed entries.
 func SplitList(csv string) []string {
 	var out []string
 	for _, raw := range strings.Split(csv, ",") {
@@ -99,8 +88,9 @@ func (m *DomainMatcher) Empty() bool {
 	return len(m.exact) == 0 && len(m.wildcard) == 0
 }
 
-// Match reports whether name (which must already be normalized via
-// NormalizeName) is allowed.
+// Match reports whether name is allowed.
+//
+// Preconditions: name has been normalized with NormalizeName.
 func (m *DomainMatcher) Match(name string) bool {
 	if _, ok := m.exact[name]; ok {
 		return true
@@ -108,11 +98,7 @@ func (m *DomainMatcher) Match(name string) bool {
 	if len(m.wildcard) == 0 {
 		return false
 	}
-	// Walk each label boundary: for "a.b.github.com", test suffixes
-	// "b.github.com", "github.com", "com". A wildcard "*.github.com" (stored as
-	// "github.com") matches because we only test proper suffixes that begin
-	// after a dot, so the apex "github.com" itself is never tested against its
-	// own wildcard.
+	// Check only suffixes after a dot so wildcards exclude the apex.
 	rest := name
 	for {
 		i := strings.IndexByte(rest, '.')
@@ -126,9 +112,7 @@ func (m *DomainMatcher) Match(name string) bool {
 	}
 }
 
-// NormalizeName canonicalizes a DNS name for matching: ASCII-lowercased with a
-// single trailing dot stripped. DNS is case-insensitive and resolvers randomize
-// case ("DNS 0x20"), so matching must fold case.
+// NormalizeName lowercases ASCII letters and removes one trailing dot.
 func NormalizeName(name string) string {
 	if len(name) > 0 && name[len(name)-1] == '.' {
 		name = name[:len(name)-1]
@@ -183,9 +167,8 @@ func ParseDomainPattern(pattern string) (suffix string, wildcard bool, err error
 	return p, wildcard, nil
 }
 
-// validateDomainName checks that name (already normalized, wildcard stripped) is
-// a syntactically valid domain name. orig is the caller-supplied pattern, used
-// only for error messages.
+// validateDomainName checks a normalized name with the wildcard removed.
+// orig is the original pattern, used in errors.
 func validateDomainName(name, orig string) error {
 	if len(name) > maxDomainNameLen {
 		return fmt.Errorf("egress domain %q is longer than %d characters", orig, maxDomainNameLen)
