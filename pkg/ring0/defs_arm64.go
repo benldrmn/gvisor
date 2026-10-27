@@ -17,16 +17,12 @@
 
 package ring0
 
-import (
-	"gvisor.dev/gvisor/pkg/hostarch"
-)
-
 const (
 	// UserspaceSize is the total size of userspace.
 	UserspaceSize = uintptr(1) << VirtualAddressBits
 
-	// MaximumUserAddress is the largest possible user address.
-	MaximumUserAddress = (UserspaceSize - 1) & ^uintptr(hostarch.PageSize-1)
+	// MaximumUserAddress is the largest possible user address (exclusive).
+	MaximumUserAddress = UserspaceSize
 
 	// KernelStartAddress is the starting kernel address.
 	KernelStartAddress = ^uintptr(0) - (UserspaceSize - 1)
@@ -36,11 +32,8 @@ const (
 type KernelArchState struct {
 }
 
-// CPUArchState contains CPU-specific arch state.
-type CPUArchState struct {
-	// stack is the stack used for interrupts on this CPU.
-	stack [128]byte
-
+// CPUArchRegisters contains non-stack CPU architecture state.
+type CPUArchRegisters struct {
 	// errorCode is the error code from the last exception.
 	errorCode uintptr
 
@@ -76,6 +69,19 @@ type CPUArchState struct {
 
 	// appASID is the asid value of guest application.
 	appASID uintptr
+}
+
+// CPUArchState contains CPU-specific arch state.
+type CPUArchState struct {
+	// stack is the stack used for interrupts on this CPU.
+	//
+	// The EL1 trampolines (HaltEl1SvcAndResume, HaltEl1ExceptionAndResume)
+	// run Go call chains on this stack. The deepest chain
+	// (kernelException -> vCPU.KernelException -> Halt) needs ~136 bytes
+	// plus 16 bytes for HaltEl1ExceptionAndResume itself to stage args.
+	stack [176]byte
+
+	CPUArchRegisters
 }
 
 // ErrorCode returns the last error code.

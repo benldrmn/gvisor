@@ -17,11 +17,11 @@ package lisafs
 import (
 	"fmt"
 	"math"
-	"runtime"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/fdchannel"
 	"gvisor.dev/gvisor/pkg/flipcall"
+	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/log"
 )
 
@@ -36,7 +36,7 @@ var (
 // accounts for a large region of shared memory.
 // TODO(gvisor.dev/issue/6313): Tune the number of channels.
 func maxChannels() int {
-	maxChans := runtime.GOMAXPROCS(0)
+	maxChans := gomaxprocs.Base()
 	if maxChans < 2 {
 		maxChans = 2
 	}
@@ -98,6 +98,8 @@ func (ch *channel) destroy() {
 
 // createChannel creates a server side channel. It returns a packet window
 // descriptor (for the data channel) and an open socket for the FD channel.
+//
+// +checklocksexclude:c.channelsMu
 func (c *Connection) createChannel(maxMessageSize uint32) (*channel, flipcall.PacketWindowDescriptor, int, error) {
 	c.channelsMu.Lock()
 	defer c.channelsMu.Unlock()

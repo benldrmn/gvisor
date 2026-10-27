@@ -17,6 +17,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -34,11 +35,41 @@ func TestDefault(t *testing.T) {
 	// "--root" is always set to something different than the default. Reset it
 	// to make it easier to test that default values do not generate flags.
 	c.RootDir = ""
+	if c.GoferNetworkNamespace != GoferNetworkNamespaceNull {
+		t.Errorf("GoferNetworkNamespace=%q, want null", c.GoferNetworkNamespace)
+	}
+	if c.UseNetworkProxy() {
+		t.Errorf("UseNetworkProxy()=true, want false")
+	}
 
 	// All defaults doesn't require setting flags.
 	flags := c.ToFlags()
 	if len(flags) > 0 {
 		t.Errorf("default flags not set correctly for: %s", flags)
+	}
+}
+
+func TestRegisterFlagsXDPIsolation(t *testing.T) {
+	first := flag.NewFlagSet("first", flag.ContinueOnError)
+	RegisterFlags(first)
+	if err := first.Set("EXPERIMENTAL-xdp", "ns"); err != nil {
+		t.Fatal(err)
+	}
+
+	second := flag.NewFlagSet("second", flag.ContinueOnError)
+	RegisterFlags(second)
+	fl := second.Lookup("EXPERIMENTAL-xdp")
+	if got := fl.DefValue; got != "off" {
+		t.Errorf("second FlagSet default = %q, want off", got)
+	}
+	if got := fl.Value.String(); got != "off" {
+		t.Errorf("second FlagSet value = %q, want off", got)
+	}
+	if err := second.Set("EXPERIMENTAL-xdp", "redirect:eth0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Lookup("EXPERIMENTAL-xdp").Value.String(); got != "ns" {
+		t.Errorf("first FlagSet value = %q, want ns", got)
 	}
 }
 
@@ -55,6 +86,9 @@ func TestFromFlags(t *testing.T) {
 		t.Errorf("Flag set: %v", err)
 	}
 	if err := testFlags.Lookup("network").Value.Set("none"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	if err := testFlags.Lookup("gofer-network-namespace").Value.Set("host"); err != nil {
 		t.Errorf("Flag set: %v", err)
 	}
 
@@ -74,6 +108,23 @@ func TestFromFlags(t *testing.T) {
 	if want := NetworkNone; c.Network != want {
 		t.Errorf("Network=%v, want: %v", c.Network, want)
 	}
+	if want := GoferNetworkNamespaceHost; c.GoferNetworkNamespace != want {
+		t.Errorf("GoferNetworkNamespace=%v, want: %v", c.GoferNetworkNamespace, want)
+	}
+
+	if err := testFlags.Lookup("network").Value.Set("sandbox"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	if err := testFlags.Lookup("network-proxy-path").Value.Set("/run/netproxy.sock"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/run/netproxy.sock"; c.NetworkProxyPath != want || !c.UseNetworkProxy() {
+		t.Errorf("NetworkProxyPath=%q UseNetworkProxy()=%v, want %q and true", c.NetworkProxyPath, c.UseNetworkProxy(), want)
+	}
 }
 
 func TestToFlagsFromFlags(t *testing.T) {
@@ -84,14 +135,15 @@ func TestToFlagsFromFlags(t *testing.T) {
 	testFlags.Set("profile", "false") // Matches default value.
 	testFlags.Set("num-network-channels", "123")
 	testFlags.Set("network", "none")
+	testFlags.Set("gofer-network-namespace", "host")
 	c, err := NewFromFlags(testFlags)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	flags := c.ToFlags()
-	if len(flags) != 5 {
-		t.Errorf("wrong number of flags set, want: 5, got: %d: %s", len(flags), flags)
+	if len(flags) != 6 {
+		t.Errorf("wrong number of flags set, want: 6, got: %d: %s", len(flags), flags)
 	}
 	t.Logf("Flags: %s", flags)
 	fm := map[string]string{}
@@ -100,11 +152,12 @@ func TestToFlagsFromFlags(t *testing.T) {
 		fm[kv[0]] = kv[1]
 	}
 	for name, want := range map[string]string{
-		"--root":                 "some-path",
-		"--debug":                "true",
-		"--profile":              "false",
-		"--num-network-channels": "123",
-		"--network":              "none",
+		"--root":                    "some-path",
+		"--debug":                   "true",
+		"--profile":                 "false",
+		"--num-network-channels":    "123",
+		"--network":                 "none",
+		"--gofer-network-namespace": "host",
 	} {
 		if got, ok := fm[name]; ok {
 			if got != want {
@@ -118,11 +171,12 @@ func TestToFlagsFromFlags(t *testing.T) {
 
 func TestToFlagsFromManual(t *testing.T) {
 	c := &Config{
-		RootDir:            "some-path",
-		Debug:              true,
-		ProfileEnable:      false, // Matches default flag value.
-		NumNetworkChannels: 123,
-		Network:            NetworkNone,
+		RootDir:               "some-path",
+		Debug:                 true,
+		ProfileEnable:         false, // Matches default flag value.
+		NumNetworkChannels:    123,
+		Network:               NetworkNone,
+		GoferNetworkNamespace: GoferNetworkNamespaceHost,
 	}
 
 	// Create a second config with flag-default values that we'll copy from.
@@ -144,15 +198,15 @@ func TestToFlagsFromManual(t *testing.T) {
 			// No flag set for this field.
 			continue
 		}
-		if name == "root" || name == "debug" || name == "profile" || name == "num-network-channels" || name == "network" {
+		if name == "root" || name == "debug" || name == "profile" || name == "num-network-channels" || name == "network" || name == "gofer-network-namespace" {
 			continue
 		}
 		cfgReflect.Field(i).Set(cfgDefaultReflect.Field(i))
 	}
 
 	flags := c.ToFlags()
-	if len(flags) != 4 {
-		t.Errorf("wrong number of flags set, want: 4, got: %d: %s", len(flags), flags)
+	if len(flags) != 5 {
+		t.Errorf("wrong number of flags set, want: 5, got: %d: %s", len(flags), flags)
 	}
 	t.Logf("Flags: %s", flags)
 	fm := map[string]string{}
@@ -161,10 +215,11 @@ func TestToFlagsFromManual(t *testing.T) {
 		fm[kv[0]] = kv[1]
 	}
 	for name, want := range map[string]string{
-		"--root":                 "some-path",
-		"--debug":                "true",
-		"--num-network-channels": "123",
-		"--network":              "none",
+		"--root":                    "some-path",
+		"--debug":                   "true",
+		"--num-network-channels":    "123",
+		"--network":                 "none",
+		"--gofer-network-namespace": "host",
 	} {
 		if got, ok := fm[name]; ok {
 			if got != want {
@@ -195,6 +250,11 @@ func TestInvalidFlags(t *testing.T) {
 			name:  "network",
 			value: "invalid",
 			error: "invalid network type",
+		},
+		{
+			name:  "gofer-network-namespace",
+			value: "invalid",
+			error: "invalid gofer network namespace",
 		},
 		{
 			name:  "qdisc",
@@ -231,6 +291,21 @@ func TestInvalidFlags(t *testing.T) {
 			value: "root:memory,sz=sdg",
 			error: "expected format is --overlay2",
 		},
+		{
+			name:  "sidecar-release-enforcement-policy",
+			value: "invalid",
+			error: "invalid value \"invalid\"; must be NEVER, ALWAYS, or IF_RELEASE_BUILD",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "invalid",
+			error: "invalid value \"invalid\"; must be DEFAULT or STRICT",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
+			error: "the embedded sidecar fallback has been removed",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -243,8 +318,6 @@ func TestInvalidFlags(t *testing.T) {
 }
 
 func TestValidationFail(t *testing.T) {
-	// EXPERIMENTAL-xdp changes package-global state.
-	defer func() { xdpConfig = XDP{} }()
 	for _, tc := range []struct {
 		name  string
 		flags map[string]string
@@ -407,12 +480,68 @@ func TestValidationFail(t *testing.T) {
 			},
 			error: "not supported with XDP redirect or tunnel mode",
 		},
+		{
+			name: "network-proxy-path+network:none",
+			flags: map[string]string{
+				"network-proxy-path": "/run/netproxy.sock",
+				"network":            "none",
+			},
+			error: "network-proxy-path flag is only supported with sandbox networking",
+		},
+		{
+			name: "network-proxy-path+network:host",
+			flags: map[string]string{
+				"network-proxy-path": "/run/netproxy.sock",
+				"network":            "host",
+			},
+			error: "network-proxy-path flag is only supported with sandbox networking",
+		},
+		{
+			name: "network-proxy-path:relative",
+			flags: map[string]string{
+				"network-proxy-path": "relative/netproxy.sock",
+			},
+			error: "network-proxy-path must be an absolute path",
+		},
+		{
+			name: "network-proxy-path:abstract",
+			flags: map[string]string{
+				"network-proxy-path": "@netproxy",
+			},
+			error: "network-proxy-path must be an absolute path",
+		},
+		{
+			name: "network-proxy-path+xdp",
+			flags: map[string]string{
+				"network-proxy-path": "/run/netproxy.sock",
+				"EXPERIMENTAL-xdp":   "ns",
+			},
+			error: "network-proxy-path flag is incompatible with XDP",
+		},
+		{
+			name: "platform_device_path:malformed-pair",
+			flags: map[string]string{
+				"platform_device_path": "kvm=/dev/kvm,/dev/other",
+			},
+			error: "expected format is --platform_device_path",
+		},
+		{
+			name: "platform_device_path:duplicate-platform",
+			flags: map[string]string{
+				"platform_device_path": "kvm=/dev/kvm,kvm=/dev/kvm2",
+			},
+			error: "names platform \"kvm\" more than once",
+		},
+		{
+			name: "platform_device_path:auto-single-path",
+			flags: map[string]string{
+				"platform":             PlatformAuto,
+				"platform_device_path": "/dev/kvm2",
+			},
+			error: "--platform=auto accepts only --platform_device_path={platform}={path}",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// A fresh FlagSet does not isolate the package-global XDP setting.
-			savedXDPConfig := xdpConfig
-			t.Cleanup(func() { xdpConfig = savedXDPConfig })
-
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 			RegisterFlags(testFlags)
 			for name, val := range tc.flags {
@@ -427,6 +556,57 @@ func TestValidationFail(t *testing.T) {
 	}
 }
 
+func TestPlatformDeviceFor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		flag     string
+		platform string
+		want     string
+	}{
+		{name: "unset", flag: "", platform: "kvm", want: ""},
+		{name: "single path applies to any platform", flag: "/dev/kvm2", platform: "kvm", want: "/dev/kvm2"},
+		{name: "single path applies to platform without device", flag: "/dev/kvm2", platform: "systrap", want: "/dev/kvm2"},
+		{name: "pair matches", flag: "kvm=/dev/kvm2,other=/dev/other2", platform: "other", want: "/dev/other2"},
+		{name: "pair for other platform is ignored", flag: "kvm=/dev/kvm2", platform: "other", want: ""},
+		{name: "unknown platform name is tolerated", flag: "nosuch=/dev/nosuch,kvm=/dev/kvm2", platform: "kvm", want: "/dev/kvm2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+			RegisterFlags(testFlags)
+			if err := testFlags.Lookup("platform_device_path").Value.Set(tc.flag); err != nil {
+				t.Fatalf("platform_device_path=%q: %v", tc.flag, err)
+			}
+			c, err := NewFromFlags(testFlags)
+			if err != nil {
+				t.Fatalf("NewFromFlags() failed: %v", err)
+			}
+			if got := c.PlatformDeviceFor(tc.platform); got != tc.want {
+				t.Errorf("PlatformDeviceFor(%q) with --platform_device_path=%q = %q, want %q", tc.platform, tc.flag, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPlatformAutoAcceptsDevicePairs(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	for name, val := range map[string]string{
+		"platform":             PlatformAuto,
+		"platform_device_path": "kvm=/dev/kvm2",
+	} {
+		if err := testFlags.Lookup(name).Value.Set(val); err != nil {
+			t.Fatalf("%s=%q: %v", name, val, err)
+		}
+	}
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatalf("NewFromFlags() failed: %v", err)
+	}
+	if got, want := c.PlatformDeviceFor("kvm"), "/dev/kvm2"; got != want {
+		t.Errorf("PlatformDeviceFor(%q) = %q, want %q", "kvm", got, want)
+	}
+}
+
 func TestOverride(t *testing.T) {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)
@@ -435,6 +615,18 @@ func TestOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.AllowFlagOverride = true
+
+	t.Run("XDP", func(t *testing.T) {
+		if err := c.Override(testFlags, "EXPERIMENTAL-xdp", "ns", false); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.XDP; got != (XDP{Mode: XDPModeNS}) {
+			t.Errorf("Override XDP = %+v, want ns", got)
+		}
+		if flags := c.ToFlags(); !slices.Contains(flags, "--EXPERIMENTAL-xdp=ns") {
+			t.Errorf("ToFlags() = %v, want --EXPERIMENTAL-xdp=ns", flags)
+		}
+	})
 
 	t.Run("string", func(t *testing.T) {
 		c.RootDir = "foobar"
@@ -508,6 +700,11 @@ func TestOverrideError(t *testing.T) {
 			value: "invalid",
 			error: "invalid file access type",
 		},
+		{
+			name:  "in-sandbox-cgroup",
+			value: "invalid",
+			error: "invalid in-sandbox-cgroup",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := c.Override(testFlags, tc.name, tc.value, false); err == nil || !strings.Contains(err.Error(), tc.error) {
@@ -540,6 +737,14 @@ func TestOverrideAllowlist(t *testing.T) {
 			error: "error setting flag",
 		},
 		{
+			flag:  "in-sandbox-cgroup",
+			value: "v1",
+		},
+		{
+			flag:  "in-sandbox-cgroup",
+			value: "v2",
+		},
+		{
 			flag:  "oci-seccomp",
 			value: "true",
 		},
@@ -566,6 +771,11 @@ func TestOverrideAllowlist(t *testing.T) {
 		{
 			flag:  "profile",
 			value: "123",
+			error: "flag override disabled",
+		},
+		{
+			flag:  "network-proxy-path",
+			value: "/run/netproxy.sock",
 			error: "flag override disabled",
 		},
 		{
@@ -668,10 +878,6 @@ func newConfigWithEgress(t *testing.T, domains, ips string) (*Config, *flag.Flag
 		if err := testFlags.Lookup("egress-allow-ips").Value.Set(ips); err != nil {
 			t.Fatalf("setting egress-allow-ips: %v", err)
 		}
-	}
-	// Clear XDP state left by other tests.
-	if err := testFlags.Lookup("EXPERIMENTAL-xdp").Value.Set("off"); err != nil {
-		t.Fatalf("resetting EXPERIMENTAL-xdp: %v", err)
 	}
 	c, err := NewFromFlags(testFlags)
 	if err != nil {
@@ -832,7 +1038,7 @@ func TestOverrideDeferredValidation(t *testing.T) {
 func TestBundles(t *testing.T) {
 	noChange := func(t *testing.T, old, new *Config) {
 		t.Helper()
-		if diff := cmp.Diff(old, new, cmp.AllowUnexported(Config{}, Overlay2{})); diff != "" {
+		if diff := cmp.Diff(old, new, cmp.AllowUnexported(Config{}, Overlay2{}, SandboxCPUPolicy{})); diff != "" {
 			t.Errorf("different configs:\n%+v\nvs\n%+v\nDiff:\n%s", old, new, diff)
 		}
 	}
@@ -1101,4 +1307,140 @@ func TestParseSerializeOverlay2(t *testing.T) {
 			t.Fatalf("String mismatch, expecting ll:memory,size=1g, got %q", o.String())
 		}
 	})
+	t.Run("Repeated Set", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("all:memory,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Set("root:self"); err != nil {
+			t.Fatal(err)
+		}
+		want := Overlay2{rootMount: true, medium: SelfOverlay}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
+		}
+	})
+	t.Run("Invalid Set preserves value", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("root:self,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		want := o
+		if err := o.Set("all:memory,invalid=1g"); err == nil {
+			t.Fatal("Set succeeded, want error")
+		}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
+		}
+	})
+}
+
+func TestSignalUnkillablePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		val     string
+		want    SignalUnkillablePolicy
+		wantErr bool
+	}{
+		{val: "none", want: SignalUnkillableNone},
+		{val: "linux", want: SignalUnkillableLinux},
+		{val: "invalid", wantErr: true},
+	} {
+		t.Run(tc.val, func(t *testing.T) {
+			var p SignalUnkillablePolicy
+			err := p.Set(tc.val)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("p.Set(%q) succeeded, want error", tc.val)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("p.Set(%q) failed: %v", tc.val, err)
+			}
+			if p != tc.want {
+				t.Errorf("got %v, want %v", p, tc.want)
+			}
+			if p.String() != tc.val {
+				t.Errorf("p.String() = %q, want %q", p.String(), tc.val)
+			}
+			if p.Get() != tc.want {
+				t.Errorf("p.Get() = %v, want %v", p.Get(), tc.want)
+			}
+			if *p.Ptr() != tc.want {
+				t.Errorf("*p.Ptr() = %v, want %v", *p.Ptr(), tc.want)
+			}
+		})
+	}
+
+	t.Run("InvalidStringPanics", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic for invalid policy string, got none")
+			}
+		}()
+		_ = SignalUnkillablePolicy(-1).String()
+	})
+}
+
+func TestSandboxCPUPolicy(t *testing.T) {
+	if got := (SandboxCPUPolicy{}).String(); got != "1x" {
+		t.Errorf("zero value String() = %q, want %q", got, "1x")
+	}
+	if !DefaultSandboxLifecycleCPUPolicy.Implicit() {
+		t.Errorf("default policy is not implicit")
+	}
+	explicit := DefaultSandboxLifecycleCPUPolicy
+	if err := explicit.Set(DefaultSandboxLifecycleCPUPolicy.String()); err != nil {
+		t.Fatalf("Set(%q) failed: %v", DefaultSandboxLifecycleCPUPolicy, err)
+	}
+	if explicit.Implicit() || explicit.String() != DefaultSandboxLifecycleCPUPolicy.String() {
+		t.Errorf("policy set to the default value = %+v, want the same value and explicit", explicit)
+	}
+	const quota, period = 50000, 100000
+	for _, tc := range []struct {
+		val       string
+		str       string
+		wantQuota int64
+		wantErr   bool
+	}{
+		{val: "1x", str: "1x", wantQuota: quota},
+		{val: "1.0x", str: "1x", wantQuota: quota},
+		{val: "uncapped", str: "uncapped", wantQuota: -1},
+		{val: "2500m", str: "2500m", wantQuota: 250000},
+		{val: "3.5x", str: "3.5x", wantQuota: 175000},
+		{val: "1m", str: "1m", wantQuota: quota},
+		{val: "0.5x", str: "1x", wantQuota: quota},
+		{val: "9223372036854775807m", str: "9223372036854775807m", wantQuota: 1<<44 - 1},
+		{val: "max(4x,1000m)", str: "max(4x,1000m)", wantQuota: 200000},
+		{val: "max( 1000m , 4x )", str: "max(4x,1000m)", wantQuota: 200000},
+		{val: "max(0.5x,2000m,1x)", str: "2000m", wantQuota: 200000},
+		{val: "max(1x)", str: "1x", wantQuota: quota},
+		{val: "max(uncapped,4x)", str: "uncapped", wantQuota: -1},
+		{val: "max()", wantErr: true},
+		{val: "max(4x", wantErr: true},
+		{val: "max(4x,bogus)", wantErr: true},
+		{val: "0m", wantErr: true},
+		{val: "-1x", wantErr: true},
+		{val: "1.5m", wantErr: true},
+		{val: "2", wantErr: true},
+	} {
+		t.Run(tc.val, func(t *testing.T) {
+			var p SandboxCPUPolicy
+			if err := p.Set(tc.val); (err != nil) != tc.wantErr {
+				t.Fatalf("p.Set(%q) = %v, want error: %t", tc.val, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if got := p.String(); got != tc.str {
+				t.Errorf("p.String() = %q, want %q", got, tc.str)
+			}
+			if got := p.Enabled(); got != (tc.str != "1x") {
+				t.Errorf("p.Enabled() = %t, want %t", got, tc.str != "1x")
+			}
+			if got := p.Quota(quota, period); got != tc.wantQuota {
+				t.Errorf("p.Quota(%d, %d) = %d, want %d", quota, period, got, tc.wantQuota)
+			}
+		})
+	}
 }

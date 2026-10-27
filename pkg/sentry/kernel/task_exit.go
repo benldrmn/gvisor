@@ -34,10 +34,10 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	"gvisor.dev/gvisor/pkg/waiter"
-
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // TaskExitState represents a step in the task exit path.
@@ -85,7 +85,7 @@ func (t TaskExitState) String() string {
 // killLocked marks t as killed by enqueueing a SIGKILL, without causing the
 // thread-group-affecting side effects SIGKILL usually has.
 //
-// Preconditions: The signal mutex must be locked.
+// +checklocks:t.tg.signalHandlers.mu
 func (t *Task) killLocked() {
 	// Clear killable stops.
 	if t.stop != nil && t.stop.Killable() {
@@ -125,6 +125,37 @@ func (t *Task) killedLocked() bool {
 	return linux.SignalSet(t.pendingSignals.pendingSet.RacyLoad())&linux.SignalSetOf(linux.SIGKILL) != 0
 }
 
+// FatalSignalPending returns true if t has a SIGKILL pending, or an unblocked
+// pending signal whose delivery will terminate t's thread group. In Linux,
+// kernel/signal.c:complete_signal() converts the latter into SIGKILL when the
+// signal is sent, so FatalSignalPending is analogous to Linux's
+// fatal_signal_pending().
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) FatalSignalPending() bool {
+	if t.killed() {
+		return true
+	}
+	// As in Linux, signals other than SIGKILL are never fatal before delivery
+	// to a traced task, since the tracer may suppress them.
+	if t.ptraceTracer.Load() != nil {
+		return false
+	}
+	mask := linux.SignalSet(t.signalMask.Load())
+	if (linux.SignalSet(t.pendingSignals.pendingSet.Load())|linux.SignalSet(t.tg.pendingSignals.pendingSet.Load()))&^mask == 0 {
+		return false
+	}
+	t.tg.signalHandlers.mu.Lock()
+	defer t.tg.signalHandlers.mu.Unlock()
+	pending := (linux.SignalSet(t.pendingSignals.pendingSet.RacyLoad()) | linux.SignalSet(t.tg.pendingSignals.pendingSet.RacyLoad())) &^ mask
+	for sig := linux.Signal(1); sig <= linux.SignalMaximum; sig++ {
+		if pending&linux.SignalSetOf(sig) != 0 && computeAction(sig, t.tg.signalHandlers.actions[sig]) == SignalActionTerm {
+			return true
+		}
+	}
+	return false
+}
+
 // PrepareExit indicates an exit with the given status.
 //
 // Preconditions: The caller must be running on the task goroutine.
@@ -151,15 +182,17 @@ func (t *Task) PrepareExit(ws linux.WaitStatus) {
 // ptrace.)
 //
 // Preconditions: The caller must be running on the task goroutine.
+//
+// +checklocksexclude:t.tg.signalHandlers.mu
 func (t *Task) PrepareGroupExit(ws linux.WaitStatus) {
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
 	t.prepareGroupExitLocked(ws)
 }
 
-// Preconditions:
-//   - The caller must be running on the task goroutine.
-//   - The signal mutex must be locked.
+// Preconditions: The caller must be running on the task goroutine.
+//
+// +checklocks:t.tg.signalHandlers.mu
 func (t *Task) prepareGroupExitLocked(ws linux.WaitStatus) {
 	if t.tg.exiting || t.tg.execing != nil {
 		// Note that if t.tg.exiting is false but t.tg.execing is not nil, i.e.
@@ -180,7 +213,9 @@ func (t *Task) prepareGroupExitLocked(ws linux.WaitStatus) {
 	t.exitStatus = ws
 	for sibling := t.tg.tasks.Front(); sibling != nil; sibling = sibling.Next() {
 		if sibling != t {
-			sibling.killLocked()
+			// The list contains tasks in t.tg; checklocks cannot infer
+			// that sibling uses the signal mutex required by this helper.
+			sibling.killLocked() // +checklocksignore
 		}
 	}
 }
@@ -243,8 +278,11 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.traceExitEvent()
 
 	if seccheck.Global.Enabled(seccheck.PointTaskExit) {
+		t.tg.signalHandlers.mu.Lock()
+		exitStatus := int32(t.tg.exitStatus)
+		t.tg.signalHandlers.mu.Unlock()
 		info := &pb.TaskExit{
-			ExitStatus: int32(t.tg.exitStatus),
+			ExitStatus: exitStatus,
 		}
 		fields := seccheck.Global.GetFieldSet(seccheck.PointTaskExit)
 		if !fields.Context.Empty() {
@@ -288,11 +326,16 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	// of that lock.
 	t.p.PrepareExit()
 	t.mu.Lock()
-	mm := t.image.MemoryManager
+	taskMM := t.image.MemoryManager
+	if taskMM != nil {
+		t.userDumpable = (taskMM.Dumpability() == mm.UserDumpable)
+	}
 	t.image.MemoryManager = nil
 	t.image.fu = nil
 	t.mu.Unlock()
-	mm.DecUsers(t)
+	if taskMM != nil {
+		taskMM.DecUsers(t)
+	}
 
 	// Releasing the MM unblocks a blocked CLONE_VFORK parent.
 	t.unstopVforkParent()
@@ -312,6 +355,8 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.utsns = nil
 	ipcns := t.ipcns
 	t.ipcns = nil
+	cgroupns := t.cgroupns
+	t.cgroupns = nil
 	netns := t.netns
 	t.netns = nil
 	userns := t.Credentials().UserNamespace
@@ -321,6 +366,7 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	mntns.DecRef(t)
 	utsns.DecRef(t)
 	ipcns.DecRef(t)
+	cgroupns.DecRef(t)
 	netns.DecRef(t)
 	userns.DecRef(t)
 	if childPIDNS != nil {
@@ -379,10 +425,10 @@ func (t *Task) exitThreadGroup() bool {
 	return last
 }
 
-// Preconditions: The TaskSet mutex must be locked for writing.
+// +checklocks:t.tg.pidns.owner.mu
 func (t *Task) exitChildrenLocked() {
 	newParent := t.findReparentTargetLocked()
-	if newParent == nil {
+	if newParent == nil && !t.tg.pidns.noInit {
 		// "If the init process of a PID namespace terminates, the kernel
 		// terminates all of the processes in the namespace via a SIGKILL
 		// signal." - pid_namespaces(7)
@@ -393,7 +439,7 @@ func (t *Task) exitChildrenLocked() {
 				continue
 			}
 			other.signalHandlers.mu.Lock()
-			other.leader.sendSignalLocked(&linux.SignalInfo{
+			other.leader.sendForcedSignalLocked(&linux.SignalInfo{
 				Signo: int32(linux.SIGKILL),
 			}, true /* group */)
 			other.signalHandlers.mu.Unlock()
@@ -415,10 +461,12 @@ func (t *Task) exitChildrenLocked() {
 			siginfo.SetPID(int32(c.tg.pidns.tids[t]))
 			siginfo.SetUID(int32(t.Credentials().RealKUID.In(c.UserNamespace()).OrOverflow()))
 			c.tg.signalHandlers.mu.Lock()
-			c.sendSignalLocked(siginfo, true /* group */)
+			c.sendSignalTimerLocked(siginfo, true /* group */, c.tg.signalForcedFrom(t), nil)
 			c.tg.signalHandlers.mu.Unlock()
 		}
-		c.reparentLocked(newParent)
+		// Children belong to t's locked TaskSet; checklocks cannot infer
+		// that relationship from membership in t.children.
+		c.reparentLocked(newParent) // +checklocksignore
 		if newParent != nil {
 			newParent.children[c] = struct{}{}
 		}
@@ -483,9 +531,19 @@ func (tg *ThreadGroup) anyNonExitingTaskLocked() *Task {
 	return nil
 }
 
+// HasNonExitingTasks returns true if any task in tg has not yet begun
+// exiting.
+func (tg *ThreadGroup) HasNonExitingTasks() bool {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	return tg.anyNonExitingTaskLocked() != nil
+}
+
 // reparentLocked changes t's parent. The new parent may be nil.
 //
-// Preconditions: The TaskSet mutex must be locked for writing.
+// Preconditions: A nonnil parent belongs to t's TaskSet.
+//
+// +checklocks:t.tg.pidns.owner.mu
 func (t *Task) reparentLocked(parent *Task) {
 	oldParent := t.parent
 	t.parent = parent
@@ -648,7 +706,8 @@ func (*runExitNotify) execute(t *Task) taskRunState {
 // handling of SIGCHLD, regardless of what the exited task's thread group's
 // termination signal is.
 //
-// Preconditions: The TaskSet mutex must be locked for writing.
+// +checklocks:t.tg.pidns.owner.mu
+// +checklocksexclude:t.mu
 func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 	if t.exitStateLocked() != TaskExitZombie {
 		return
@@ -801,6 +860,8 @@ type TaskDestroyAction interface {
 //
 // It returns true if the action was successfully registered.
 // If the task is already terminated, it returns false.
+//
+// +checklocksexclude:t.mu
 func (t *Task) RegisterOnDestroyAction(act TaskDestroyAction) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -813,12 +874,15 @@ func (t *Task) RegisterOnDestroyAction(act TaskDestroyAction) bool {
 
 // UnregisterOnDestroyAction unregisters an action previously registered with
 // RegisterOnDestroyAction.
+//
+// +checklocksexclude:t.mu
 func (t *Task) UnregisterOnDestroyAction(key TaskDestroyAction) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.onDestroyAction, key)
 }
 
+// +checklocksexclude:t.mu
 func (t *Task) execOnDestroyActions() {
 	t.mu.Lock()
 	actions := t.onDestroyAction
@@ -988,7 +1052,9 @@ type WaitOptions struct {
 	NonBlock bool
 }
 
-// Preconditions: The TaskSet mutex must be locked (for reading or writing).
+// Preconditions: pidns belongs to t's TaskSet.
+//
+// +checklocksread:t.tg.pidns.owner.mu
 func (o *WaitOptions) matchesTask(t *Task, pidns *PIDNamespace, tracee bool) bool {
 	if o.SpecificTID != 0 && o.SpecificTID != pidns.tids[t] {
 		return false
@@ -1091,19 +1157,23 @@ func (t *Task) waitOnce(opts *WaitOptions) (*WaitResult, error) {
 	return nil, linuxerr.ECHILD
 }
 
-// Preconditions: The TaskSet mutex must be locked for writing.
+// Preconditions: parent belongs to t's thread group.
+//
+// +checklocks:t.tg.pidns.owner.mu
 func (t *Task) waitParentLocked(opts *WaitOptions, parent *Task) (*WaitResult, bool) {
 	anyWaitableTasks := false
 
 	for child := range parent.children {
-		if !opts.matchesTask(child, parent.tg.pidns, false) {
+		// parent is in t's thread group, so its children belong to t's
+		// locked TaskSet. checklocks cannot follow map membership.
+		if !opts.matchesTask(child, parent.tg.pidns, false) { // +checklocksignore
 			continue
 		}
 		// Non-leaders don't notify parents on exit and aren't eligible to
 		// be waited on.
 		if opts.Events&EventExit != 0 && child == child.tg.leader && !child.exitParentAcked {
 			anyWaitableTasks = true
-			if wr := t.waitCollectZombieLocked(child, opts, false); wr != nil {
+			if wr := t.waitCollectZombieLocked(child, opts, false); wr != nil { // +checklocksignore
 				return wr, anyWaitableTasks
 			}
 		}
@@ -1139,13 +1209,15 @@ func (t *Task) waitParentLocked(opts *WaitOptions, parent *Task) (*WaitResult, b
 		}
 	}
 	for tracee := range parent.ptraceTracees {
-		if !opts.matchesTask(tracee, parent.tg.pidns, true) {
+		// parent is in t's thread group, so its tracees belong to t's
+		// locked TaskSet. checklocks cannot follow map membership.
+		if !opts.matchesTask(tracee, parent.tg.pidns, true) { // +checklocksignore
 			continue
 		}
 		// Non-leaders do notify tracers on exit.
 		if opts.Events&EventExit != 0 && !tracee.exitTracerAcked {
 			anyWaitableTasks = true
-			if wr := t.waitCollectZombieLocked(tracee, opts, true); wr != nil {
+			if wr := t.waitCollectZombieLocked(tracee, opts, true); wr != nil { // +checklocksignore
 				return wr, anyWaitableTasks
 			}
 		}
@@ -1171,7 +1243,9 @@ func (t *Task) waitParentLocked(opts *WaitOptions, parent *Task) (*WaitResult, b
 	return nil, anyWaitableTasks
 }
 
-// Preconditions: The TaskSet mutex must be locked for writing.
+// Preconditions: t and target belong to the same TaskSet.
+//
+// +checklocks:target.tg.pidns.owner.mu
 func (t *Task) waitCollectZombieLocked(target *Task, opts *WaitOptions, asPtracer bool) *WaitResult {
 	if asPtracer && !target.exitTracerNotified {
 		return nil
@@ -1210,6 +1284,7 @@ func (t *Task) waitCollectZombieLocked(target *Task, opts *WaitOptions, asPtrace
 	if tracer := target.Tracer(); tracer != nil && tracer.tg == t.tg && target.exitTracerNotified {
 		target.exitTracerAcked = true
 		target.ptraceTracer.Store(nil)
+		target.ptracerCreds = nil
 		delete(t.ptraceTracees, target)
 	}
 	if target.parent != nil && target.parent.tg == t.tg && target.exitParentNotified {

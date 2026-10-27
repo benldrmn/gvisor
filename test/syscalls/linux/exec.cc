@@ -17,13 +17,26 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
+#include <linux/prctl.h>
+#include <sched.h>
+#include <signal.h>
+#include <string.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <cassert>
@@ -32,6 +45,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -44,11 +58,13 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/optional.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
+#include "test/util/mount_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
@@ -70,11 +86,16 @@ namespace {
 #ifndef SUID_DUMP_ROOT
 #define SUID_DUMP_ROOT 2
 #endif /* SUID_DUMP_ROOT */
+#ifndef PR_CAP_AMBIENT
+#define PR_CAP_AMBIENT 47
+#define PR_CAP_AMBIENT_RAISE 2
+#endif /* PR_CAP_AMBIENT */
 
 constexpr char kBasicWorkload[] = "test/syscalls/linux/exec_basic_workload";
 constexpr char kCheckEuidProgram[] = "test/syscalls/linux/exec_check_creds";
 constexpr char kExitScript[] = "test/syscalls/linux/exit_script";
 constexpr char kStateWorkload[] = "test/syscalls/linux/exec_state_workload";
+constexpr char kEtxtbsyWorkload[] = "test/syscalls/linux/exec_etxtbsy_workload";
 constexpr char kProcExeWorkload[] =
     "test/syscalls/linux/exec_proc_exe_workload";
 constexpr char kAssertClosedWorkload[] =
@@ -767,20 +788,35 @@ TEST(ExecveatTest, SymlinkNoFollowAndEmptyPath) {
 }
 
 TEST(ExecveatTest, SymlinkNoFollowIgnoreSymlinkAncestor) {
+  // System executables may themselves be symlinks. Use a regular file so only
+  // the ancestor is a symlink.
+  TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  std::string contents =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(RunfilePath(kBasicWorkload)));
+  TempPath executable = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(parent.path(), contents, 0755));
   TempPath parent_link = ASSERT_NO_ERRNO_AND_VALUE(
-      TempPath::CreateSymlinkTo(GetAbsoluteTestTmpdir(), "/bin"));
-  std::string path_with_symlink = JoinPath(parent_link.path(), "echo");
+      TempPath::CreateSymlinkTo(GetAbsoluteTestTmpdir(), parent.path()));
+  std::string path_with_symlink =
+      JoinPath(parent_link.path(), Basename(executable.path()));
 
   CheckExecveat(AT_FDCWD, path_with_symlink, {path_with_symlink}, {},
-                AT_SYMLINK_NOFOLLOW, ArgEnvExitStatus(0, 0), "");
+                AT_SYMLINK_NOFOLLOW, ArgEnvExitStatus(0, 0),
+                absl::StrCat(path_with_symlink, "\n"));
 }
 
 TEST(ExecveatTest, SymlinkNoFollowWithNormalFile) {
+  TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  std::string contents =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(RunfilePath(kBasicWorkload)));
+  TempPath executable = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(parent.path(), contents, 0755));
   const FileDescriptor dirfd =
-      ASSERT_NO_ERRNO_AND_VALUE(Open("/bin", O_DIRECTORY));
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent.path(), O_DIRECTORY));
+  std::string name(Basename(executable.path()));
 
-  CheckExecveat(dirfd.get(), "echo", {"echo"}, {}, AT_SYMLINK_NOFOLLOW,
-                ArgEnvExitStatus(0, 0), "");
+  CheckExecveat(dirfd.get(), name, {name}, {}, AT_SYMLINK_NOFOLLOW,
+                ArgEnvExitStatus(0, 0), absl::StrCat(name, "\n"));
 }
 
 TEST(ExecveatTest, BasicWithCloexecFD) {
@@ -822,6 +858,43 @@ TEST(ExecveatTest, InvalidFlags) {
       /*dirfd=*/-1, "", {}, {}, /*flags=*/0xFFFF, /*child=*/nullptr,
       &execve_errno));
   EXPECT_EQ(execve_errno, EINVAL);
+}
+
+ExecveArray OversizedExecveArgv(const std::string& argv0) {
+  std::string long_arg(128 * 1024, 'A');
+  std::vector<std::string> argv;
+  argv.reserve(18);
+  argv.push_back(argv0);
+  // 17 * 128KB = 2176KB > 2MB.
+  for (int i = 0; i < 17; i++) {
+    argv.push_back(long_arg);
+  }
+  return ExecveArray(argv);
+}
+
+// Oversized argv is E2BIG on both Linux (stack-based cap) and gVisor (2MB).
+TEST(ExecTest, ExecveArgvE2BIG) {
+  int execve_errno = 0;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec("/bin/true",
+                                        OversizedExecveArgv("/bin/true"), {},
+                                        /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, E2BIG);
+}
+
+// Oversized envv is E2BIG.
+TEST(ExecTest, ExecveEnvvE2BIG) {
+  std::string long_env(128 * 1024, 'B');
+  std::vector<std::string> envv;
+  envv.reserve(17);
+  for (int i = 0; i < 17; i++) {
+    envv.push_back("VAR=" + long_env);
+  }
+
+  int execve_errno = 0;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec("/bin/true", {"/bin/true"},
+                                        ExecveArray(envv),
+                                        /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, E2BIG);
 }
 
 int memfd_create(const std::string& name, unsigned int flags) {
@@ -913,6 +986,14 @@ PosixErrorOr<TempPath> CreateSgidExecutable(std::string path) {
   return TempPath::CreateFileWith(GetShortTestTmpdir(), exec_blob, mode);
 }
 
+PosixErrorOr<TempPath> CreateExecuteOnlyExecutable(std::string path) {
+  std::string exec_blob;
+  PosixError perr = GetContents(path, &exec_blob);
+  RETURN_IF_ERRNO(perr);
+
+  return TempPath::CreateFileWith(GetShortTestTmpdir(), exec_blob, 0111);
+}
+
 constexpr int kUnprivilegedUid = 12345;
 constexpr int kUnprivilegedGid = 12345;
 
@@ -974,6 +1055,263 @@ TEST(ExecTest, SGIDExecGainsGID) {
   });
 }
 
+// Returns the expected dumpability of a task after an exec that enforces
+// non-dumpability: gVisor hardcodes SUID_DUMP_DISABLE, while Linux uses the
+// value of the fs.suid_dumpable sysctl (fs/exec.c:begin_new_exec() =>
+// set_dumpable(current->mm, suid_dumpable)).
+PosixErrorOr<int> WantNonDumpable() {
+  if (IsRunningOnGvisor()) {
+    return SUID_DUMP_DISABLE;
+  }
+  std::string contents;
+  RETURN_IF_ERRNO(GetContents("/proc/sys/fs/suid_dumpable", &contents));
+  return atoi(contents.c_str());
+}
+
+// Mirrors struct posix_acl_xattr_entry.
+struct ACLEntry {
+  uint16_t tag;
+  uint16_t perm;
+  uint32_t id;
+};
+
+// BuildACL builds the raw xattr representation for a POSIX ACL.
+std::string BuildACL(const std::vector<ACLEntry>& entries) {
+  uint32_t version = 2;
+  std::string buf(reinterpret_cast<const char*>(&version), sizeof(version));
+  for (const ACLEntry& e : entries) {
+    buf.append(reinterpret_cast<const char*>(&e), sizeof(e));
+  }
+  return buf;
+}
+
+// A binary whose mode bits permit reading but whose ACL denies it to the
+// executing user must still make the task non-dumpable.
+TEST(ExecTest, ACLExecuteOnlyBinary) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  std::string exec_blob;
+  ASSERT_NO_ERRNO(GetContents(RunfilePath(kCheckEuidProgram), &exec_blob));
+  TempPath exe = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetShortTestTmpdir(), exec_blob, 0755));
+
+  // ACL: named user kUnprivilegedUid gets --x, so the named-user entry (not
+  // the readable "other" class) governs its access.
+  constexpr uint16_t kTagUserObj = 0x01, kTagUser = 0x02, kTagGroupObj = 0x04,
+                     kTagMask = 0x10, kTagOther = 0x20;
+  constexpr uint32_t kIdUndef = 0xffffffff;
+  const std::string acl = BuildACL({
+      {kTagUserObj, 7, kIdUndef},
+      {kTagUser, 1, kUnprivilegedUid},
+      {kTagGroupObj, 5, kIdUndef},
+      {kTagMask, 1, kIdUndef},
+      {kTagOther, 5, kIdUndef},
+  });
+  int ret = setxattr(exe.path().c_str(), "system.posix_acl_access", acl.data(),
+                     acl.size(), 0);
+  SKIP_IF(ret < 0 && (errno == ENOTSUP || errno == EOPNOTSUPP));
+  ASSERT_THAT(ret, SyscallSucceeds());
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid/gid we're about to set. The gid must also leave the
+  // file's group class so that only the named-user ACL entry (and not the
+  // group bits, which mirror the ACL mask) denies reading.
+  bool acl_enforced = true;
+  ScopedThread t([&] {
+    ASSERT_THAT(syscall(SYS_setgroups, 0, nullptr), SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresgid, kUnprivilegedGid, kUnprivilegedGid,
+                        kUnprivilegedGid),
+                SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+
+    // The ACL must deny reading. Some filesystems (e.g. gVisor's overlay)
+    // accept the ACL xattr but do not enforce ACLs; skip on those.
+    int fd = open(exe.path().c_str(), O_RDONLY);
+    if (fd >= 0) {
+      close(fd);
+      acl_enforced = false;
+      return;
+    }
+    EXPECT_THAT(open(exe.path().c_str(), O_RDONLY),
+                SyscallFailsWithErrno(EACCES));
+
+    // ...but the ACL must permit executing, and the resulting task must be
+    // non-dumpable.
+    const int want_dumpability = ASSERT_NO_ERRNO_AND_VALUE(WantNonDumpable());
+    const ExecveArray argv = {
+        exe.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),
+        /*want_egid=*/absl::StrCat(kUnprivilegedGid),
+        /*want_dumpability=*/absl::StrCat(want_dumpability)};
+    CheckExec(exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+  t.Join();
+  if (!acl_enforced) {
+    GTEST_SKIP() << "filesystem does not enforce POSIX ACLs";
+  }
+}
+
+// Only regular files may be executed: Linux's fs/namei.c:may_open() rejects
+// exec opens of special files with EACCES regardless of their permission
+// bits, before the open can block (e.g. on a FIFO with no writer). Execute
+// permission also does not make a special file readable.
+TEST(ExecTest, ExecuteOnlySpecialFiles) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  const std::string dir = GetShortTestTmpdir();
+
+  const std::string fifo = absl::StrCat(dir, "/exec-only-fifo.", getpid());
+  ASSERT_THAT(mkfifo(fifo.c_str(), 0111), SyscallSucceeds());
+  // mkfifo's mode is affected by the umask.
+  ASSERT_THAT(chmod(fifo.c_str(), 0111), SyscallSucceeds());
+  const auto fifo_cleanup = Cleanup([&fifo] { unlink(fifo.c_str()); });
+
+  const std::string sock = absl::StrCat(dir, "/exec-only-sock.", getpid());
+  const FileDescriptor sock_fd(socket(AF_UNIX, SOCK_STREAM, 0));
+  ASSERT_THAT(sock_fd.get(), SyscallSucceeds());
+  struct sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  ASSERT_LT(sock.size(), sizeof(addr.sun_path));
+  strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_THAT(bind(sock_fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
+                   sizeof(addr)),
+              SyscallSucceeds());
+  ASSERT_THAT(chmod(sock.c_str(), 0111), SyscallSucceeds());
+  const auto sock_cleanup = Cleanup([&sock] { unlink(sock.c_str()); });
+
+  // A character device (a /dev/null clone). mknod of character devices
+  // requires privileges the environment may not have; skip it if so.
+  const std::string chr = absl::StrCat(dir, "/exec-only-chr.", getpid());
+  const bool have_chr =
+      mknod(chr.c_str(), S_IFCHR | 0111, makedev(1, 3)) == 0 &&
+      chmod(chr.c_str(), 0111) == 0;
+  const auto chr_cleanup = Cleanup([&chr, have_chr] {
+    if (have_chr) unlink(chr.c_str());
+  });
+
+  std::vector<std::string> paths = {fifo, sock};
+  if (have_chr) {
+    paths.push_back(chr);
+  }
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+
+    for (const auto& path : paths) {
+      // Exec is rejected for non-regular files. Bound the exec with an alarm
+      // so that a regression to a blocking open (e.g. a FIFO waiting for a
+      // writer) fails promptly instead of hanging the test.
+      pid_t child;
+      int execve_errno;
+      const auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+          path, {path}, {}, +[] { alarm(10); }, &child, &execve_errno));
+      EXPECT_EQ(execve_errno, EACCES) << path;
+
+      // Execute permission does not make the file readable...
+      EXPECT_THAT(open(path.c_str(), O_RDONLY | O_NONBLOCK),
+                  SyscallFailsWithErrno(EACCES))
+          << path;
+
+      // ...including via the exec-open path, also bounded by an alarm.
+      const FileDescriptor path_fd =
+          ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_PATH));
+      pid_t at_child;
+      int execveat_errno;
+      const auto at_cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(
+          path_fd.get(), "", {path}, {}, AT_EMPTY_PATH, +[] { alarm(10); },
+          &at_child, &execveat_errno));
+      EXPECT_EQ(execveat_errno, EACCES) << path;
+    }
+  });
+}
+
+// A failed exec of a PTY replica must not acquire it as the caller's
+// controlling terminal: the exec open is rejected before the device's open
+// handler can run (Linux's fs/namei.c:may_open()).
+TEST(ExecTest, ExecuteOnlyPtyReplicaAcquiresNoControllingTerminal) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  // Some test environments have no devpts mount, in which case /dev/ptmx may
+  // be missing or a dangling symlink to pts/ptmx.
+  PosixErrorOr<FileDescriptor> master_or = Open("/dev/ptmx", O_RDWR | O_NOCTTY);
+  SKIP_IF(!master_or.ok() && master_or.error().errno_value() == ENOENT);
+
+  const FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(std::move(master_or));
+  int n;
+  ASSERT_THAT(ioctl(master.get(), TIOCGPTN, &n), SyscallSucceeds());
+  int unlock = 0;
+  ASSERT_THAT(ioctl(master.get(), TIOCSPTLCK, &unlock), SyscallSucceeds());
+  const std::string replica = absl::StrCat("/dev/pts/", n);
+  ASSERT_THAT(chmod(replica.c_str(), 0111), SyscallSucceeds());
+
+  pid_t child = fork();
+  if (child == 0) {
+    // Become a session leader with no controlling terminal, as an
+    // unprivileged user. No group change is needed: the 0111 fixture denies
+    // reading to every class, and changing groups would require CAP_SETGID.
+    if (setsid() < 0) _exit(10);
+    if (syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                kUnprivilegedUid) != 0) {
+      _exit(13);
+    }
+    char* const argv[] = {const_cast<char*>(replica.c_str()), nullptr};
+    char* const envv[] = {nullptr};
+    if (execve(replica.c_str(), argv, envv) == 0 || errno != EACCES) {
+      _exit(14);
+    }
+    // The failed exec must not have acquired a controlling terminal.
+    errno = 0;
+    int tty = open("/dev/tty", O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    if (tty >= 0 || errno != ENXIO) _exit(15);
+    _exit(0);
+  }
+  ASSERT_GT(child, 0);
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "child status: " << status;
+}
+
+// Linux requires only execute permission (not read) to execve a binary, but
+// marks the resulting task non-dumpable so that the binary's contents cannot
+// be recovered via ptrace or procfs. See gvisor.dev/issue/160.
+TEST(ExecTest, ExecuteOnlyBinary) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  TempPath exec_only_exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateExecuteOnlyExecutable(RunfilePath(kCheckEuidProgram)));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_EQ(geteuid(), kUnprivilegedUid);
+
+    // The binary must not be readable...
+    EXPECT_THAT(open(exec_only_exe.path().c_str(), O_RDONLY),
+                SyscallFailsWithErrno(EACCES));
+
+    // ...but must still be executable, and the resulting task must be
+    // non-dumpable.
+    const int want_dumpability = ASSERT_NO_ERRNO_AND_VALUE(WantNonDumpable());
+    const ExecveArray argv = {
+        exec_only_exe.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),
+        /*want_egid=*/absl::StrCat(getegid()),
+        /*want_dumpability=*/absl::StrCat(want_dumpability)};
+    CheckExec(exec_only_exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
 TEST(ExecTest, SUIDExecDoesntGainUIDWithNoNewPrivs) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
   TempPath suid_exe = ASSERT_NO_ERRNO_AND_VALUE(
@@ -996,6 +1334,127 @@ TEST(ExecTest, SUIDExecDoesntGainUIDWithNoNewPrivs) {
     CheckExec(suid_exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
               /*expect_stderr=*/"");
   });
+}
+
+// FileCapsExecutable is a copy of kCheckEuidProgram with file capabilities, on
+// a tmpfs mounted just for it. Members are destroyed in reverse order, so the
+// file is removed before the tmpfs is unmounted.
+struct FileCapsExecutable {
+  TempPath dir;
+  Cleanup mount;
+  TempPath file;
+};
+
+// Creates a FileCapsExecutable whose file permitted set is `permitted` and
+// whose file effective bit is set. A fresh tmpfs is used because the gofer
+// does not allow setting security.* xattrs.
+PosixErrorOr<FileCapsExecutable> CreateFileCapsExecutable(uint64_t permitted) {
+  std::string exec_blob;
+  RETURN_IF_ERRNO(GetContents(RunfilePath(kCheckEuidProgram), &exec_blob));
+
+  ASSIGN_OR_RETURN_ERRNO(TempPath dir,
+                         TempPath::CreateDirIn(GetShortTestTmpdir()));
+  ASSIGN_OR_RETURN_ERRNO(Cleanup mount, Mount("tmpfs", dir.path(), "tmpfs", 0,
+                                              "mode=0755", MNT_DETACH));
+  ASSIGN_OR_RETURN_ERRNO(TempPath file,
+                         TempPath::CreateFileWith(dir.path(), exec_blob, 0755));
+
+  struct vfs_cap_data cap_data = {};
+  cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
+  cap_data.data[0].permitted = static_cast<uint32_t>(permitted);
+  cap_data.data[1].permitted = static_cast<uint32_t>(permitted >> 32);
+  if (setxattr(file.path().c_str(), "security.capability", &cap_data,
+               sizeof(cap_data), 0) < 0) {
+    return PosixError(errno, "setxattr(security.capability)");
+  }
+  return FileCapsExecutable{std::move(dir), std::move(mount), std::move(file)};
+}
+
+// Execs a FileCapsExecutable with file permitted set `file_permitted` from a
+// thread running as kUnprivilegedUid with capability sets `caps` and ambient
+// set `ambient`, with NO_NEW_PRIVS set if `no_new_privs`. Checks the capability
+// sets after execve.
+void CheckFileCapsExec(CapSet caps, uint64_t ambient, bool no_new_privs,
+                       uint64_t file_permitted, CapSet want,
+                       uint64_t want_ambient) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETFCAP)));
+  FileCapsExecutable exe =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateFileCapsExecutable(file_permitted));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // credentials we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_NO_ERRNO(SetCapabilitySets(caps));
+    for (int cap = 0; cap <= CAP_LAST_CAP; cap++) {
+      if (ambient & (1ULL << cap)) {
+        ASSERT_THAT(prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0),
+                    SyscallSucceeds());
+      }
+    }
+    if (no_new_privs) {
+      ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
+    }
+
+    const ExecveArray argv = {
+        exe.file.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),
+        /*want_egid=*/absl::StrCat(getegid()),
+        /*want_dumpability=*/absl::StrCat(SUID_DUMP_USER),
+        /*want_permitted=*/absl::StrCat(absl::Hex(want.permitted)),
+        /*want_effective=*/absl::StrCat(absl::Hex(want.effective)),
+        /*want_ambient=*/absl::StrCat(absl::Hex(want_ambient))};
+    CheckExec(exe.file.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
+// NO_NEW_PRIVS does not make execve ignore file capabilities. Capabilities
+// the file grants that the task already holds are kept.
+TEST(ExecTest, FileCapsAlreadyHeldKeptWithNoNewPrivs) {
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  CheckFileCapsExec(
+      /*caps=*/{.effective = kNetBind, .permitted = kNetBind},
+      /*ambient=*/0, /*no_new_privs=*/true, /*file_permitted=*/kNetBind,
+      /*want=*/{.effective = kNetBind, .permitted = kNetBind},
+      /*want_ambient=*/0);
+}
+
+// A file with capabilities is privileged, so execve clears the ambient set.
+void CheckFileCapsClearAmbient(bool no_new_privs) {
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  constexpr uint64_t kChown = 1ULL << CAP_CHOWN;
+  CheckFileCapsExec(
+      /*caps=*/
+      {.effective = kNetBind | kChown,
+       .permitted = kNetBind | kChown,
+       .inheritable = kNetBind},
+      /*ambient=*/kNetBind, no_new_privs, /*file_permitted=*/kChown,
+      /*want=*/{.effective = kChown, .permitted = kChown},
+      /*want_ambient=*/0);
+}
+
+TEST(ExecTest, FileCapsClearAmbient) {
+  CheckFileCapsClearAmbient(/*no_new_privs=*/false);
+}
+
+// File capabilities still apply under NO_NEW_PRIVS, so the ambient set is
+// still cleared.
+TEST(ExecTest, FileCapsClearAmbientWithNoNewPrivs) {
+  CheckFileCapsClearAmbient(/*no_new_privs=*/true);
+}
+
+// NO_NEW_PRIVS stops file capabilities from adding to the permitted set.
+TEST(ExecTest, FileCapsNotGainedWithNoNewPrivs) {
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  CheckFileCapsExec(
+      /*caps=*/{}, /*ambient=*/0, /*no_new_privs=*/true,
+      /*file_permitted=*/kNetBind, /*want=*/{}, /*want_ambient=*/0);
 }
 
 TEST(ExecTest, SUIDExecDoesntGainUIDForInterpreterScript) {
@@ -1094,8 +1553,14 @@ TEST(ExecTest, SUIDExecDoesntGainUIDWithPtracerAttached) {
   const pid_t tracee_pid = fork();
   if (tracee_pid == 0) {
     TEST_PCHECK(close(sockets[1]) == 0);
-    TEST_PCHECK(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == 0);
-    // Indicate that the prctl has been set.
+    // Earlier tests may have disabled dumpability. Allow same-user attachment
+    // without CAP_SYS_PTRACE before dropping our UID below.
+    TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER) == 0);
+    // PR_SET_PTRACER is a Yama extension. Without Yama the option is
+    // unrecognized (EINVAL); see prctl(2) and PR_SET_PTRACER(2const).
+    const int ret = prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
+    TEST_PCHECK(ret == 0 || (ret == -1 && errno == EINVAL));
+    // Let the tracer proceed after the optional Yama setup.
     TEST_PCHECK(WriteFd(sockets[0], "x", 1) == 1);
 
     // Wait until tracer has attached before execing.
@@ -1115,16 +1580,16 @@ TEST(ExecTest, SUIDExecDoesntGainUIDWithPtracerAttached) {
 
   const pid_t tracer_pid = fork();
   if (tracer_pid == 0) {
-    // Wait until tracee has called prctl, or else we won't be able to attach.
+    // Wait for the tracee to finish optional Yama setup.
     char done;
     TEST_PCHECK(ReadFd(sockets[1], &done, 1) == 1);
 
+    // Linux retains the tracer's credentials at attachment for exec permission
+    // checks (ptracer_capable). Drop this capability before they are captured.
+    TEST_PCHECK(SetCapability(CAP_SYS_PTRACE, false).ok());
     TEST_PCHECK(ptrace(PTRACE_ATTACH, tracee_pid, 0, 0) == 0);
     // Indicate that we have attached.
     TEST_PCHECK(WriteFd(sockets[1], &done, 1) == 1);
-
-    // Priv gain isn't prevented when the tracer has this cap, so drop it.
-    TEST_PCHECK(SetCapability(CAP_SYS_PTRACE, false).ok());
 
     // Block until tracee enters signal-delivery-stop as a result of the
     // SIGSTOP sent by PTRACE_ATTACH. And then continue it.
@@ -1146,7 +1611,7 @@ TEST(ExecTest, SUIDExecDoesntGainUIDWithPtracerAttached) {
   int status;
   // Verify the tracee's (exec_check_creds's) exit code
   ASSERT_THAT(waitpid(tracee_pid, &status, 0), SyscallSucceeds());
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  EXPECT_EQ(status, 0);
 }
 
 TEST(ExecTest, ReadProcMemAfterExecFromChild) {
@@ -1312,6 +1777,51 @@ bool ValidateProcCmdlineVsArgv(const int argc, const char* const* argv) {
     }
   }
   return true;
+}
+
+// A binary that is being executed cannot be written, and becomes writable
+// again once it is not. See fs/exec.c:set_mm_exe_file().
+TEST(ExecTest, RunningBinaryIsNotWritable) {
+  // Copy the workload somewhere we own, so that we may attempt to write it.
+  const std::string blob =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(RunfilePath(kEtxtbsyWorkload)));
+  const TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), blob, 0755));
+  const std::string path = binary.path();
+  EXPECT_NO_ERRNO(Open(path, O_WRONLY));
+
+  // The workload writes a byte to stdout once execve(2) has completed, so that
+  // we do not race against it.
+  int fds[2];
+  ASSERT_THAT(pipe(fds), SyscallSucceeds());
+  FileDescriptor rd(fds[0]);
+  FileDescriptor wr(fds[1]);
+
+  pid_t child;
+  int execve_errno;
+  const int wfd = wr.get();
+  Cleanup kill_child = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      path, {path}, {}, [wfd] { dup2(wfd, STDOUT_FILENO); }, &child,
+      &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+  wr.reset();
+  char c;
+  ASSERT_THAT(RetryEINTR(read)(rd.get(), &c, 1), SyscallSucceedsWithValue(1));
+
+  // Writing the contents must fail, whether by open(2) or truncate(2).
+  EXPECT_THAT(open(path.c_str(), O_WRONLY), SyscallFailsWithErrno(ETXTBSY));
+  EXPECT_THAT(open(path.c_str(), O_RDONLY | O_TRUNC),
+              SyscallFailsWithErrno(ETXTBSY));
+  EXPECT_THAT(truncate(path.c_str(), 0), SyscallFailsWithErrno(ETXTBSY));
+
+  // Reads and metadata changes are unaffected.
+  EXPECT_NO_ERRNO(Open(path, O_RDONLY));
+  EXPECT_THAT(chmod(path.c_str(), 0755), SyscallSucceeds());
+
+  // Killing the child reaps it, so the executable is released by the time this
+  // returns. A leaked denial would leave the file permanently unwritable.
+  kill_child.Release()();
+  EXPECT_NO_ERRNO(Open(path, O_WRONLY));
 }
 
 }  // namespace

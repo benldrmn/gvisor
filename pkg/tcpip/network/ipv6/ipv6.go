@@ -16,6 +16,7 @@
 package ipv6
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"reflect"
@@ -26,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
 	"gvisor.dev/gvisor/pkg/tcpip/network/internal/fragmentation"
@@ -176,6 +178,7 @@ var _ stack.MulticastForwardingNetworkEndpoint = (*endpoint)(nil)
 var _ stack.GroupAddressableEndpoint = (*endpoint)(nil)
 var _ stack.AddressableEndpoint = (*endpoint)(nil)
 var _ stack.NetworkEndpoint = (*endpoint)(nil)
+var _ stack.RestorableNetworkEndpoint = (*endpoint)(nil)
 var _ stack.NDPEndpoint = (*endpoint)(nil)
 var _ MLDEndpoint = (*endpoint)(nil)
 var _ NDPEndpoint = (*endpoint)(nil)
@@ -184,15 +187,21 @@ var _ NDPEndpoint = (*endpoint)(nil)
 type endpointMu struct {
 	sync.RWMutex `state:"nosave"`
 
+	// +checklocks:RWMutex
 	addressableEndpointState stack.AddressableEndpointState
-	ndp                      ndpState
-	mld                      mldState
+
+	// +checklocks:RWMutex
+	ndp ndpState
+
+	// +checklocks:RWMutex
+	mld mldState
 }
 
 // +stateify savable
 type dadMu struct {
 	sync.Mutex `state:"nosave"`
 
+	// +checklocks:Mutex
 	dad ip.DAD
 }
 
@@ -201,6 +210,11 @@ type endpointDAD struct {
 	mu dadMu
 }
 
+// NDP and MLD retain their containing endpoint after NewEndpoint initializes
+// them, so their lock paths refer to the same mutex.
+//
+// +checklocksalias:mu.ndp.ep.mu.RWMutex=mu.RWMutex
+// +checklocksalias:mu.mld.ep.mu.RWMutex=mu.RWMutex
 // +stateify savable
 type endpoint struct {
 	nic        stack.NetworkInterface
@@ -232,6 +246,30 @@ type endpoint struct {
 	//
 	// LOCK ORDERING: mu > dad.mu.
 	dad endpointDAD
+}
+
+// Restore implements stack.RestorableNetworkEndpoint.
+func (e *endpoint) Restore() {
+	e.mu.Lock()
+	e.dad.mu.Lock()
+	e.dad.mu.dad.Restore(&e.dad.mu, e.protocol.stack.SecureRNG().Reader)
+	e.dad.mu.Unlock()
+	e.mu.mld.restore()
+	e.mu.ndp.restore()
+	if e.Enabled() {
+		e.mu.addressableEndpointState.ForEachEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
+			addr := addressEndpoint.AddressWithPrefix().Address
+			if header.IsV6UnicastAddress(addr) && addressEndpoint.GetKind() == stack.PermanentTentative {
+				_ = e.mu.ndp.startDuplicateAddressDetection(addr, addressEndpoint) // +checklocksforce: ForEachEndpoint calls back synchronously with e.mu held.
+			}
+			return true
+		})
+	}
+	e.mu.Unlock()
+
+	e.protocol.mu.Lock()
+	e.protocol.mu.eps[e.nic.ID()] = e
+	e.protocol.mu.Unlock()
 }
 
 // NICNameFromID is a function that returns a stable name for the specified NIC,
@@ -316,7 +354,7 @@ func (e *endpoint) HandleLinkResolutionFailure(pkt *stack.PacketBuffer) {
 
 // onAddressAssignedLocked handles an address being assigned.
 //
-// Precondition: e.mu must be exclusively locked.
+// +checklocks:e.mu.RWMutex
 func (e *endpoint) onAddressAssignedLocked(addr tcpip.Address) {
 	// As per RFC 2710 section 3,
 	//
@@ -586,7 +624,7 @@ func (e *endpoint) Enable() tcpip.Error {
 			addressEndpoint.SetKind(stack.PermanentTentative)
 			fallthrough
 		case stack.PermanentTentative:
-			err = e.mu.ndp.startDuplicateAddressDetection(addr, addressEndpoint)
+			err = e.mu.ndp.startDuplicateAddressDetection(addr, addressEndpoint) // +checklocksforce: ForEachEndpoint calls back synchronously with e.mu held.
 			return err == nil
 		case stack.Temporary, stack.PermanentExpired:
 			return true
@@ -671,6 +709,7 @@ func (e *endpoint) Disable() {
 	e.disableLocked()
 }
 
+// +checklocks:e.mu.RWMutex
 func (e *endpoint) disableLocked() {
 	if !e.isEnabled() {
 		return
@@ -696,7 +735,7 @@ func (e *endpoint) disableLocked() {
 		switch kind := addressEndpoint.GetKind(); kind {
 		case stack.Permanent, stack.PermanentTentative:
 			if header.IsV6UnicastAddress(addrWithPrefix.Address) {
-				e.mu.ndp.stopDuplicateAddressDetection(addrWithPrefix.Address, &stack.DADAborted{})
+				e.mu.ndp.stopDuplicateAddressDetection(addrWithPrefix.Address, &stack.DADAborted{}) // +checklocksforce: ForEachEndpoint calls back synchronously with e.mu held.
 			}
 		case stack.Temporary, stack.PermanentExpired:
 		default:
@@ -815,6 +854,66 @@ func (e *endpoint) handleFragments(r *stack.Route, networkMTU uint32, pkt *stack
 	}
 }
 
+// recalculateChecksum recalculates the transport checksum from the packet's
+// network header.
+func recalculateChecksum(pkt *stack.PacketBuffer) tcpip.Error {
+	// RXChecksumValidated indicates that checksum verification may be
+	// safely skipped.
+	if pkt.RXChecksumValidated {
+		return nil
+	}
+	// NeedsCsum is set if the checksum offload is enabled, so no need to
+	// calculate the checksum.
+	if pkt.GSOOptions.Type != stack.GSONone && pkt.GSOOptions.NeedsCsum {
+		return nil
+	}
+	transportHeader := pkt.TransportHeader().Slice()
+	netHdr := header.IPv6(pkt.NetworkHeader().Slice())
+	payload := len(transportHeader) + pkt.Data().Size()
+	if payload > math.MaxUint16 {
+		return &tcpip.ErrMessageTooLong{}
+	}
+	payloadLength := uint16(payload)
+	switch pkt.TransportProtocolNumber {
+	case header.TCPProtocolNumber:
+		if len(transportHeader) < header.TCPMinimumSize {
+			return &tcpip.ErrMalformedHeader{}
+		}
+		tcp := header.TCP(transportHeader)
+		xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, netHdr.SourceAddress(), netHdr.DestinationAddress(), payloadLength)
+		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
+		tcp.SetChecksum(0)
+		tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
+	case header.UDPProtocolNumber:
+		if len(transportHeader) < header.UDPMinimumSize {
+			return &tcpip.ErrMalformedHeader{}
+		}
+		udp := header.UDP(transportHeader)
+		xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, netHdr.SourceAddress(), netHdr.DestinationAddress(), payloadLength)
+		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
+		udp.SetChecksum(0)
+		csum := ^udp.CalculateChecksum(xsum)
+		// RFC 768: If the computed checksum is zero, it is transmitted as all ones.
+		if csum == 0 {
+			csum = 0xFFFF
+		}
+		udp.SetChecksum(csum)
+	case header.ICMPv6ProtocolNumber:
+		if len(transportHeader) < header.ICMPv6MinimumSize {
+			return &tcpip.ErrMalformedHeader{}
+		}
+		icmp := header.ICMPv6(transportHeader)
+		icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+			Header:      icmp,
+			Src:         netHdr.SourceAddress(),
+			Dst:         netHdr.DestinationAddress(),
+			PayloadCsum: pkt.Data().Checksum(),
+			PayloadLen:  pkt.Data().Size(),
+		}))
+	}
+	return nil
+}
+
 // WritePacket writes a packet to the given destination address and protocol.
 func (e *endpoint) WritePacket(r *stack.Route, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) tcpip.Error {
 	dstAddr := r.RemoteAddress()
@@ -832,7 +931,6 @@ func (e *endpoint) WritePacket(r *stack.Route, params stack.NetworkHeaderParams,
 	}
 
 	if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
-		// TODO: b/486197011 - Add support for NAT re-routing in IPv6.
 		if !nft.CheckOutput(pkt, r, stack.IP6) {
 			// nftables is telling us to drop the packet.
 			return nil
@@ -847,12 +945,46 @@ func (e *endpoint) WritePacket(r *stack.Route, params stack.NetworkHeaderParams,
 	// removing this check short circuits broadcasts before they are sent out to
 	// other hosts.
 	if netHeader := header.IPv6(pkt.NetworkHeader().Slice()); dstAddr != netHeader.DestinationAddress() {
-		if ep := e.protocol.findEndpointWithAddress(netHeader.DestinationAddress()); ep != nil {
+		newDstAddr := netHeader.DestinationAddress()
+		if ep := e.protocol.findEndpointWithAddress(newDstAddr); ep != nil {
 			// Since we rewrote the packet but it is being routed back to us, we
 			// can safely assume the checksum is valid.
 			ep.handleLocalPacket(pkt, true /* canSkipRXChecksum */)
 			return nil
 		}
+
+		// Find a new route for the rewritten destination, like Linux
+		// ip6_route_me_harder. As there, the packet's source address does not
+		// restrict the route and is left unchanged.
+		newRoute, err := stk.FindRoute(0 /* nic id */, tcpip.Address{} /* localAddr */, newDstAddr, ProtocolNumber, false /* multicastLoop */)
+		if err != nil {
+			e.stats.ip.OutgoingPacketErrors.Increment()
+			return err // Drop the packet
+		}
+		// Release the new route on exit.
+		defer newRoute.Release()
+
+		// Check if we need to recalculate the checksum.
+		// If the original route did not require a checksum but the new one does,
+		// we must calculate the full checksum; otherwise, NAT should have already
+		// done it.
+		if !r.RequiresTXTransportChecksum() && newRoute.RequiresTXTransportChecksum() {
+			if err := recalculateChecksum(pkt); err != nil {
+				e.stats.ip.OutgoingPacketErrors.Increment()
+				return err // Drop the packet
+			}
+		}
+
+		// Update the route to the new route.
+		r = newRoute
+
+		// Use the new endpoint to write the packet.
+		forwardToEp, ok := e.protocol.getEndpointForNIC(r.NICID())
+		if !ok {
+			e.stats.ip.OutgoingPacketErrors.Increment()
+			return &tcpip.ErrUnknownNICID{}
+		}
+		return forwardToEp.writePacket(r, pkt, params.Protocol, true /* headerIncluded */)
 	}
 
 	return e.writePacket(r, pkt, params.Protocol, false /* headerIncluded */)
@@ -1047,7 +1179,7 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 	r, err := stk.FindRoute(0, tcpip.Address{}, dstAddr, ProtocolNumber, false /* multicastLoop */)
 	switch err.(type) {
 	case nil:
-	case *tcpip.ErrNetworkUnreachable:
+	case *tcpip.ErrNetworkUnreachable, *tcpip.ErrBadLocalAddress:
 		// We return the original error rather than the result of returning the
 		// ICMP packet because the original error is more relevant to the caller.
 		_ = e.protocol.returnError(&icmpReasonNetUnreachable{}, pkt, false /* deliveredLocally */)
@@ -1173,8 +1305,10 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 			}
 		}
 
+		nicID := e.nic.ID()
 		// Loopback traffic skips the prerouting chain.
-		inNicName := stk.FindNICNameFromID(e.nic.ID())
+		inNicName := stk.FindNICNameFromID(nicID)
+		pkt.InputNICID = nicID
 		if ok := stk.IPTables().CheckPrerouting(pkt, e, inNicName); !ok {
 			// iptables is telling us to drop the packet.
 			stats.IPTablesPreroutingDropped.Increment()
@@ -1201,6 +1335,11 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 func (e *endpoint) handleLocalPacket(pkt *stack.PacketBuffer, canSkipRXChecksum bool) {
 	stats := e.stats.ip
 	stats.PacketsReceived.Increment()
+
+	if !e.isEnabled() {
+		stats.DisabledPacketsReceived.Increment()
+		return
+	}
 
 	pkt = pkt.CloneToInbound()
 	defer pkt.DecRef()
@@ -1377,7 +1516,7 @@ func (e *endpoint) handleValidatedPacket(h header.IPv6, pkt *stack.PacketBuffer,
 
 	// Raw socket packets are delivered based solely on the transport protocol
 	// number. We only require that the packet be valid IPv6.
-	e.dispatcher.DeliverRawPacket(h.TransportProtocol(), pkt)
+	e.dispatcher.DeliverRawPacket(tcpip.TransportProtocolNumber(h.NextHeader()), pkt)
 
 	stats := e.stats.ip
 	stats.ValidPacketsReceived.Increment()
@@ -1531,6 +1670,17 @@ func (e *endpoint) processExtensionHeader(it *header.IPv6PayloadIterator, pkt **
 // Returns an error if the processing of a header failed or if the packet should
 // be discarded.
 func (e *endpoint) processExtensionHeaders(h header.IPv6, pkt *stack.PacketBuffer, forwarding bool) error {
+	if h.PayloadLength() == 0 && h.NextHeader() == uint8(header.IPv6HopByHopOptionsExtHdrIdentifier) {
+		// Jumbograms are unsupported. RFC 2675 section 3 requires this error
+		// for a zero payload length followed by a Hop-by-Hop Options header.
+		e.stats.ip.MalformedPacketsReceived.Increment()
+		_ = e.protocol.returnError(&icmpReasonParameterProblem{
+			code:    header.ICMPv6ErroneousHeader,
+			pointer: header.IPv6PayloadLenOffset,
+		}, pkt, !forwarding /* deliveredLocally */)
+		return fmt.Errorf("zero payload length with Hop-by-Hop Options header")
+	}
+
 	// Create a VV to parse the packet. We don't plan to modify anything here.
 	// vv consists of:
 	//	- Any IPv6 header bytes after the first 40 (i.e. extensions).
@@ -1995,7 +2145,7 @@ func (e *endpoint) AddAndAcquirePermanentAddress(addr tcpip.AddressWithPrefix, p
 // addAndAcquirePermanentAddressLocked also joins the passed address's
 // solicited-node multicast group and start duplicate address detection.
 //
-// Precondition: e.mu must be write locked.
+// +checklocks:e.mu.RWMutex
 func (e *endpoint) addAndAcquirePermanentAddressLocked(addr tcpip.AddressWithPrefix, properties stack.AddressProperties) (stack.AddressEndpoint, tcpip.Error) {
 	addressEndpoint, err := e.mu.addressableEndpointState.AddAndAcquireAddress(addr, properties, stack.PermanentTentative)
 	if err != nil {
@@ -2038,7 +2188,7 @@ func (e *endpoint) RemovePermanentAddress(addr tcpip.Address) tcpip.Error {
 // removePermanentEndpointLocked is like removePermanentAddressLocked except
 // it works with a stack.AddressEndpoint.
 //
-// Precondition: e.mu must be write locked.
+// +checklocks:e.mu.RWMutex
 func (e *endpoint) removePermanentEndpointLocked(addressEndpoint stack.AddressEndpoint, allowSLAACInvalidation bool, reason stack.AddressRemovalReason, dadResult stack.DADResult) tcpip.Error {
 	addr := addressEndpoint.AddressWithPrefix()
 	// If we are removing an address generated via SLAAC, cleanup
@@ -2057,7 +2207,7 @@ func (e *endpoint) removePermanentEndpointLocked(addressEndpoint stack.AddressEn
 // removePermanentEndpointInnerLocked is like removePermanentEndpointLocked
 // except it does not cleanup SLAAC address state.
 //
-// Precondition: e.mu must be write locked.
+// +checklocks:e.mu.RWMutex
 func (e *endpoint) removePermanentEndpointInnerLocked(addressEndpoint stack.AddressEndpoint, reason stack.AddressRemovalReason, dadResult stack.DADResult) tcpip.Error {
 	addr := addressEndpoint.AddressWithPrefix()
 	e.mu.ndp.stopDuplicateAddressDetection(addr.Address, dadResult)
@@ -2078,7 +2228,7 @@ func (e *endpoint) removePermanentEndpointInnerLocked(addressEndpoint stack.Addr
 // hasPermanentAddressLocked returns true if the endpoint has a permanent
 // address equal to the passed address.
 //
-// Precondition: e.mu must be read or write locked.
+// +checklocksread:e.mu.RWMutex
 func (e *endpoint) hasPermanentAddressRLocked(addr tcpip.Address) bool {
 	addressEndpoint := e.getAddressRLocked(addr)
 	if addressEndpoint == nil {
@@ -2089,7 +2239,7 @@ func (e *endpoint) hasPermanentAddressRLocked(addr tcpip.Address) bool {
 
 // getAddressRLocked returns the endpoint for the passed address.
 //
-// Precondition: e.mu must be read or write locked.
+// +checklocksread:e.mu.RWMutex
 func (e *endpoint) getAddressRLocked(localAddr tcpip.Address) stack.AddressEndpoint {
 	return e.mu.addressableEndpointState.GetAddress(localAddr)
 }
@@ -2125,7 +2275,7 @@ func (e *endpoint) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp boo
 // acquireAddressOrCreateTempLocked is like AcquireAssignedAddress but with
 // locking requirements.
 //
-// Precondition: e.mu must be write locked.
+// +checklocksread:e.mu.RWMutex
 func (e *endpoint) acquireAddressOrCreateTempLocked(localAddr tcpip.Address, allowTemp bool, tempPEB stack.PrimaryEndpointBehavior, readOnly bool) stack.AddressEndpoint {
 	return e.mu.addressableEndpointState.AcquireAssignedAddress(localAddr, allowTemp, tempPEB, readOnly)
 }
@@ -2142,7 +2292,7 @@ func (e *endpoint) AcquireOutgoingPrimaryAddress(remoteAddr, srcHint tcpip.Addre
 //
 // See stack.PrimaryEndpointBehavior for more details about the primary list.
 //
-// Precondition: e.mu must be read locked.
+// +checklocksread:e.mu.RWMutex
 func (e *endpoint) getLinkLocalAddressRLocked() tcpip.Address {
 	var linkLocalAddr tcpip.Address
 	e.mu.addressableEndpointState.ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
@@ -2160,7 +2310,7 @@ func (e *endpoint) getLinkLocalAddressRLocked() tcpip.Address {
 // acquireOutgoingPrimaryAddressRLocked is like AcquireOutgoingPrimaryAddress
 // but with locking requirements.
 //
-// Precondition: e.mu must be read locked.
+// +checklocksread:e.mu.RWMutex
 func (e *endpoint) acquireOutgoingPrimaryAddressRLocked(remoteAddr, srcHint tcpip.Address, allowExpired bool) stack.AddressEndpoint {
 	// TODO(b/309216156): Support IPv6 hints.
 
@@ -2306,7 +2456,7 @@ func (e *endpoint) JoinGroup(addr tcpip.Address) tcpip.Error {
 
 // joinGroupLocked is like JoinGroup but with locking requirements.
 //
-// Precondition: e.mu must be locked.
+// +checklocks:e.mu.RWMutex
 func (e *endpoint) joinGroupLocked(addr tcpip.Address) tcpip.Error {
 	if !header.IsV6MulticastAddress(addr) {
 		return &tcpip.ErrBadAddress{}
@@ -2325,7 +2475,7 @@ func (e *endpoint) LeaveGroup(addr tcpip.Address) tcpip.Error {
 
 // leaveGroupLocked is like LeaveGroup but with locking requirements.
 //
-// Precondition: e.mu must be locked.
+// +checklocks:e.mu.RWMutex
 func (e *endpoint) leaveGroupLocked(addr tcpip.Address) tcpip.Error {
 	return e.mu.mld.leaveGroup(addr)
 }
@@ -2353,15 +2503,30 @@ type protocolMu struct {
 
 	// eps is keyed by NICID to allow protocol methods to retrieve an endpoint
 	// when handling a packet, by looking at which NIC handled the packet.
-	eps map[tcpip.NICID]*endpoint
+	//
+	// +checklocks:RWMutex
+	eps map[tcpip.NICID]*endpoint `state:"nosave"`
 
 	// ICMP types for which the stack's global rate limiting must apply.
+	//
+	// +checklocks:RWMutex
 	icmpRateLimitedTypes map[header.ICMPv6Type]struct{}
 
 	// multicastForwardingDisp is the multicast forwarding event dispatcher that
 	// an integrator can provide to receive multicast forwarding events. Note
 	// that multicast packets will only be forwarded if this is non-nil.
+	//
+	// +checklocks:RWMutex
 	multicastForwardingDisp stack.MulticastForwardingEventDispatcher
+}
+
+// afterLoad is invoked by stateify.
+//
+// +checklocksexclude:p.RWMutex
+func (p *protocolMu) afterLoad(context.Context) {
+	p.Lock()
+	defer p.Unlock()
+	p.eps = make(map[tcpip.NICID]*endpoint)
 }
 
 // +stateify savable
@@ -2731,7 +2896,8 @@ func (p *protocol) allowICMPReply(icmpType header.ICMPv6Type) bool {
 }
 
 // SendRejectionError implements stack.RejectIPv6WithHandler.
-func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.RejectIPv6WithICMPType, inputHook bool) tcpip.Error {
+func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.RejectIPv6WithICMPType, hook stack.Hook) tcpip.Error {
+	inputHook := hook == stack.Input
 	switch rejectWith {
 	case stack.RejectIPv6WithICMPNoRoute:
 		return p.returnError(&icmpReasonNetUnreachable{}, pkt, inputHook)
@@ -2742,7 +2908,7 @@ func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.
 	case stack.RejectIPv6WithICMPAdminProhibited:
 		return p.returnError(&icmpReasonAdministrativelyProhibited{}, pkt, inputHook)
 	case stack.RejectIPv6WithTCPReset:
-		return ip.RejectWithTCPReset(pkt, ProtocolNumber, p.stack, inputHook)
+		return ip.RejectWithTCPReset(pkt, ProtocolNumber, p.stack, hook)
 	default:
 		panic(fmt.Sprintf("unhandled %[1]T = %[1]d", rejectWith))
 	}

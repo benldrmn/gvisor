@@ -24,6 +24,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	bin "gvisor.dev/gvisor/pkg/binary"
@@ -57,9 +58,13 @@ func (info *DUTInfo) ConnectToDUT(t *testing.T) DUT {
 
 	n := info.Net
 	posixServerAddress := net.JoinHostPort(n.POSIXServerIP.String(), fmt.Sprintf("%d", n.POSIXServerPort))
-	conn, err := grpc.Dial(posixServerAddress, grpc.WithInsecure(), grpc.WithKeepaliveParams(keepalive.ClientParameters{Timeout: RPCKeepalive}))
+	conn, err := grpc.NewClient(
+		posixServerAddress,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Timeout: RPCKeepalive}),
+	)
 	if err != nil {
-		t.Fatalf("failed to grpc.Dial(%s): %s", posixServerAddress, err)
+		t.Fatalf("failed to grpc.NewClient(%s): %s", posixServerAddress, err)
 	}
 	posixServer := NewPOSIXClient(conn)
 	return DUT{
@@ -333,7 +338,7 @@ func (dut *DUT) getSockOpt(ctx context.Context, t *testing.T, sockfd, level, opt
 
 // GetSockOpt calls getsockopt on the DUT and causes a fatal test failure if it
 // doesn't succeed. If more control over the timeout or error handling is
-// needed, use GetSockOptWithErrno. Because endianess and the width of values
+// needed, use GetSockOptWithErrno. Because endianness and the width of values
 // might differ between the testbench and DUT architectures, prefer to use a
 // more specific GetSockOptXxx function.
 func (dut *DUT) GetSockOpt(t *testing.T, sockfd, level, optname, optlen int32) []byte {
@@ -346,7 +351,7 @@ func (dut *DUT) GetSockOpt(t *testing.T, sockfd, level, optname, optlen int32) [
 	return optval
 }
 
-// GetSockOptWithErrno calls getsockopt on the DUT. Because endianess and the
+// GetSockOptWithErrno calls getsockopt on the DUT. Because endianness and the
 // width of values might differ between the testbench and DUT architectures,
 // prefer to use a more specific GetSockOptXxxWithErrno function.
 func (dut *DUT) GetSockOptWithErrno(ctx context.Context, t *testing.T, sockfd, level, optname, optlen int32) (int32, []byte, error) {
@@ -414,7 +419,7 @@ func (dut *DUT) GetSockOptTimevalWithErrno(ctx context.Context, t *testing.T, so
 	return ret, timeval, errno
 }
 
-// GetSockOptTCPInfo retreives TCPInfo for the given socket descriptor.
+// GetSockOptTCPInfo retrieves TCPInfo for the given socket descriptor.
 func (dut *DUT) GetSockOptTCPInfo(t *testing.T, sockfd int32) linux.TCPInfo {
 	t.Helper()
 
@@ -425,7 +430,7 @@ func (dut *DUT) GetSockOptTCPInfo(t *testing.T, sockfd int32) linux.TCPInfo {
 	return info
 }
 
-// GetSockOptTCPInfoWithErrno retreives TCPInfo with any errno.
+// GetSockOptTCPInfoWithErrno retrieves TCPInfo with any errno.
 func (dut *DUT) GetSockOptTCPInfoWithErrno(ctx context.Context, t *testing.T, sockfd int32) (int32, linux.TCPInfo, error) {
 	t.Helper()
 
@@ -623,7 +628,7 @@ func (dut *DUT) setSockOpt(ctx context.Context, t *testing.T, sockfd, level, opt
 
 // SetSockOpt calls setsockopt on the DUT and causes a fatal test failure if it
 // doesn't succeed. If more control over the timeout or error handling is
-// needed, use SetSockOptWithErrno. Because endianess and the width of values
+// needed, use SetSockOptWithErrno. Because endianness and the width of values
 // might differ between the testbench and DUT architectures, prefer to use a
 // more specific SetSockOptXxx function.
 func (dut *DUT) SetSockOpt(t *testing.T, sockfd, level, optname int32, optval []byte) {
@@ -635,7 +640,7 @@ func (dut *DUT) SetSockOpt(t *testing.T, sockfd, level, optname int32, optval []
 	}
 }
 
-// SetSockOptWithErrno calls setsockopt on the DUT. Because endianess and the
+// SetSockOptWithErrno calls setsockopt on the DUT. Because endianness and the
 // width of values might differ between the testbench and DUT architectures,
 // prefer to use a more specific SetSockOptXxxWithErrno function.
 func (dut *DUT) SetSockOptWithErrno(ctx context.Context, t *testing.T, sockfd, level, optname int32, optval []byte) (int32, error) {

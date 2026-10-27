@@ -13,23 +13,38 @@
 // limitations under the License.
 
 #include <fcntl.h>
+#include <linux/capability.h>
 #include <mqueue.h>
 #include <sched.h>
 #include <sys/poll.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
 #include <string>
 
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/flags/flag.h"
+#include "absl/strings/str_format.h"
 #include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/mount_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+#include "test/util/thread_util.h"
 
 #define NAME_MAX 255
+
+ABSL_FLAG(int32_t, scratch_uid, 65534, "scratch UID");
 
 namespace gvisor {
 namespace testing {
@@ -194,8 +209,25 @@ TEST(MqTest, NoQueueExists) {
               PosixErrorIs(ENOENT));
 }
 
+TEST(MqTest, UnlinkOtherUserQueue) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  PosixQueue queue = ASSERT_NO_ERRNO_AND_VALUE(
+      MqOpen(O_RDWR | O_CREAT | O_EXCL, 0600, nullptr));
+
+  // Change only this thread's credentials so the owner can clean up afterward.
+  ScopedThread([&] {
+    AutoCapability fowner(CAP_FOWNER, false);
+    ASSERT_THAT(
+        syscall(SYS_setresuid, -1, absl::GetFlag(FLAGS_scratch_uid), -1),
+        SyscallSucceeds());
+    EXPECT_THAT(MqUnlink(queue.name()), PosixErrorIs(EACCES));
+  });
+}
+
 // Test trying to re-open a queue with invalid permissions.
 TEST(MqTest, OpenNoAccess) {
+  AutoCapability dacOverride(CAP_DAC_OVERRIDE, false);
+  AutoCapability dacReadSearch(CAP_DAC_READ_SEARCH, false);
   PosixQueue queue = ASSERT_NO_ERRNO_AND_VALUE(
       MqOpen(O_RDWR | O_CREAT | O_EXCL, 0000, nullptr));
 
@@ -204,8 +236,36 @@ TEST(MqTest, OpenNoAccess) {
   EXPECT_THAT(MqOpen(queue.name(), O_RDWR), PosixErrorIs(EACCES));
 }
 
+TEST(MqTest, OpenWithDacOverride) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_DAC_OVERRIDE)));
+  AutoCapability dacReadSearch(CAP_DAC_READ_SEARCH, false);
+  PosixQueue queue = ASSERT_NO_ERRNO_AND_VALUE(
+      MqOpen(O_RDWR | O_CREAT | O_EXCL, 0000, nullptr));
+
+  for (int mode : {O_RDONLY, O_WRONLY, O_RDWR}) {
+    FileDescriptor fd(mq_open(queue.name(), mode));
+    ASSERT_THAT(fd.get(), SyscallSucceeds());
+  }
+}
+
+TEST(MqTest, OpenWithDacReadSearch) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_DAC_READ_SEARCH)));
+  PosixQueue queue = ASSERT_NO_ERRNO_AND_VALUE(
+      MqOpen(O_RDWR | O_CREAT | O_EXCL, 0000, nullptr));
+  AutoCapability dacOverride(CAP_DAC_OVERRIDE, false);
+
+  FileDescriptor fd(mq_open(queue.name(), O_RDONLY));
+  ASSERT_THAT(fd.get(), SyscallSucceeds());
+  for (int mode : {O_WRONLY, O_RDWR}) {
+    FileDescriptor write_fd(mq_open(queue.name(), mode));
+    EXPECT_THAT(write_fd.get(), SyscallFailsWithErrno(EACCES));
+  }
+}
+
 // Test trying to re-open a read-only queue for write.
 TEST(MqTest, OpenReadAccess) {
+  AutoCapability dacOverride(CAP_DAC_OVERRIDE, false);
+  AutoCapability dacReadSearch(CAP_DAC_READ_SEARCH, false);
   PosixQueue queue = ASSERT_NO_ERRNO_AND_VALUE(
       MqOpen(O_RDWR | O_CREAT | O_EXCL, 0400, nullptr));
 
@@ -216,6 +276,8 @@ TEST(MqTest, OpenReadAccess) {
 
 // Test trying to re-open a write-only queue for read.
 TEST(MqTest, OpenWriteAccess) {
+  AutoCapability dacOverride(CAP_DAC_OVERRIDE, false);
+  AutoCapability dacReadSearch(CAP_DAC_READ_SEARCH, false);
   PosixQueue queue = ASSERT_NO_ERRNO_AND_VALUE(
       MqOpen(O_RDWR | O_CREAT | O_EXCL, 0200, nullptr));
 

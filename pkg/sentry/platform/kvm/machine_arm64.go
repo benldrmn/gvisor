@@ -58,30 +58,71 @@ const (
 )
 
 func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
+	// Stop one page short so the end address (addr + length) of the last
+	// upper-half page (0xfffffffffffff000) does not overflow a 64-bit uint.
+	// Leaving the top page unmapped here is fine: it only ever holds the
+	// host thread stack (accessed via the lower half), whereas the upper
+	// half is only used for kernel entry code and Go heap structs.
+	const maxUpperOffset = ring0.UserspaceSize - hostarch.PageSize
 	applyPhysicalRegions(func(pr physicalRegion) bool {
+		if pr.virtual >= maxUpperOffset {
+			return true
+		}
+		length := pr.length
+		if pr.virtual+length > maxUpperOffset {
+			length = maxUpperOffset - pr.virtual
+		}
 		pageTable.Map(
 			hostarch.Addr(ring0.KernelStartAddress|pr.virtual),
-			pr.length,
+			length,
 			pagetables.MapOpts{AccessType: hostarch.AnyAccess, Global: true},
 			pr.physical)
 
 		return true // Keep iterating.
 	})
+	if len(m.shadowVDSO) > 0 {
+		shadowVirt := m.shadowVDSOVirt()
+		vdsoVirt := m.vdsoVirt
+		remaining := uintptr(len(m.shadowVDSO))
+		for remaining > 0 {
+			physical, length, ok := translateToPhysical(shadowVirt)
+			if !ok || length == 0 {
+				panic(fmt.Sprintf("impossible translation: shadowVirt %x remaining %x", shadowVirt, remaining))
+			}
+			if length > remaining {
+				length = remaining
+			}
+			pageTable.Map(
+				hostarch.Addr(ring0.KernelStartAddress|vdsoVirt),
+				length,
+				pagetables.MapOpts{AccessType: hostarch.ReadExecute, Global: true},
+				physical)
+			pageTable.Map(
+				hostarch.Addr(ring0.KernelStartAddress|shadowVirt),
+				length,
+				pagetables.MapOpts{AccessType: hostarch.Read, Global: true},
+				physical)
+			shadowVirt += length
+			vdsoVirt += length
+			remaining -= length
+		}
+	}
 }
 
 // archPhysicalRegions fills readOnlyGuestRegions and allocates separate
 // physical regions form them.
 func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 	rdRegions := []virtualRegion{}
-	if err := applyVirtualRegions(func(vr virtualRegion) {
+	if err := applyVirtualRegions(func(vr virtualRegion) bool {
 		if excludeVirtualRegion(vr) {
-			return // skip region.
+			return false // skip region.
 		}
 		// Skip PROT_NONE mappings. Go-runtime uses them as place
 		// holders for future read-write mappings.
 		if !vr.accessType.Write && vr.accessType.Read {
 			rdRegions = append(rdRegions, vr)
 		}
+		return false
 	}); err != nil {
 		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
 	}
@@ -218,3 +259,21 @@ func initFaultBlocks() {
 }
 
 func archOverrideFaultBlocks() {}
+
+// tcrTGFlags returns the TCR_EL1 translation granule flags (TG0 and TG1)
+// matching the compiled hostarch.PageSize.
+//
+// In ARM64, TCR_EL1 controls the translation granule for both TTBR0 (lower/user
+// space, configured via TG0) and TTBR1 (upper/kernel space, configured via TG1).
+// These must match hostarch.PageSize so the hardware MMU walks the page tables
+// with the level dimensions expected by pkg/ring0/pagetables.
+func tcrTGFlags() uint64 {
+	switch hostarch.PageSize {
+	case 4096:
+		return _TCR_TG0_4K | _TCR_TG1_4K
+	case 65536:
+		return _TCR_TG0_64K | _TCR_TG1_64K
+	default:
+		panic(fmt.Sprintf("unsupported page size: %d", hostarch.PageSize))
+	}
+}

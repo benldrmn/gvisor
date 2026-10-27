@@ -133,7 +133,7 @@ func (fs *filesystem) newSyntheticDentry(opts *createSyntheticOpts) *dentry {
 			mode:       atomicbitops.FromUint32(uint32(opts.mode)),
 			uid:        atomicbitops.FromUint32(uint32(opts.kuid)),
 			gid:        atomicbitops.FromUint32(uint32(opts.kgid)),
-			blockSize:  atomicbitops.FromUint32(hostarch.PageSize), // arbitrary
+			blockSize:  atomicbitops.FromUint32(uint32(hostarch.PageSize)), // arbitrary
 			atime:      atomicbitops.FromInt64(now),
 			mtime:      atomicbitops.FromInt64(now),
 			ctime:      atomicbitops.FromInt64(now),
@@ -354,6 +354,6 @@ func (fd *directoryFD) Seek(ctx context.Context, offset int64, whence int32) (in
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
-func (fd *directoryFD) Sync(ctx context.Context) error {
-	return fd.dentry().syncRemoteFile(ctx)
+func (fd *directoryFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
+	return fd.dentry().syncRemoteFile(ctx, opts.DataOnly)
 }

@@ -26,7 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/timing"
 )
 
 const (
@@ -43,19 +43,13 @@ const (
 
 // Install generates BPF code based on the set of syscalls provided. It only
 // allows syscalls that conform to the specification. Syscalls that violate the
-// specification will trigger RET_KILL_PROCESS. If RET_KILL_PROCESS is not
-// supported, violations will trigger RET_TRAP instead. RET_KILL_THREAD is not
-// used because it only kills the offending thread and often keeps the sentry
+// specification will trigger RET_KILL_PROCESS. RET_KILL_THREAD is not used
+// because it only kills the offending thread and often keeps the sentry
 // hanging.
 //
 // denyRules describes forbidden syscalls. rules describes allowed syscalls.
 // denyRules is executed before rules.
-//
-// Be aware that RET_TRAP sends SIGSYS to the process and it may be ignored,
-// making it possible for the process to continue running after a violation.
-// However, it will leave a SECCOMP audit event trail behind. In any case, the
-// syscall is still blocked from executing.
-func (p *Program) Install() error {
+func (p *Program) Install(timer *timing.Timer) error {
 	// ***   DEBUG TIP   ***
 	// If you suspect the Sentry is getting killed due to a seccomp violation,
 	// look for the `debugFilter` boolean in `//runsc/boot/filter/filter.go`.
@@ -78,11 +72,13 @@ func (p *Program) Install() error {
 	if err != nil {
 		return err
 	}
+	timer.Reached("seccomp program compiled")
 
 	// Perform the actual installation.
 	if err := SetFilter(instrs); err != nil {
 		return fmt.Errorf("failed to set filter: %v", err)
 	}
+	timer.Reached("seccomp program installed")
 
 	log.Infof("Seccomp filters installed.")
 	return nil
@@ -95,7 +91,8 @@ type Action string
 
 // Values for SeccompAction.
 const (
-	// Default is the default action; see saneDefaultAction().
+	// Default is the default action: ProgramOptions.DefaultAction, or
+	// KillProcess if that is Default too.
 	Default Action = ""
 
 	// Allow the syscall.
@@ -112,6 +109,9 @@ const (
 
 	// UserNotify notifies userspace.
 	UserNotify Action = "user_notify"
+
+	// Log logs the syscall and allows it.
+	Log Action = "log"
 
 	// ReturnError returns the given error code to the application.
 	ReturnError Action = "return_error"
@@ -138,29 +138,27 @@ func (a Action) String() string {
 }
 
 // bpf returns the corresponding BPF action for the given seccomp action.
-// If the action is `Default`, `defaultAction` is called.
-func (a Action) bpf(defaultAction func() (linux.BPFAction, error)) (linux.BPFAction, error) {
+// If the action is `Default`, `defaultAction` is returned.
+func (a Action) bpf(defaultAction linux.BPFAction) linux.BPFAction {
 	switch a {
 	case Default:
-		da, err := defaultAction()
-		if err != nil {
-			return 0, fmt.Errorf("failed to determine default seccomp action: %w", err)
-		}
-		return da, nil
+		return defaultAction
 	case Allow:
-		return linux.SECCOMP_RET_ALLOW, nil
+		return linux.SECCOMP_RET_ALLOW
 	case UserNotify:
-		return linux.SECCOMP_RET_USER_NOTIF, nil
+		return linux.SECCOMP_RET_USER_NOTIF
+	case Log:
+		return linux.SECCOMP_RET_LOG
 	case Trap:
-		return linux.SECCOMP_RET_TRAP, nil
+		return linux.SECCOMP_RET_TRAP
 	case Trace:
-		return linux.SECCOMP_RET_TRACE, nil
+		return linux.SECCOMP_RET_TRACE
 	case ReturnError:
-		return linux.SECCOMP_RET_ERRNO, nil
+		return linux.SECCOMP_RET_ERRNO
 	case KillThread:
-		return linux.SECCOMP_RET_KILL_THREAD, nil
+		return linux.SECCOMP_RET_KILL_THREAD
 	case KillProcess:
-		return linux.SECCOMP_RET_KILL_PROCESS, nil
+		return linux.SECCOMP_RET_KILL_PROCESS
 	default:
 		colonIndex := strings.Index(string(a), ":")
 		if colonIndex == -1 {
@@ -171,40 +169,8 @@ func (a Action) bpf(defaultAction func() (linux.BPFAction, error)) (linux.BPFAct
 		if err != nil {
 			panic(fmt.Sprintf("failed to parse seccomp action: %v", err))
 		}
-		act, err := ins.bpf(defaultAction)
-		if err != nil {
-			return 0, err
-		}
-		return act.WithReturnCode(uint16(code)), nil
+		return ins.bpf(defaultAction).WithReturnCode(uint16(code))
 	}
-}
-
-var (
-	// killProcessAvailableOnce is used to ensure that isKillProcessAvailable is
-	// only called once.
-	killProcessAvailableOnce sync.Once
-
-	// killProcessAvailable is true if SECCOMP_RET_KILL_PROCESS is available.
-	killProcessAvailable bool
-
-	// killProcessAvailableErr is the error obtained when trying to determine if
-	// SECCOMP_RET_KILL_PROCESS is available.
-	killProcessAvailableErr error
-)
-
-// saneDefaultAction returns a sane default for a failure to match
-// a seccomp-bpf filter. Either kill the process, or trap.
-func saneDefaultAction() (linux.BPFAction, error) {
-	killProcessAvailableOnce.Do(func() {
-		killProcessAvailable, killProcessAvailableErr = isKillProcessAvailable()
-	})
-	if killProcessAvailableErr != nil {
-		return 0, killProcessAvailableErr
-	}
-	if killProcessAvailable {
-		return linux.SECCOMP_RET_KILL_PROCESS, nil
-	}
-	return linux.SECCOMP_RET_TRAP, nil
 }
 
 // RuleSet is a set of rules and associated action.
@@ -427,6 +393,10 @@ type ProgramOptions struct {
 	// and its BPF bytecode.
 	SkipOptimizations bool
 
+	// RuleCache, if non-nil, memoizes optimized syscall rules across Build
+	// calls. Useful when compiling many programs that share rules.
+	RuleCache *OptimizedRuleCache
+
 	// HotSyscalls is the set of syscall numbers that are the hottest,
 	// where "hotness" refers to frequency (regardless of the amount of
 	// computation that the kernel will do handling them, and regardless of
@@ -435,6 +405,12 @@ type ProgramOptions struct {
 	// called >10% of the time out of all syscalls made).
 	// It is ordered from most frequent to least frequent.
 	HotSyscalls []uintptr
+}
+
+// defaultBPFAction returns the BPF action that `Default` actions resolve to:
+// `o.DefaultAction`, or SECCOMP_RET_KILL_PROCESS if that is `Default` too.
+func (o ProgramOptions) defaultBPFAction() linux.BPFAction {
+	return o.DefaultAction.bpf(linux.SECCOMP_RET_KILL_PROCESS)
 }
 
 // BuildStats contains information about seccomp program generation.
@@ -466,20 +442,10 @@ func (p *Program) Build() ([]bpf.Instruction, BuildStats, error) {
 		return nil, BuildStats{}, err
 	}
 
-	defaultActionFn := func() (linux.BPFAction, error) {
-		return p.Options.DefaultAction.bpf(saneDefaultAction)
-	}
-	defaultAction, err := defaultActionFn()
-	if err != nil {
-		return nil, BuildStats{}, err
-	}
+	defaultAction := p.Options.defaultBPFAction()
 	possibleActions := make(map[linux.BPFAction]struct{})
 	for _, ruleSet := range p.RuleSets {
-		action, err := ruleSet.Action.bpf(defaultActionFn)
-		if err != nil {
-			return nil, BuildStats{}, err
-		}
-		possibleActions[action] = struct{}{}
+		possibleActions[ruleSet.Action.bpf(defaultAction)] = struct{}{}
 	}
 
 	program := &syscallProgram{
@@ -505,11 +471,7 @@ func (p *Program) Build() ([]bpf.Instruction, BuildStats, error) {
 
 	// Label if the architecture didn't match:
 	program.Label(badArchLabel)
-	badArchAction, err := p.Options.BadArchAction.bpf(defaultActionFn)
-	if err != nil {
-		return nil, BuildStats{}, err
-	}
-	program.Ret(badArchAction)
+	program.Ret(p.Options.BadArchAction.bpf(defaultAction))
 
 	insns, err := program.program.Instructions()
 	if err != nil {
@@ -679,14 +641,9 @@ func orderRuleSets(rules []RuleSet, options ProgramOptions) (orderedRuleSets, ti
 	// Build a single map of per-syscall syscallRuleActions.
 	// We will split this map up later.
 	allSyscallRuleActions := make(map[uintptr][]syscallRuleAction)
-	defaultActionFn := func() (linux.BPFAction, error) {
-		return options.DefaultAction.bpf(saneDefaultAction)
-	}
+	defaultAction := options.defaultBPFAction()
 	for _, rs := range rules {
-		action, err := rs.Action.bpf(defaultActionFn)
-		if err != nil {
-			return orderedRuleSets{}, 0, err
-		}
+		action := rs.Action.bpf(defaultAction)
 		for sysno, rule := range rs.Rules.rules {
 			existing, found := allSyscallRuleActions[sysno]
 			if !found {
@@ -716,7 +673,7 @@ func orderRuleSets(rules []RuleSet, options ProgramOptions) (orderedRuleSets, ti
 		optimizeStart := time.Now()
 		for _, ruleActions := range allSyscallRuleActions {
 			for i, ra := range ruleActions {
-				ra.rule = optimizeSyscallRule(ra.rule)
+				ra.rule = OptimizeSyscalls(ra.rule, options.RuleCache)
 				ruleActions[i] = ra
 			}
 		}

@@ -43,7 +43,10 @@
 //
 //	subprocessPool.mu
 //		subprocess.mu
-//			platformContext.mu
+//
+//	subprocess.aliveMu
+//		subprocess.syscallThreadMu
+//		subprocess.sysmsgThreadsMu
 //
 // +checkalignedignore
 package systrap
@@ -53,14 +56,16 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/interrupt"
@@ -135,9 +140,9 @@ type platformContext struct {
 
 	// sharedContext is everything related to this platformContext that is resident in
 	// shared memory with the stub thread.
-	// sharedContext is only accessed on the Task goroutine, therefore it is not
-	// mutex protected.
-	sharedContext *sharedContext
+	// sharedContext is only written on the Task goroutine, but atomic because
+	// NotifyInterrupt may read it from any goroutines.
+	sharedContext atomic.Pointer[sharedContext]
 
 	// needRestoreFPState indicates that the FPU state has been changed by
 	// the Sentry and has to be updated on the stub thread.
@@ -171,6 +176,9 @@ func (c *platformContext) FullStateChanged() {
 func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as := mm.AddressSpace()
 	s := as.(*subprocess)
+	if s.dead.Load() {
+		return nil, hostarch.NoAccess, errDeadSubprocessContext
+	}
 	if err := s.activateContext(c); err != nil {
 		return nil, hostarch.NoAccess, err
 	}
@@ -217,17 +225,23 @@ func (c *platformContext) Interrupt() {
 // Preempt implements platform.Context.Preempt.
 func (c *platformContext) Preempt() {}
 
+// NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
+func (c *platformContext) NotifyInterrupt() {
+	if sc := c.sharedContext.Load(); sc != nil {
+		sc.NotifyInterrupt()
+	}
+}
+
 // Release releases all platform resources used by the platformContext.
 func (c *platformContext) Release() {
-	if c.sharedContext != nil {
-		c.sharedContext.release()
-		c.sharedContext = nil
+	if sc := c.sharedContext.Swap(nil); sc != nil {
+		sc.release()
 	}
 }
 
 // PrepareSleep implements platform.Context.PrepareSleep.
 func (c *platformContext) PrepareSleep() {
-	ctx := c.sharedContext
+	ctx := c.sharedContext.Load()
 	if ctx == nil {
 		return
 	}
@@ -271,7 +285,7 @@ func (*Systrap) MinUserAddress() hostarch.Addr {
 
 // New returns a new seccomp-based implementation of the platform interface.
 func New(opts platform.Options) (*Systrap, error) {
-
+	mbCh := hostmm.Probe(false)
 	if !disableSyscallPatching {
 		disableSyscallPatching = opts.DisableSyscallPatching
 	}
@@ -279,8 +293,8 @@ func New(opts platform.Options) (*Systrap, error) {
 	if maxSysmsgThreads == 0 {
 		// CPUID information has been initialized at this point.
 		archState.Init()
-		// GOMAXPROCS has been set at this point.
-		maxSysmsgThreads = runtime.GOMAXPROCS(0)
+		// Base GOMAXPROCS has been set at this point.
+		maxSysmsgThreads = gomaxprocs.Base()
 		// Account for syscall thread.
 		maxChildThreads = maxSysmsgThreads + 1
 	}
@@ -289,6 +303,7 @@ func New(opts platform.Options) (*Systrap, error) {
 	if err != nil {
 		return nil, err
 	}
+	opts.StartupTimer.Reached("systrap memory file created")
 
 	var stubErr error
 	stubInitialized.Do(func() {
@@ -297,7 +312,7 @@ func New(opts platform.Options) (*Systrap, error) {
 		configureSystrapAddressSpace()
 		// Don't use sentry and stub fast paths if here is just one cpu,
 		// or if the fast path has been explicitly disabled.
-		neverEnableFastPath = opts.DisableFastPath || min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) == 1
+		neverEnableFastPath = opts.DisableFastPath || min(runtime.NumCPU(), gomaxprocs.Base()) == 1
 
 		// Convert the spin/deep-sleep timeouts into cputicks() units for
 		// the current architecture. Must happen before stubInit(), which
@@ -306,14 +321,17 @@ func New(opts platform.Options) (*Systrap, error) {
 
 		// Initialize the stub.
 		stubInit()
+		opts.StartupTimer.Reached("systrap stub initialized")
 
 		// Create the source process for the global pool. This must be
 		// done before initializing any other processes.
-		source, err := newSubprocess(createStub, mf, false)
+		usesSeccompNotify := false
+		source, err := newSubprocess(createStub, mf, usesSeccompNotify, disableSyscallPatching)
 		if err != nil {
 			stubErr = fmt.Errorf("initialize systrap: %w", err)
 			return
 		}
+		opts.StartupTimer.Reached("systrap source process created")
 		// The source subprocess is never released explicitly by a MM.
 		source.DecRef(nil)
 
@@ -334,7 +352,13 @@ func New(opts platform.Options) (*Systrap, error) {
 		})
 	}
 
-	return &Systrap{memoryFile: mf}, nil
+	opts.StartupTimer.Reached("waiting for membarrier")
+	memBarrier := <-mbCh
+	opts.StartupTimer.Reached("host membarrier probed")
+	return &Systrap{
+		UseHostGlobalMemoryBarrier: platform.UseHostGlobalMemoryBarrier{MemBarrier: memBarrier},
+		memoryFile:                 mf,
+	}, nil
 }
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
@@ -356,16 +380,32 @@ func (*Systrap) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
-	return newSubprocess(globalPool.source.createStub, p.memoryFile, true)
+//
+// In mm.Fork, the child process's AddressSpace and MemoryManager must be
+// synchronized to ensure a consistent view of syscall patching. Even though a
+// concurrent ARCH_SET_GS may set mm.gsInUse just after reading it for
+// opts.DisableSyscallPatching, that is ok. The flag is only set once the
+// parent process's syscalls have already been unpatched, so the child process
+// will either:
+//   - see the flag before and inherit an unpatched address space.
+//   - miss it, unpatch completes, and inherit a clean address space with
+//     usertrap enabled.
+//
+// This is ok as the calling thread never set its own GS register. The child
+// process/thread inherits an accurate value with a completely patchable
+// address space.
+func (p *Systrap) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
+	return newSubprocess(globalPool.source.createStub, p.memoryFile, true /* usesSeccomNotify */, opts.DisableSyscallPatching)
 }
 
 // NewContext returns an interruptible platformContext.
 func (*Systrap) NewContext(ctx pkgcontext.Context) platform.Context {
-	return &platformContext{
+	c := &platformContext{
 		needRestoreFPState:  true,
 		needToPullFullState: false,
 	}
+	c.interrupt.Dst = c
+	return c
 }
 
 // ConcurrencyCount implements platform.Platform.ConcurrencyCount.
@@ -377,17 +417,6 @@ type constructor struct{}
 
 func (*constructor) New(opts platform.Options) (platform.Platform, error) {
 	return New(opts)
-}
-
-func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
-	return nil, nil
-}
-
-// Requirements implements platform.Constructor.Requirements().
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{
-		RequiresCapSysPtrace: true,
-	}
 }
 
 func init() {

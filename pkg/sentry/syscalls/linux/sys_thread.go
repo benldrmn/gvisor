@@ -40,7 +40,7 @@ var (
 	ExecMaxTotalSize = 2 * 1024 * 1024
 
 	// ExecMaxElemSize is the maximum length of a single argv or envv entry.
-	ExecMaxElemSize = 32 * hostarch.PageSize
+	ExecMaxElemSize = 32 * int(hostarch.PageSize)
 )
 
 // Getppid implements linux syscall getppid(2).
@@ -80,6 +80,15 @@ func Execveat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 	return execveat(t, dirfd, pathnameAddr, argvAddr, envvAddr, flags)
 }
 
+// copyExecVector copies exec argv/envv, reporting size overflows as E2BIG.
+func copyExecVector(t *kernel.Task, addr hostarch.Addr) ([]string, error) {
+	vec, err := t.CopyInVector(addr, ExecMaxElemSize, ExecMaxTotalSize)
+	if linuxerr.Equals(linuxerr.ENAMETOOLONG, err) || linuxerr.Equals(linuxerr.ENOMEM, err) {
+		return nil, linuxerr.E2BIG
+	}
+	return vec, err
+}
+
 func execveat(t *kernel.Task, dirfd int32, pathnameAddr, argvAddr, envvAddr hostarch.Addr, flags int32) (uintptr, *kernel.SyscallControl, error) {
 	if flags&^(linux.AT_EMPTY_PATH|linux.AT_SYMLINK_NOFOLLOW) != 0 {
 		return 0, nil, linuxerr.EINVAL
@@ -92,14 +101,14 @@ func execveat(t *kernel.Task, dirfd int32, pathnameAddr, argvAddr, envvAddr host
 	var argv, envv []string
 	if argvAddr != 0 {
 		var err error
-		argv, err = t.CopyInVector(argvAddr, ExecMaxElemSize, ExecMaxTotalSize)
+		argv, err = copyExecVector(t, argvAddr)
 		if err != nil {
 			return 0, nil, err
 		}
 	}
 	if envvAddr != 0 {
 		var err error
-		envv, err = t.CopyInVector(envvAddr, ExecMaxElemSize, ExecMaxTotalSize)
+		envv, err = copyExecVector(t, envvAddr)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -674,7 +683,7 @@ func copyInSchedAttr(t *kernel.Task, addr hostarch.Addr) (linux.SchedAttr, error
 	if size == 0 {
 		size = linux.SCHED_ATTR_SIZE_VER0
 	}
-	if size < linux.SCHED_ATTR_SIZE_VER0 || size > hostarch.PageSize {
+	if size < linux.SCHED_ATTR_SIZE_VER0 || size > uint32(hostarch.PageSize) {
 		return linux.SchedAttr{}, linuxerr.E2BIG
 	}
 
@@ -716,7 +725,7 @@ func SchedGetattr(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 	if flags != 0 || tid < 0 || schedAttrAddr == 0 {
 		return 0, nil, linuxerr.EINVAL
 	}
-	if schedAttrSize < linux.SCHED_ATTR_SIZE_VER0 || schedAttrSize > hostarch.PageSize {
+	if schedAttrSize < linux.SCHED_ATTR_SIZE_VER0 || schedAttrSize > uint32(hostarch.PageSize) {
 		return 0, nil, linuxerr.EINVAL
 	}
 
@@ -959,7 +968,7 @@ func Getpgid(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 
 // Setsid implements the linux syscall setsid(2).
 func Setsid(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	sid, err := t.ThreadGroup().CreateSession()
+	sid, err := t.ThreadGroup().CreateSession(t)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1059,6 +1068,8 @@ func Setpriority(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 }
 
 // Ptrace implements linux system call ptrace(2).
+//
+// +checklocksexclude:t.mu
 func Ptrace(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	req := args[0].Int64()
 	pid := kernel.ThreadID(args[1].Int())

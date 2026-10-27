@@ -18,9 +18,13 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
+#include <cstdint>
+#include <functional>
+#include <string>
 #include <vector>
 
-#include "test/syscalls/linux/socket_netlink_util.h"
+#include "test/util/file_descriptor.h"
+#include "test/util/posix_error.h"
 
 namespace gvisor {
 namespace testing {
@@ -32,6 +36,7 @@ struct Link {
   uint32_t mtu;
   std::string address;
   unsigned int flags;
+  std::string kind;
 };
 
 PosixError DumpLinks(const FileDescriptor& fd, uint32_t seq,
@@ -67,6 +72,12 @@ PosixError LinkChangeFlags(int index, unsigned int flags, unsigned int change);
 // LinkSetMacAddr sets IFLA_ADDRESS attribute of the interface.
 PosixError LinkSetMacAddr(int index, const void* addr, int addrlen);
 
+// Returns the link kind (IFLA_INFO_KIND inside IFLA_LINKINFO) for the given
+// interface message, or an empty string if IFLA_LINKINFO/IFLA_INFO_KIND is
+// not present.
+PosixErrorOr<std::string> LinkKind(const struct nlmsghdr* hdr,
+                                   const struct ifinfomsg* msg);
+
 // AddRoute adds a route to the given dst subnet via the given interface.
 PosixError AddUnicastRoute(int interface, int family, int prefixlen,
                            const void* dst, int dstlen);
@@ -74,6 +85,13 @@ PosixError AddUnicastRoute(int interface, int family, int prefixlen,
 // DelRoute removes a route to the given dst subnet via the given interface.
 PosixError DelUnicastRoute(int interface, int family, int prefixlen,
                            const void* dst, int dstlen);
+
+// ReplaceUnicastRouteViaGateway replaces the route to the given dst subnet via
+// the given interface with one through the on-link gateway gw, using the same
+// metric as AddUnicastRoute.
+PosixError ReplaceUnicastRouteViaGateway(int interface, int family,
+                                         int prefixlen, const void* dst,
+                                         const void* gw, int addrlen);
 
 // AddExclusiveLookupInTableRule adds a PBR rule that performs a route lookup
 // against the given table, for all packets destined to the given subnet.

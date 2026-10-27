@@ -437,23 +437,32 @@ type sock struct {
 	// +checklocks:mu
 	readWriter usermem.IOSequenceReadWriter `state:"nosave"`
 
-	// readMu protects access to the below fields.
+	// readMu serializes receive metadata and control-message generation.
 	readMu sync.Mutex `state:"nosave"`
 
 	// sockOptTimestamp corresponds to SO_TIMESTAMP. When true, timestamps
 	// of returned messages can be returned via control messages. When
 	// false, the same timestamp is instead stored and can be read via the
-	// SIOCGSTAMP ioctl. It is protected by readMu. See socket(7).
+	// SIOCGSTAMP ioctl. See socket(7).
+	//
+	// +checklocks:readMu
 	sockOptTimestamp bool
-	// timestampValid indicates whether timestamp for SIOCGSTAMP has been
-	// set. It is protected by readMu.
+
+	// timestampValid indicates whether timestamp for SIOCGSTAMP has been set.
+	//
+	// +checklocks:readMu
 	timestampValid bool
-	// timestamp holds the timestamp to use with SIOCTSTAMP. It is only
-	// valid when timestampValid is true. It is protected by readMu.
-	timestamp time.Time `state:".(int64)"`
+
+	// timestamp holds the timestamp to use with SIOCGSTAMP. It is only
+	// valid when timestampValid is true.
+	//
+	// +checklocks:readMu
+	timestamp time.Time
 
 	// TODO(b/153685824): Move this to SocketOptions.
 	// sockOptInq corresponds to TCP_INQ.
+	//
+	// +checklocks:readMu
 	sockOptInq bool
 }
 
@@ -461,10 +470,6 @@ var _ = socket.Socket(&sock{})
 
 // New creates a new endpoint socket.
 func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*vfs.FileDescription, *syserr.Error) {
-	if skType == linux.SOCK_STREAM {
-		endpoint.SocketOptions().SetDelayOption(true)
-	}
-
 	mnt := t.Kernel().SocketMount()
 	d := sockfs.NewDentry(t, mnt)
 	defer d.DecRef(t)
@@ -484,6 +489,7 @@ func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue 
 		DenyPRead:         true,
 		DenyPWrite:        true,
 		UseDentryMetadata: true,
+		SpecialFile:       true,
 	}); err != nil {
 		return nil, syserr.FromError(err)
 	}
@@ -522,6 +528,9 @@ func (s *sock) Epollable() bool {
 }
 
 // Read implements vfs.FileDescriptionImpl.
+//
+// +checklocksexclude:s.readMu
+// +checklocksexclude:s.mu
 func (s *sock) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	// All flags other than RWF_NOWAIT should be ignored.
 	// TODO(gvisor.dev/issue/2601): Support RWF_NOWAIT.
@@ -543,6 +552,8 @@ func (s *sock) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOp
 }
 
 // Write implements vfs.FileDescriptionImpl.
+//
+// +checklocksexclude:s.mu
 func (s *sock) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	// All flags other than RWF_NOWAIT should be ignored.
 	// TODO(gvisor.dev/issue/2601): Support RWF_NOWAIT.
@@ -624,6 +635,8 @@ func (s *sock) Accept(t *kernel.Task, peerRequested bool, flags int, blocking bo
 
 // GetSockOpt implements the linux syscall getsockopt(2) for sockets backed by
 // tcpip.Endpoint.
+//
+// +checklocksexclude:s.readMu
 func (s *sock) GetSockOpt(t *kernel.Task, level, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
 	// TODO(b/78348848): Unlike other socket options, SO_TIMESTAMP is
 	// implemented specifically for netstack.Socket rather than
@@ -683,7 +696,12 @@ func (s *sock) GetSockOpt(t *kernel.Task, level, name int, outPtr hostarch.Addr,
 
 // SetSockOpt implements the linux syscall setsockopt(2) for sockets backed by
 // tcpip.Endpoint.
+//
+// +checklocksexclude:s.readMu
 func (s *sock) SetSockOpt(t *kernel.Task, level int, name int, optVal []byte) *syserr.Error {
+	if level == linux.SOL_TLS || (level == linux.SOL_TCP && name == linux.TCP_ULP) {
+		return syserr.ErrProtocolNotAvailable
+	}
 	// TODO(b/78348848): Unlike other socket options, SO_TIMESTAMP is
 	// implemented specifically for netstack.Socket rather than
 	// commonEndpoint. commonEndpoint should be extended to support socket
@@ -1258,6 +1276,7 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 			RTTVar:      uint32(v.RTTVar / time.Microsecond),
 			SndSsthresh: v.SndSsthresh,
 			SndCwnd:     v.SndCwnd,
+			SndMss:      v.SndMss,
 		}
 		switch v.CcState {
 		case tcpip.RTORecovery:
@@ -1407,7 +1426,7 @@ func (s *sock) getSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, outPt
 		return nil, syserr.ErrUnknownProtocolOption
 	}
 
-	family, skType, _ := s.Type()
+	family, _, _ := s.Type()
 	if family != linux.AF_INET6 {
 		return nil, syserr.ErrNotSupported
 	}
@@ -1533,17 +1552,12 @@ func (s *sock) getSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, outPt
 		return a.(*linux.SockAddrInet6), nil
 
 	case linux.IP6T_SO_GET_INFO:
-		if outLen < linux.SizeOfIPTGetinfo {
-			return nil, syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv6 sockets.
-		if skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
-		}
-
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
 			return nil, syserr.ErrNotPermitted
+		}
+
+		if outLen != linux.SizeOfIPTGetinfo {
+			return nil, syserr.ErrInvalidArgument
 		}
 
 		stk := inet.StackFromContext(t)
@@ -1560,10 +1574,6 @@ func (s *sock) getSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, outPt
 		// IPTGetEntries is reused for IPv6.
 		if outLen < linux.SizeOfIPTGetEntries {
 			return nil, syserr.ErrInvalidArgument
-		}
-		// Only valid for raw IPv6 sockets.
-		if skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
 		}
 
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
@@ -1583,11 +1593,6 @@ func (s *sock) getSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, outPt
 	case linux.IP6T_SO_GET_REVISION_MATCH:
 		if outLen < linux.SizeOfXTGetRevision {
 			return nil, syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv6 sockets.
-		if skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
 		}
 
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
@@ -1610,11 +1615,6 @@ func (s *sock) getSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, outPt
 	case linux.IP6T_SO_GET_REVISION_TARGET:
 		if outLen < linux.SizeOfXTGetRevision {
 			return nil, syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv6 sockets.
-		if skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
 		}
 
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
@@ -1790,17 +1790,12 @@ func (s *sock) getSockOptIP(t *kernel.Task, ep commonEndpoint, name int, outPtr 
 		return a.(*linux.SockAddrInet), nil
 
 	case linux.IPT_SO_GET_INFO:
-		if outLen < linux.SizeOfIPTGetinfo {
-			return nil, syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv4 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET || skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
-		}
-
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
 			return nil, syserr.ErrNotPermitted
+		}
+
+		if outLen != linux.SizeOfIPTGetinfo {
+			return nil, syserr.ErrInvalidArgument
 		}
 
 		stk := inet.StackFromContext(t)
@@ -1816,11 +1811,6 @@ func (s *sock) getSockOptIP(t *kernel.Task, ep commonEndpoint, name int, outPtr 
 	case linux.IPT_SO_GET_ENTRIES:
 		if outLen < linux.SizeOfIPTGetEntries {
 			return nil, syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv4 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET || skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
 		}
 
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
@@ -1840,12 +1830,6 @@ func (s *sock) getSockOptIP(t *kernel.Task, ep commonEndpoint, name int, outPtr 
 	case linux.IPT_SO_GET_REVISION_MATCH:
 		if outLen < linux.SizeOfXTGetRevision {
 			return nil, syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv4 sockets.
-		family, skType, _ := s.Type()
-		if family != linux.AF_INET || skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
 		}
 
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
@@ -1868,11 +1852,6 @@ func (s *sock) getSockOptIP(t *kernel.Task, ep commonEndpoint, name int, outPtr 
 	case linux.IPT_SO_GET_REVISION_TARGET:
 		if outLen < linux.SizeOfXTGetRevision {
 			return nil, syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv4 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET || skType != linux.SOCK_RAW {
-			return nil, syserr.ErrProtocolNotAvailable
 		}
 
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
@@ -2150,6 +2129,14 @@ func SetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name i
 		})
 		return nil
 
+	case linux.SO_ATTACH_FILTER:
+		if socket.IsTCP(s) &&
+			!t.HasCapabilityIn(linux.CAP_NET_ADMIN, t.NetworkNamespace().UserNamespace()) {
+			return syserr.ErrNotPermitted
+		}
+		incrementBadSetSocketOptionMetric(t, &socketLevelSocketFieldValue, name)
+		return nil
+
 	case linux.SO_DETACH_FILTER:
 		// optval is ignored.
 		var v tcpip.SocketDetachFilterOption
@@ -2187,7 +2174,6 @@ func SetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name i
 		linux.SO_BSDCOMPAT,
 		linux.SO_PEERCRED,
 		linux.SO_SNDLOWAT,
-		linux.SO_ATTACH_FILTER,
 		linux.SO_PEERNAME,
 		linux.SO_TIMESTAMP,
 		linux.SO_ACCEPTCONN,
@@ -2397,7 +2383,6 @@ func (s *sock) setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal
 		linux.TCP_SAVED_SYN,
 		linux.TCP_REPAIR_WINDOW,
 		linux.TCP_FASTOPEN_CONNECT,
-		linux.TCP_ULP,
 		linux.TCP_MD5SIG_EXT,
 		linux.TCP_FASTOPEN_KEY,
 		linux.TCP_FASTOPEN_NO_COOKIE,
@@ -2599,11 +2584,6 @@ func (s *sock) setSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, optVa
 	case linux.IP6T_SO_SET_REPLACE:
 		if len(optVal) < linux.SizeOfIP6TReplace {
 			return syserr.ErrInvalidArgument
-		}
-
-		// Only valid for raw IPv6 sockets.
-		if !socket.IsRaw(s) {
-			return syserr.ErrProtocolNotAvailable
 		}
 
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
@@ -2903,11 +2883,6 @@ func (s *sock) setSockOptIP(t *kernel.Task, ep commonEndpoint, name int, optVal 
 			return syserr.ErrInvalidArgument
 		}
 
-		// Only valid for raw IPv4 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET || skType != linux.SOCK_RAW {
-			return syserr.ErrProtocolNotAvailable
-		}
-
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
 			return syserr.ErrNotPermitted
 		}
@@ -3078,6 +3053,7 @@ func (s *sock) GetPeerCreds(*kernel.Task) (marshal.Marshallable, *syserr.Error) 
 	return nil, syserr.ErrNotSupported
 }
 
+// +checklocks:s.readMu
 func (s *sock) fillCmsgInq(cmsg *socket.ControlMessages) {
 	if !s.sockOptInq {
 		return
@@ -3110,6 +3086,9 @@ func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
 // nonBlockingRead issues a non-blocking read.
 //
 // TODO(b/78348848): Support timestamps for stream sockets.
+//
+// +checklocksexclude:s.readMu
+// +checklocksexclude:s.mu
 func (s *sock) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek, trunc, senderRequested bool) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
 	isPacket := s.isPacketBased()
 
@@ -3210,6 +3189,7 @@ func (s *sock) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek
 	return res.Count, 0, nil, 0, cmsg, syserr.TranslateNetstackError(err)
 }
 
+// +checklocks:s.readMu
 func (s *sock) netstackToLinuxControlMessages(cm tcpip.ReceivableControlMessages) socket.ControlMessages {
 	readCM := socket.NewIPControlMessages(s.family, cm)
 	return socket.ControlMessages{
@@ -3248,7 +3228,7 @@ func (s *sock) linuxToNetstackControlMessages(cm socket.ControlMessages) tcpip.S
 // updateTimestamp sets the timestamp for SIOCGSTAMP. It should be called after
 // successfully writing packet data out to userspace.
 //
-// Precondition: s.readMu must be locked.
+// +checklocks:s.readMu
 func (s *sock) updateTimestamp(cm tcpip.ReceivableControlMessages) {
 	// Save the SIOCGSTAMP timestamp only if SO_TIMESTAMP is disabled.
 	if !s.sockOptTimestamp {
@@ -3315,6 +3295,9 @@ func (s *sock) recvErr(t *kernel.Task, dst usermem.IOSequence) (int, int, linux.
 
 // RecvMsg implements the linux syscall recvmsg(2) for sockets backed by
 // tcpip.Endpoint.
+//
+// +checklocksexclude:s.readMu
+// +checklocksexclude:s.mu
 func (s *sock) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDeadline bool, deadline ktime.Time, senderRequested bool, _ uint64) (n int, msgFlags int, senderAddr linux.SockAddr, senderAddrLen uint32, controlMessages socket.ControlMessages, err *syserr.Error) {
 	if flags&linux.MSG_ERRQUEUE != 0 {
 		return s.recvErr(t, dst)
@@ -3460,6 +3443,8 @@ func (s *sock) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags 
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.
+//
+// +checklocksexclude:s.readMu
 func (s *sock) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {

@@ -16,10 +16,12 @@
 package metric
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
 	re "regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -154,8 +156,11 @@ type Uint64Metric struct {
 }
 
 var (
-	// initialized indicates that all metrics are registered. allMetrics is
-	// immutable once initialized is true.
+	// initialized indicates that metric registration is complete. Once true,
+	// allMetrics' registration and metric maps are immutable; metric values
+	// and stage timing state continue to change.
+	//
+	// +checkatomic
 	initialized atomicbitops.Bool
 
 	// allMetrics are the registered metrics.
@@ -278,10 +283,17 @@ type FieldValue struct {
 	Value string
 }
 
-// fieldMapperMapThreshold is the number of field values after which we switch
-// to using map lookups when looking up field values.
-// This value was determined using benchmarks to see which is fastest.
-const fieldMapperMapThreshold = 48
+// fieldMapperSearchThreshold is the number of field values after which we
+// switch from linear to binary search when looking up field values.
+// The benchmarks described in https://github.com/google/gvisor/commit/79b38029d
+// found linear search faster than map and binary search up to 48 values.
+const fieldMapperSearchThreshold = 48
+
+// fieldValueIndex associates a retained field value with its declaration index.
+type fieldValueIndex struct {
+	value *FieldValue
+	index int
+}
 
 // Field contains the field name and allowed values for the metric which is
 // used in registration of the metric.
@@ -289,19 +301,15 @@ type Field struct {
 	// name is the metric field name.
 	name string
 
-	// values is the list of values for the field.
-	// `values` is always populated but not always used for lookup. It depends
-	// on the number of allowed field values. `values` is used for lookups on
-	// fields with small numbers of field values.
+	// values holds the field values in declaration order. Its indices define
+	// metric keys and are also used by valuesSorted for lookup.
 	values []*FieldValue
 
-	// valuesPtrMap is a map version of `values`. For each item in `values`,
-	// its pointer is mapped to its index within `values`.
-	// `valuesPtrMap` is used for fields with large numbers of possible values.
-	// For fields with small numbers of field values, it is nil.
-	// This map allows doing faster string matching than a normal string map,
-	// as it avoids the string hashing step that normal string maps need to do.
-	valuesPtrMap map[*FieldValue]int
+	// valuesSorted contains field values and their declaration indices, sorted
+	// by pointer address.
+	// It supports binary search without changing declaration order or calling
+	// map runtime helpers, which can split the stack. For small fields it is nil.
+	valuesSorted []fieldValueIndex
 }
 
 // toProto returns the proto definition of this field, for use in metric
@@ -325,29 +333,34 @@ func (f Field) toProto() *pb.MetricMetadata_Field {
 // package-level `var`s during metric modifications.
 func NewField(name string, allowedValues ...*FieldValue) Field {
 	// Verify that all string values have a unique value.
-	strMap := make(map[string]bool, len(allowedValues))
+	strMap := make(map[string]struct{}, len(allowedValues))
 	for _, v := range allowedValues {
-		if strMap[v.Value] {
+		if _, ok := strMap[v.Value]; ok {
 			panic(fmt.Sprintf("found duplicate field value: %q", v))
 		}
-		strMap[v.Value] = true
+		strMap[v.Value] = struct{}{}
 	}
 
-	if useMap := len(allowedValues) > fieldMapperMapThreshold; !useMap {
+	if len(allowedValues) <= fieldMapperSearchThreshold {
 		return Field{
 			name:   name,
 			values: allowedValues,
 		}
 	}
 
-	valuesPtrMap := make(map[*FieldValue]int, len(allowedValues))
+	valuesSorted := make([]fieldValueIndex, len(allowedValues))
 	for i, v := range allowedValues {
-		valuesPtrMap[v] = i
+		// Storing v in the slice ensures that caller-local FieldValues
+		// escape to the heap, where stack growth cannot change their order.
+		valuesSorted[i] = fieldValueIndex{value: v, index: i}
 	}
+	slices.SortFunc(valuesSorted, func(a, b fieldValueIndex) int {
+		return cmp.Compare(fieldValueAddress(a.value), fieldValueAddress(b.value))
+	})
 	return Field{
 		name:         name,
 		values:       allowedValues,
-		valuesPtrMap: valuesPtrMap,
+		valuesSorted: valuesSorted,
 	}
 }
 
@@ -398,30 +411,43 @@ func (m *fieldMapper) lookupSingle(fieldIndex int, fieldValue *FieldValue, idx, 
 	field := m.fields[fieldIndex]
 	numValues := len(field.values)
 
-	// Are we doing a linear search?
-	if field.valuesPtrMap == nil {
+	valIdx := -1
+	if field.valuesSorted == nil {
 		// We scan by pointers only. This means the caller must pass the same
 		// FieldValue pointer as the one used in `NewField`.
-		for valIdx, allowedVal := range field.values {
+		for i, allowedVal := range field.values {
 			if fieldValue == allowedVal {
-				remainingCombinationBucket /= numValues
-				idx += remainingCombinationBucket * valIdx
-				return idx, remainingCombinationBucket
+				valIdx = i
+				break
 			}
 		}
+	} else {
+		// slices.BinarySearchFunc can split the stack, so keep the search
+		// within this nosplit function.
+		targetAddr := fieldValueAddress(fieldValue)
+		low, high := 0, len(field.valuesSorted)
+		for low < high {
+			mid := low + (high-low)/2
+			if fieldValueAddress(field.valuesSorted[mid].value) < targetAddr {
+				low = mid + 1
+			} else {
+				high = mid
+			}
+		}
+		if low < len(field.valuesSorted) {
+			entry := field.valuesSorted[low]
+			if entry.value == fieldValue {
+				valIdx = entry.index
+			}
+		}
+	}
+
+	if valIdx < 0 {
 		panic("invalid field value or did not reuse the same FieldValue pointer as passed in NewField")
 	}
-
-	// Match using FieldValue pointer.
-	// This avoids the string hashing step that string maps otherwise do.
-	valIdx, found := field.valuesPtrMap[fieldValue]
-	if found {
-		remainingCombinationBucket /= numValues
-		idx += remainingCombinationBucket * valIdx
-		return idx, remainingCombinationBucket
-	}
-
-	panic("invalid field value or did not reuse the same FieldValue pointer as passed in NewField")
+	remainingCombinationBucket /= numValues
+	idx += remainingCombinationBucket * valIdx
+	return idx, remainingCombinationBucket
 }
 
 // lookupConcat looks up a key within the fieldMapper where the fields are
@@ -779,8 +805,8 @@ func NewExponentialBucketer(numFiniteBuckets int, width uint64, scale, growth fl
 	if numFiniteBuckets < exponentialMinBuckets || numFiniteBuckets > exponentialMaxBuckets {
 		panic(fmt.Sprintf("number of finite buckets must be in [%d, %d]", exponentialMinBuckets, exponentialMaxBuckets))
 	}
-	if scale < 0 || growth < 0 {
-		panic(fmt.Sprintf("scale and growth for exponential buckets must be >0, got scale=%f and growth=%f", scale, growth))
+	if scale < 0 || growth < 0 || math.IsNaN(scale) || math.IsNaN(growth) {
+		panic(fmt.Sprintf("scale and growth for exponential buckets must be non-negative numbers, got scale=%f and growth=%f", scale, growth))
 	}
 	b := &ExponentialBucketer{
 		numFiniteBuckets: numFiniteBuckets,
@@ -983,6 +1009,8 @@ type distributionStatistics struct {
 // As a result, it is not entirely accurate when it races with itself,
 // though the imprecision should be fairly small and should not practically
 // matter for distributions with more than a handful of records.
+//
+//go:nosplit
 func (s *distributionStatistics) Update(sample int64) {
 	newSampleCount := s.sampleCount.Add(1)
 	newSampleSum := s.sampleSum.Add(sample)
@@ -1223,14 +1251,18 @@ type metricSet struct {
 	// Map of distribution metrics.
 	distributionMetrics map[string]*DistributionMetric
 
-	// mu protects the fields below.
 	mu sync.RWMutex
 
-	// Information about the stages reached by the Sentry. Only appended to, so
-	// reading a shallow copy of the slice header concurrently is safe.
+	// finished records completed Sentry initialization stages. Its slice header
+	// is copied under mu; existing elements are immutable, so the copied prefix
+	// can be read after releasing mu.
+	//
+	// +checklocks:mu
 	finished []stageTiming
 
 	// The current stage in progress.
+	//
+	// +checklocks:mu
 	currentStage stageTiming
 }
 
@@ -1244,6 +1276,8 @@ func makeMetricSet() *metricSet {
 }
 
 // Values returns a snapshot of all values in m.
+//
+// +checklocksexclude:m.mu
 func (m *metricSet) Values() metricValues {
 	m.mu.Lock()
 	stages := m.finished[:]
@@ -1348,12 +1382,13 @@ type metricValues struct {
 }
 
 var (
-	// emitMu protects metricsAtLastEmit and ensures that all emitted
-	// metrics are strongly ordered (older metrics are never emitted after
-	// newer metrics).
+	// emitMu ensures that all emitted metrics are strongly ordered (older
+	// metrics are never emitted after newer metrics).
 	emitMu sync.Mutex
 
 	// metricsAtLastEmit contains the state of the metrics at the last emit event.
+	//
+	// +checklocks:emitMu
 	metricsAtLastEmit metricValues
 )
 
@@ -1649,7 +1684,7 @@ func StartStage(stage InitStage) func() {
 	allMetrics.mu.Lock()
 	defer allMetrics.mu.Unlock()
 	if allMetrics.currentStage.inProgress() {
-		endStage(now)
+		allMetrics.endStage(now)
 	}
 	allMetrics.currentStage.stage = stage
 	allMetrics.currentStage.started = now
@@ -1660,15 +1695,17 @@ func StartStage(stage InitStage) func() {
 		// The current stage may have been ended by another call to StartStage, so
 		// double-check prior to clearing the current stage.
 		if allMetrics.currentStage.inProgress() && allMetrics.currentStage.stage == stage {
-			endStage(now)
+			allMetrics.endStage(now)
 		}
 	}
 }
 
-// endStage marks allMetrics.currentStage as ended, adding it to the list of
-// finished stages. It assumes allMetrics.mu is locked.
-func endStage(when time.Time) {
-	allMetrics.currentStage.ended = when
-	allMetrics.finished = append(allMetrics.finished, allMetrics.currentStage)
-	allMetrics.currentStage = stageTiming{}
+// endStage marks m.currentStage as ended, adding it to the list of
+// finished stages.
+//
+// +checklocks:m.mu
+func (m *metricSet) endStage(when time.Time) {
+	m.currentStage.ended = when
+	m.finished = append(m.finished, m.currentStage)
+	m.currentStage = stageTiming{}
 }

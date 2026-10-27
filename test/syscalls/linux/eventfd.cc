@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,9 +23,15 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstdint>
+#include <vector>
+
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/util/epoll_util.h"
 #include "test/util/eventfd_util.h"
+#include "test/util/file_descriptor.h"
+#include "test/util/posix_error.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -122,7 +129,7 @@ TEST(EventfdTest, IllegalPwrite) {
 
 TEST(EventfdTest, BigWriteFails) {
   // Starting Linux 6.9, big writes fail. gVisor has the newer behavior.
-  if (!IsRunningOnGvisor()) {
+  if (GvisorPlatform() == Platform::kNative) {
     auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
     SKIP_IF(version.major < 6 || (version.major == 6 && version.minor < 9));
   }
@@ -192,7 +199,7 @@ TEST(EventfdTest, NotifyNonZero) {
 TEST(EventfdTest, SpliceReturnsEINVAL) {
   // Splicing into eventfd has been disabled in
   // 36e2c7421f02 ("fs: don't allow splice read/write without explicit ops").
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
 
   // Create an eventfd descriptor.
   FileDescriptor efd = ASSERT_NO_ERRNO_AND_VALUE(NewEventFD(7, 0));

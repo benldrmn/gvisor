@@ -26,12 +26,15 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // CompatibilityInfo is the collection of all information.
 type CompatibilityInfo map[string]map[string]ArchInfo
 
-// ArchInfo is compatbility doc for an architecture.
+// ArchInfo is compatibility doc for an architecture.
 type ArchInfo struct {
 	// Syscalls maps syscall number for the architecture to the doc.
 	Syscalls map[uintptr]SyscallDoc `json:"syscalls"`
@@ -178,7 +181,7 @@ func main() {
 					URLs    []string
 				}
 			}{
-				Title:        strings.Title(osName) + "/" + archName,
+				Title:        cases.Title(language.Und, cases.NoLower).String(osName) + "/" + archName,
 				OS:           osName,
 				Arch:         archName,
 				Weight:       weight,

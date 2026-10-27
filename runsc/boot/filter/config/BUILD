@@ -33,6 +33,7 @@ go_library(
         "//pkg/seccomp/precompiledseccomp",
         "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/devices/nvproxy/nvconf",
+        "//pkg/sentry/devices/rdmaproxy",
         "//pkg/sentry/devices/tpuproxy",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/platforms",
@@ -47,10 +48,17 @@ go_library(
 
 go_test(
     name = "config_test",
-    srcs = ["config_test.go"],
-    library = ":config",
+    size = "large",
+    srcs = [
+        "clone_test.go",
+        "config_test.go",
+    ],
+    embed = [":config"],
     deps = [
+        "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/seccomp",
+        "//pkg/seccomp/precompiledseccomp",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/platform/kvm",
         "//pkg/sentry/platform/systrap",

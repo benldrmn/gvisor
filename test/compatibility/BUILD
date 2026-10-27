@@ -11,6 +11,7 @@ go_library(
     name = "compatibility",
     testonly = True,
     srcs = ["compatibility.go"],
+    importpath = "gvisor.dev/gvisor/test/compatibility",
 )
 
 compatibility_test(
@@ -70,6 +71,42 @@ compatibility_test(
 compatibility_test(
     name = "valkey",
     srcs = ["valkey/valkey_test.go"],
+    deps = [
+        "//pkg/test/dockerutil",
+        "//test/compatibility",
+    ],
+)
+
+compatibility_test(
+    name = "kafka",
+    srcs = ["kafka/kafka_test.go"],
+    deps = [
+        "//pkg/test/dockerutil",
+        "//test/compatibility",
+    ],
+)
+
+compatibility_test(
+    name = "mosquitto",
+    srcs = ["mosquitto/mosquitto_test.go"],
+    deps = [
+        "//pkg/test/dockerutil",
+        "//test/compatibility",
+    ],
+)
+
+compatibility_test(
+    name = "rabbitmq",
+    srcs = ["rabbitmq/rabbitmq_test.go"],
+    deps = [
+        "//pkg/test/dockerutil",
+        "//test/compatibility",
+    ],
+)
+
+compatibility_test(
+    name = "keycloak",
+    srcs = ["keycloak/keycloak_test.go"],
     deps = [
         "//pkg/test/dockerutil",
         "//test/compatibility",

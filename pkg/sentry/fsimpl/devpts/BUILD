@@ -56,10 +56,11 @@ go_test(
     name = "devpts_test",
     size = "small",
     srcs = ["devpts_test.go"],
-    library = ":devpts",
+    embed = [":devpts"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel/auth",
         "//pkg/usermem",
         "//pkg/waiter",
     ],

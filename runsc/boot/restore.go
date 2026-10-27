@@ -15,15 +15,17 @@
 package boot
 
 import (
-	"errors"
 	"fmt"
-	"io"
+	"math/bits"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	time2 "time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
@@ -33,11 +35,15 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -47,6 +53,7 @@ import (
 	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
@@ -63,72 +70,50 @@ const (
 	// metadata during save/restore.
 	ContainerSpecsKey = "container_specs"
 
-	annotationCheckpointPrefix = "dev.gvisor.internal.checkpoint."
-
-	// annotationCheckpointPath is the path to the directory where the checkpoint files will be
-	// created. When present, it allows for the workload running inside to trigger a checkpoint
-	// without having to use the runsc CLI.
-	annotationCheckpointPath = annotationCheckpointPrefix + "path"
+	// TSC snapshot metadata keys. These are written by the save side in
+	// pkg/sentry/state and consumed by computeTSCOffset.
+	//
+	// The cycle is in the guest TSC domain, i.e. it is the TSC value the
+	// application observed at save time, including any guest TSC offset
+	// applied by the platform. This keeps the application TSC continuous
+	// across repeated save/restore cycles.
+	metadataTSCSnapshotCycleKey        = "gvisor_tsc_snapshot_cycle"
+	metadataTSCSnapshotFrequencyKey    = "gvisor_tsc_snapshot_frequency"
+	metadataTSCSnapshotRealtimeNsecKey = "gvisor_tsc_snapshot_realtime_nsec"
 
 	// annotationCheckpointResume indicates whether the sandbox should continue running after the
 	// checkpoint. Optional, defaults to false.
-	annotationCheckpointResume = annotationCheckpointPrefix + "resume"
-
-	// annotationCheckpointCompression is the compression to use for the checkpoint file. Optional,
-	// defaults to best speed compression.
-	annotationCheckpointCompression = annotationCheckpointPrefix + "compression"
-
-	// annotationCheckpointDirect indicates whether the checkpoint IOs should use O_DIRECT. Optional,
-	// defaults to false.
-	annotationCheckpointDirect = annotationCheckpointPrefix + "direct"
+	annotationCheckpointResume = sentryapi.AnnotationCheckpointPrefix + "resume"
 
 	// annotationCheckpointExcludeCommittedZeroPages indicates whether the checkpoint should exclude
 	// committed zero pages. Optional, defaults to false.
-	annotationCheckpointExcludeCommittedZeroPages = annotationCheckpointPrefix + "exclude-committed-zero-pages"
+	annotationCheckpointExcludeCommittedZeroPages = sentryapi.AnnotationCheckpointPrefix + "exclude-committed-zero-pages"
 
 	// annotationCheckpointCudaCheckpointPath is the path to the cuda-checkpoint binary. It's required
 	// if the workload has CUDA processes.
-	annotationCheckpointCudaCheckpointPath = annotationCheckpointPrefix + "cuda-checkpoint-path"
+	annotationCheckpointCudaCheckpointPath = sentryapi.AnnotationCheckpointPrefix + "cuda-checkpoint-path"
 
 	// annotationCheckpointCudaCheckpointSequential indicates whether cuda-checkpoint should be run
 	// sequentially. Optional, defaults to false.
-	annotationCheckpointCudaCheckpointSequential = annotationCheckpointPrefix + "cuda-checkpoint-sequential"
+	annotationCheckpointCudaCheckpointSequential = sentryapi.AnnotationCheckpointPrefix + "cuda-checkpoint-sequential"
 
 	// annotationCheckpointEnable indicates whether files under /proc/gvisor should be present in
 	// the container to allow the workload to trigger a checkpoint.
-	annotationCheckpointEnable = annotationCheckpointPrefix + "enable"
+	annotationCheckpointEnable = sentryapi.AnnotationCheckpointPrefix + "enable"
 
 	// annotationSaveRestoreExecArgv is the argv to use for the save/restore exec
 	// binary.
-	annotationSaveRestoreExecArgv = annotationCheckpointPrefix + "save-restore-exec-argv"
+	annotationSaveRestoreExecArgv = sentryapi.AnnotationCheckpointPrefix + "save-restore-exec-argv"
 
 	// annotationSaveRestoreExecTimeout is the timeout to use for the save/restore
 	// exec binary.
-	annotationSaveRestoreExecTimeout = annotationCheckpointPrefix + "save-restore-exec-timeout"
+	annotationSaveRestoreExecTimeout = sentryapi.AnnotationCheckpointPrefix + "save-restore-exec-timeout"
+
+	networkKey = "network"
+
+	// noRootContainerKey marks a checkpoint of a sandbox with no root container.
+	noRootContainerKey = "no_root_container"
 )
-
-// GetAnnotationCheckpointPath returns the checkpoint path specified in the
-// container annotation. Return empty string if no annotation is specified.
-func GetAnnotationCheckpointPath(conf *config.Config, spec *specs.Spec) (string, error) {
-	path := spec.Annotations[annotationCheckpointPath]
-	if len(path) != 0 {
-		if len(conf.TestOnlyAutosaveImagePath) != 0 {
-			return "", fmt.Errorf("autosave is not supported with %q annotation", annotationCheckpointPath)
-		}
-	}
-	return path, nil
-}
-
-// GetAnnotationCheckpointCompression returns the checkpoint compression level
-// specified in the container annotation.
-func GetAnnotationCheckpointCompression(spec *specs.Spec) (statefile.CompressionLevel, error) {
-	return statefile.CompressionLevelFromString(spec.Annotations[annotationCheckpointCompression])
-}
-
-// GetAnnotationCheckpointDirect returns true if the checkpoint is direct.
-func GetAnnotationCheckpointDirect(spec *specs.Spec) bool {
-	return specutils.AnnotationToBool(spec, annotationCheckpointDirect)
-}
 
 // SaveAsync starts a goroutine to save the kernel. Implements kernel.Saver.
 func (l *Loader) SaveAsync() (err error) {
@@ -169,7 +154,7 @@ func (l *Loader) SaveAsync() (err error) {
 
 // saveOptsFromSpec returns the saveOpts based on annotations from the spec. `fds` are
 // no longer needed and can be closed after this is called.
-func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (*control.SaveOpts, error) {
+func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (*controlapi.SaveOpts, error) {
 	// Convert the FDs to files which is required by the saveOpts.
 	files := make([]*os.File, len(fds))
 	for i, fd := range fds {
@@ -180,12 +165,12 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 		}
 	}
 
-	comp, err := GetAnnotationCheckpointCompression(spec)
+	comp, err := sentryapi.GetAnnotationCheckpointCompression(spec)
 	if err != nil {
 		return nil, err
 	}
 
-	saveOpts := &control.SaveOpts{
+	saveOpts := &controlapi.SaveOpts{
 		AppMFExcludeCommittedZeroPages: specutils.AnnotationToBool(spec, annotationCheckpointExcludeCommittedZeroPages),
 		FilePayload: urpc.FilePayload{
 			Files: files,
@@ -206,14 +191,14 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 	}
 
 	if spec.Annotations[annotationSaveRestoreExecArgv] != "" {
-		saveRestoreExecTimeout := control.DefaultSaveRestoreExecTimeout
+		saveRestoreExecTimeout := controlapi.DefaultSaveRestoreExecTimeout
 		if spec.Annotations[annotationSaveRestoreExecTimeout] != "" {
 			saveRestoreExecTimeout, err = time2.ParseDuration(spec.Annotations[annotationSaveRestoreExecTimeout])
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse save-restore-exec-timeout: %w", err)
 			}
 		}
-		saveOpts.ExecOpts = control.SaveRestoreExecOpts{
+		saveOpts.ExecOpts = controlapi.SaveRestoreExecOpts{
 			Argv:    spec.Annotations[annotationSaveRestoreExecArgv],
 			Timeout: saveRestoreExecTimeout,
 		}
@@ -221,23 +206,19 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 	return saveOpts, nil
 }
 
-// The root container has the annotationCheckpointPath annotation set if
-// application-driven checkpoint is enabled. Since the root container is
-// always the first container, we can use it to initialize this global variable
-// and it will inform the future sub-containers.
-var appDrivenCheckpointEnabled = false
-
-func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalData {
-	if len(spec.Annotations[annotationCheckpointPath]) != 0 {
-		appDrivenCheckpointEnabled = true
+func newProcInternalData(conf *config.Config, spec *specs.Spec, containerName string) *proc.InternalData {
+	data := &proc.InternalData{
+		GVisorMarkerFile:    conf.GVisorMarkerFile,
+		OverrideProcs:       procFiles(conf),
+		SaveTriggerEnabled:  specutils.AnnotationToBool(spec, annotationCheckpointEnable),
+		FSCheckpointEnabled: specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
+		ContainerName:       containerName,
 	}
-	return &proc.InternalData{
-		GVisorMarkerFile:           conf.GVisorMarkerFile,
-		OverrideProcs:              procFiles(conf),
-		AppDrivenCheckpointEnabled: appDrivenCheckpointEnabled,
-		SaveTriggerEnabled:         specutils.AnnotationToBool(spec, annotationCheckpointEnable),
-		FSCheckpointEnabled:        specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
+	if spec.Process != nil {
+		data.ContainerUID = auth.KUID(spec.Process.User.UID)
+		data.ContainerGID = auth.KGID(spec.Process.User.GID)
 	}
+	return data
 }
 
 // restorer manages a restore session for a sandbox. It stores information about
@@ -255,7 +236,7 @@ type restorer struct {
 	containers []*containerInfo
 
 	// stateFile is a reader for the statefile.
-	stateFile io.ReadCloser
+	stateFile statefile.Reader
 
 	// metadata is the metadata contained in the statefile.
 	metadata map[string]string
@@ -297,8 +278,9 @@ type restorer struct {
 }
 
 // restoreSubcontainer restores a subcontainer.
-func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) error {
-	containerName := l.registerContainer(spec, cid)
+// It returns whether this started the kernel.
+func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) (bool, error) {
+	containerName := r.registerContainer(l, spec, cid)
 	info := &containerInfo{
 		cid:               cid,
 		containerName:     containerName,
@@ -313,17 +295,45 @@ func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l 
 	return r.restoreContainerInfo(l, info)
 }
 
+// registerContainer registers container cid. A container without a name gets
+// the lowest unnamed container name in the checkpoint that is not yet taken.
+//
+// +checklocksexclude:l.mu
+func (r *restorer) registerContainer(l *Loader, spec *specs.Spec, cid string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if specutils.ContainerName(spec) != "" {
+		return l.registerContainerLocked(spec, cid)
+	}
+	var free []int
+	for name := range r.checkpointedSpecs {
+		if n, ok := unnamedContainerNumber(name); ok {
+			if _, taken := l.containerIDs[name]; !taken {
+				free = append(free, n)
+			}
+		}
+	}
+	if len(free) == 0 {
+		return l.registerContainerLocked(spec, cid)
+	}
+	containerName := unnamedContainerPrefix + strconv.Itoa(slices.Min(free))
+	l.registerContainerNameLocked(spec, cid, containerName)
+	return containerName
+}
+
 // restoreContainerInfo restores a container.
-func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
+// It returns whether this started the kernel.
+func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {
-			return fmt.Errorf("container %q already restored", info.containerName)
+			return false, fmt.Errorf("container %q already restored", info.containerName)
 		}
 		if container.cid == info.cid {
-			return fmt.Errorf("container CID %q already belongs to container %q", info.cid, container.containerName)
+			return false, fmt.Errorf("container CID %q already belongs to container %q", info.cid, container.containerName)
 		}
 	}
 
@@ -342,10 +352,22 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	if len(r.containers) == r.totalContainers {
 		// Trigger the restore if this is the last container.
 		if err := r.restore(l); err != nil {
-			return err
+			return false, err
 		}
+		return true, nil
 	}
-	return nil
+	return false, nil
+}
+
+type restoreMounts struct {
+	fdmap             map[checkpoint.ResourceID]int
+	mfmap             map[checkpoint.ResourceID]*pgalloc.MemoryFile
+	sharedMfs         map[string]bool
+	fsCheckpointedMfs map[checkpoint.ResourceID]struct{}
+}
+
+func (r *restoreMounts) String() string {
+	return fmt.Sprintf("fdmap: %#v, mfmap: %v, fsCheckpointedMfs: %v", r.fdmap, r.mfmap, r.fsCheckpointedMfs)
 }
 
 func (r *restorer) restore(l *Loader) error {
@@ -356,15 +378,27 @@ func (r *restorer) restore(l *Loader) error {
 	if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
 		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
-	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone {
-		// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-		return errors.New("checkpoint not supported when using hostinet")
+	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone && l.root.conf.Network != config.NetworkHost {
+		return fmt.Errorf("checkpoint not supported when using %s networking", l.root.conf.Network)
+	}
+	// Checkpoints without the network key predate hostinet support.
+	savedNetwork, ok := r.metadata[networkKey]
+	if !ok {
+		savedNetwork = config.NetworkSandbox.String()
+	}
+	savedHost := savedNetwork == config.NetworkHost.String()
+	if restoreHost := l.root.conf.Network == config.NetworkHost; savedHost != restoreHost {
+		return fmt.Errorf("checkpoint created with %s networking cannot be restored with %s networking", savedNetwork, l.root.conf.Network)
 	}
 	r.timer.Reached("specs validated")
 
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID)
+	tscOffset, willJumpBackwards := r.computeTSCOffset()
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer, &l.pinRing, tscOffset)
 	if err != nil {
 		return fmt.Errorf("creating platform: %v", err)
+	}
+	if _, ok := p.(platform.TSCAdjustablePlatform); !ok && willJumpBackwards {
+		log.Warningf("Platform %q does not support TSC offsetting; host TSC is behind snapshot base cycle, timestamps will go backwards", l.root.conf.Platform)
 	}
 
 	// Start the old watchdog before replacing it with a new one below.
@@ -387,6 +421,38 @@ func (r *restorer) restore(l *Loader) error {
 		pprof.Initialize()
 	}
 
+	if l.root.conf.Network == config.NetworkHost {
+		ports := hostinet.ReadPortRange()
+		l.hostinetPortRange = &ports
+		devFile, err := os.Open("/proc/net/dev")
+		if err != nil {
+			log.Warningf("Failed to open /proc/net/dev during restore: %v", err)
+		} else {
+			l.hostinetNetDevFile = devFile
+		}
+		snmpFile, err := os.Open("/proc/net/snmp")
+		if err != nil {
+			log.Warningf("Failed to open /proc/net/snmp during restore: %v", err)
+		} else {
+			l.hostinetNetSNMPFile = snmpFile
+		}
+		defer func() {
+			l.hostinetPortRange = nil
+			if l.hostinetNetDevFile != nil {
+				l.hostinetNetDevFile.Close()
+				l.hostinetNetDevFile = nil
+			}
+			if l.hostinetNetSNMPFile != nil {
+				l.hostinetNetSNMPFile.Close()
+				l.hostinetNetSNMPFile = nil
+			}
+		}()
+	}
+
+	if err := l.pinRing.Finalize(); err != nil {
+		log.Warningf("Cannot pin files to the pin ring: %v. This slows down gVisor sandbox teardown.", err)
+	}
+
 	// Seccomp filters have to be applied before vfs restore and before parsing
 	// the state file.
 	if err := l.installSeccompFilters(); err != nil {
@@ -399,39 +465,79 @@ func (r *restorer) restore(l *Loader) error {
 	})
 	defer cu.Clean()
 
-	fdmap := make(map[checkpoint.ResourceID]int)
-	mfmap := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+	restoreMnts := restoreMounts{
+		fdmap:             make(map[checkpoint.ResourceID]int),
+		mfmap:             make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
+		sharedMfs:         make(map[string]bool),
+		fsCheckpointedMfs: make(map[checkpoint.ResourceID]struct{}),
+	}
+	cleanMnts := cleanup.Make(func() {
+		cleanedMFs := make(map[*pgalloc.MemoryFile]struct{})
+		for _, mf := range restoreMnts.mfmap {
+			if _, ok := cleanedMFs[mf]; !ok {
+				cleanedMFs[mf] = struct{}{}
+				if !mf.IsAsyncLoading() {
+					mf.Destroy()
+				}
+			}
+		}
+		borrowedFDs := make(map[int]struct{})
+		for _, cont := range r.containers {
+			for _, customFD := range cont.passFDs {
+				borrowedFDs[customFD.host.FD()] = struct{}{}
+			}
+		}
+		closedFDs := make(map[int]struct{})
+		for _, rawFD := range restoreMnts.fdmap {
+			if _, borrowed := borrowedFDs[rawFD]; !borrowed {
+				if _, closed := closedFDs[rawFD]; !closed {
+					closedFDs[rawFD] = struct{}{}
+					_ = unix.Close(rawFD)
+				}
+			}
+		}
+	})
+	defer cleanMnts.Clean()
+
 	for _, cont := range r.containers {
+		// The sandbox has no filesystem or stdios to restore.
+		if l.noRootContainer.enabled && cont.cid == l.root.cid {
+			continue
+		}
 		// TODO(b/298078576): Need to process hints here probably
 		mntr := l.newContainerMounter(cont)
-		if err = mntr.configureRestore(fdmap, mfmap); err != nil {
+		if err = mntr.configureRestore(&restoreMnts); err != nil {
 			return fmt.Errorf("configuring filesystem restore: %v", err)
 		}
 
 		for i, fd := range cont.stdioFDs {
 			key := host.MakeResourceID(cont.containerName, i)
-			fdmap[key] = fd.Release()
+			restoreMnts.fdmap[key] = fd.Release()
 		}
 		for _, customFD := range cont.passFDs {
 			key := host.MakeResourceID(cont.containerName, customFD.guest)
-			fdmap[key] = customFD.host.FD()
+			restoreMnts.fdmap[key] = customFD.host.FD()
 		}
 	}
 
-	log.Debugf("Restore using fdmap: %#v", fdmap)
+	log.Debugf("Restore using mounts: %v", &restoreMnts)
 	ctx := l.k.SupervisorContext()
-	log.Debugf("Restore using mfmap: %v", mfmap)
-	ctx = context.WithValues(ctx, map[any]any{
-		vfs.CtxRestoreFilesystemFDMap:     fdmap,
-		pgalloc.CtxMemoryFileMap:          mfmap,
+	ctxValues := map[any]any{
+		vfs.CtxRestoreFilesystemFDMap:     restoreMnts.fdmap,
+		pgalloc.CtxMemoryFileMap:          restoreMnts.mfmap,
 		devutil.CtxDevGoferClientProvider: l.k,
-	})
+	}
+	ctx = context.WithValues(ctx, ctxValues)
+	if l.fsRestore != nil {
+		ctx = kernel.WithFSRestore(ctx, restoreMnts.fsCheckpointedMfs)
+	}
 
 	if r.asyncMFLoader != nil {
 		// Now that private memory files are known, kick off their loading in the
 		// background goroutine.
-		r.asyncMFLoader.KickoffPrivate(mfmap)
+		r.asyncMFLoader.KickoffPrivate(ctx, restoreMnts.mfmap)
 	}
+	cleanMnts.Release()
 
 	ctx, err = r.prepareNvproxyRestoreContextLocked(ctx, l)
 	if err != nil {
@@ -443,16 +549,21 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	// Load the state.
+	clocks := time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(l.root.spec, l.root.conf))
 	r.timer.Reached("loading kernel")
 	if r.extractRootFsMode {
-		if err := l.k.ExtractRootfsUpperLayer(ctx, r.stateFile, r.asyncMFLoader, nil, time.NewCalibratedClocks(), r.rootFsOutputTar); err != nil {
+		if err := l.k.ExtractRootfsUpperLayer(ctx, r.stateFile, r.asyncMFLoader, nil, clocks, r.rootFsOutputTar); err != nil {
 			return fmt.Errorf("failed to extract rootfs upper layer: %w", err)
 		}
 		r.timer.Reached("rootfs upper layer extracted")
 		return nil
 	}
-	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, clocks, &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
+	}
+	// Stop the restore if a hash does not cover all of the statefile data.
+	if err := r.stateFile.Verify(); err != nil {
+		return fmt.Errorf("statefile integrity check failed: %w", err)
 	}
 	r.timer.Reached("kernel loaded")
 	if oldNvidiaDriverVersion.Major() > 0 && !l.k.NvidiaDriverVersion.Equals(oldNvidiaDriverVersion) {
@@ -465,6 +576,8 @@ func (r *restorer) restore(l *Loader) error {
 				return err
 			}
 			r.timer.Reached("MF metadata loaded")
+			// The kernel is restored; load the remaining pages at full speed.
+			r.asyncMFLoader.Unthrottle()
 		} else {
 			if err := r.asyncMFLoader.Wait(); err != nil {
 				return err
@@ -509,16 +622,21 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	// Rebuild `processes` map with containers' root process from the restored kernel.
+	specsByCID := make(map[string]*specs.Spec, len(l.containerIDs))
+	for name, cid := range l.containerIDs {
+		specsByCID[cid] = l.containerSpecs[name]
+	}
 	for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
-		// Find all processes with no parent (root of execution), that were not started
-		// via a call to `exec`.
-		if tg.Leader().Parent() == nil && tg.Leader().Origin != kernel.OriginExec {
+		// Find all container init processes. A process with no parent is not
+		// enough: in a sandbox with no root container, orphans have none.
+		if tg.IsContainerInit() {
 			cid := tg.Leader().ContainerID()
 			proc := l.processes[execID{cid: cid}]
 			if proc == nil {
 				return fmt.Errorf("unable to find container root process with CID %q, processes: %v", cid, l.processes)
 			}
 			proc.tg = tg
+			l.restoreNamespacePathsLocked(proc, specsByCID[cid], cid == l.root.cid)
 		}
 	}
 
@@ -535,8 +653,13 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	l.k.RestoreContainerMapping(l.containerIDs)
+	for cid, spec := range specsByCID {
+		if spec != nil && spec.Process != nil {
+			l.k.SetContainerEnv(cid, spec.Process.Env)
+		}
+	}
 	l.k.SetSaver(l)
-	l.createRemappedNvproxyDeviceFiles(ctx)
+	l.createNvproxyDeviceFilesAfterRestore(ctx)
 
 	// Refresh the control server with the newly created kernel.
 	l.ctrl.refreshHandlers()
@@ -544,6 +667,7 @@ func (r *restorer) restore(l *Loader) error {
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
+	l.lifecycleCPUs.releaseForRestore()
 	r.timer.Reached("Starting sandbox")
 	if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
@@ -562,6 +686,21 @@ func (r *restorer) restore(l *Loader) error {
 	return nil
 }
 
+// restoreNamespacePathsLocked lets containers started after restore join the
+// namespaces of the restored container proc by path.
+//
+// +checklocks:l.mu
+func (l *Loader) restoreNamespacePathsLocked(proc *execProcess, spec *specs.Spec, isRoot bool) {
+	if ns, ok := specutils.GetNS(specs.PIDNamespace, spec); ok && !isRoot && proc.pidns == nil {
+		proc.pidnsPath = ns.Path
+		proc.pidns = proc.tg.PIDNamespace()
+		proc.pidns.IncRef()
+	}
+	if ns, ok := specutils.GetNS(specs.CgroupNamespace, spec); ok {
+		proc.cgroupnsPath = ns.Path
+	}
+}
+
 func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, timer *timing.Timer) {
 	defer timer.Log()
 	defer timeline.End()
@@ -571,6 +710,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 		r.cm.onRestoreFailed(fmt.Errorf("post restore work failed: %w", err))
 		log.Warningf("Killing the sandbox after post restore work failed: %v", err)
 		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		r.cm.l.stopIfKilled()
 		return
 	}
 	timeline.Reached("post restore done")
@@ -588,11 +728,12 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 			r.cm.onRestoreFailed(fmt.Errorf("async MemoryFile loading failed: %w", err))
 			log.Warningf("Killing the sandbox after MemoryFile page loading failed: %v", err)
 			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			r.cm.l.stopIfKilled()
 			return
 		}
 	}
 
-	var s Savings
+	var s sentryapi.Savings
 	if err := r.calculateCPUSavings(&s); err != nil {
 		log.Warningf("Failed to calculate CPU savings: %v", err)
 	}
@@ -606,7 +747,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 }
 
 // Calculate the CPU time saved for restore.
-func (r *restorer) calculateCPUSavings(s *Savings) error {
+func (r *restorer) calculateCPUSavings(s *sentryapi.Savings) error {
 	t, err := state.CPUTime()
 	if err != nil {
 		return fmt.Errorf("failed to get CPU time usage for restore, err: %w", err)
@@ -626,7 +767,7 @@ func (r *restorer) calculateCPUSavings(s *Savings) error {
 }
 
 // Calculate the walltime saved for restore.
-func (r *restorer) calculateWallTimeSavings(s *Savings) error {
+func (r *restorer) calculateWallTimeSavings(s *sentryapi.Savings) error {
 	savedWtStr, ok := r.metadata[state.GvisorWallTimeKey]
 	if !ok {
 		return fmt.Errorf("failed to retrieve walltime from the metadata")
@@ -642,9 +783,86 @@ func (r *restorer) calculateWallTimeSavings(s *Savings) error {
 	return nil
 }
 
-func (l *Loader) save(o *control.SaveOpts) (err error) {
+// computeTSCOffset returns the guest TSC offset to apply on restore, and whether
+// timestamps will go backwards if the offset is not applied (i.e. host TSC is
+// behind the snapshot base cycle).
+//
+// If the snapshot captured TSC timekeeping parameters and host timekeeping
+// parameters are available, the offset is computed based on elapsed real
+// time and host TSC cycle delta.
+func (r *restorer) computeTSCOffset() (uint64, bool) {
+	cycleStr, ok := r.metadata[metadataTSCSnapshotCycleKey]
+	if !ok {
+		return 0, false
+	}
+	freqStr, ok := r.metadata[metadataTSCSnapshotFrequencyKey]
+	if !ok {
+		return 0, false
+	}
+	realtimeStr, ok := r.metadata[metadataTSCSnapshotRealtimeNsecKey]
+	if !ok {
+		return 0, false
+	}
+
+	baseCycle, err := strconv.ParseUint(cycleStr, 10, 64)
+	if err != nil {
+		log.Warningf("Failed to parse snapshot TSC cycle %q: %v", cycleStr, err)
+		return 0, false
+	}
+	baseFreq, err := strconv.ParseUint(freqStr, 10, 64)
+	if err != nil {
+		log.Warningf("Failed to parse snapshot TSC frequency %q: %v", freqStr, err)
+		return 0, false
+	}
+	baseRealtime, err := strconv.ParseUint(realtimeStr, 10, 64)
+	if err != nil {
+		log.Warningf("Failed to parse snapshot TSC realtime %q: %v", realtimeStr, err)
+		return 0, false
+	}
+
+	curCycle, curRealtime, ok := hostTSCRealtime()
+	if !ok {
+		return 0, false
+	}
+
+	offset, ok := tscOffsetFromSnapshot(baseCycle, baseFreq, baseRealtime, curCycle, curRealtime)
+	if !ok {
+		return 0, false
+	}
+	log.Infof("Computed snapshot TSC offset: %d", offset)
+	return offset, curCycle < baseCycle
+}
+
+// tscOffsetFromSnapshot returns the guest TSC offset that places the guest TSC
+// at baseCycle plus the cycles elapsed at baseFreq since baseRealtime, given
+// that the host TSC reads curCycle at curRealtime. It returns false if the
+// elapsed cycle count does not fit in 64 bits.
+func tscOffsetFromSnapshot(baseCycle, baseFreq, baseRealtime, curCycle, curRealtime uint64) (uint64, bool) {
+	const nsPerSec = 1_000_000_000
+	deltaNs := int64(curRealtime) - int64(baseRealtime)
+	if deltaNs < 0 {
+		log.Warningf("Realtime clock (%d ns) is behind the snapshot realtime (%d ns), assuming no time passed", curRealtime, baseRealtime)
+		deltaNs = 0
+	}
+	// deltaNs * baseFreq overflows 64 bits after only a few seconds, so
+	// compute it with a 128-bit intermediate.
+	hi, lo := bits.Mul64(uint64(deltaNs), baseFreq)
+	if hi >= nsPerSec {
+		log.Warningf("Elapsed TSC cycles overflow: %d ns at %d Hz", deltaNs, baseFreq)
+		return 0, false
+	}
+	deltaCycles, _ := bits.Div64(hi, lo, nsPerSec)
+	oldMachineCycles := baseCycle + deltaCycles
+	return oldMachineCycles - curCycle, true
+}
+
+func (l *Loader) save(o *controlapi.SaveOpts) error {
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {
+		l.k.OnCheckpointAttempt(err)
+		if len(o.SplitFSCheckpointPaths) > 0 {
+			l.k.SignalAllFSSaveWaiters(err)
+		}
 		return err
 	}
 	defer saveOpts.Close()
@@ -653,16 +871,24 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 }
 
 // saveWithOpts saves the kernel with the given options.
-func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
+func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (err error) {
+	// Fully serialize save operations, including post-save cleanup. See
+	// Loader.saveMu.
+	l.saveMu.Lock()
+	defer l.saveMu.Unlock()
+
+	hasFSSave := saveOpts.FSSaveOpts != nil
 	defer func() {
 		// This closure is required to capture the final value of err.
-		l.k.OnCheckpointAttempt(err)
+		if err == nil && saveOpts.Resume {
+			go l.postResume()
+		} else {
+			l.k.OnCheckpointAttempt(err)
+		}
+		if hasFSSave {
+			l.k.SignalAllFSSaveWaiters(err)
+		}
 	}()
-
-	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-	if l.root.conf.Network == config.NetworkHost {
-		return errors.New("checkpoint not supported when using hostinet")
-	}
 
 	if saveOpts.Metadata == nil {
 		saveOpts.Metadata = make(map[string]string)
@@ -671,6 +897,14 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 
 	// Save runsc version.
 	saveOpts.Metadata[VersionKey] = version.Version()
+
+	saveOpts.Metadata[networkKey] = l.root.conf.Network.String()
+	if l.noRootContainer.enabled {
+		saveOpts.Metadata[noRootContainerKey] = "true"
+	}
+
+	// Save the sandbox's CPU features.
+	saveOpts.Metadata[sentryapi.CPUFeaturesKey] = strings.Join(l.k.FeatureSet().FeatureNames(), ",")
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
@@ -693,7 +927,18 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 		Kernel:   l.k,
 		Watchdog: l.watchdog,
 	}
+	defer l.stopIfKilled()
 	return state.SaveWithOpts(saveOpts, execOpts)
+}
+
+// postResume runs post-resume work and then completes the checkpoint attempt.
+func (l *Loader) postResume() {
+	err := control.PostResume(l.k, nil)
+	l.k.OnCheckpointAttempt(err)
+	if err != nil {
+		log.Warningf("Killing the sandbox after post resume work failed: %v", err)
+		l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	}
 }
 
 func procFiles(conf *config.Config) []string {

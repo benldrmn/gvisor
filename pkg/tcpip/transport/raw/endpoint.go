@@ -47,7 +47,7 @@ type rawPacket struct {
 	// data holds the actual packet data, including any headers and
 	// payload.
 	data       *stack.PacketBuffer
-	receivedAt time.Time `state:".(int64)"`
+	receivedAt time.Time
 	// senderAddr is the network address of the sender.
 	senderAddr tcpip.FullAddress
 	packetInfo tcpip.IPPacketInfo
@@ -236,11 +236,13 @@ func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult
 	}
 
 	pkt := e.rcvList.Front()
-	if !opts.Peek {
+	if opts.Peek {
+		pkt.data.IncRef()
+	} else {
 		e.rcvList.Remove(pkt)
-		defer pkt.data.DecRef()
 		e.rcvBufSize -= pkt.data.Data().Size()
 	}
+	defer pkt.data.DecRef()
 
 	e.rcvMu.Unlock()
 

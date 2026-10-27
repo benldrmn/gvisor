@@ -22,6 +22,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -323,6 +324,54 @@ func TestV4ReadOnV4(t *testing.T) {
 
 	// Test acceptance.
 	testRead(c, context.UnicastV4)
+
+	// Leave Resume and packet delivery unordered so race builds check thaw.
+	payload := []byte("resume")
+	packet := context.BuildUDPPacket(payload, context.UnicastV4, context.Incoming, testTOS, testTTL, false)
+	resumable := c.EP.(stack.ResumableEndpoint)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		<-start
+		resumable.Resume()
+	})
+	wg.Go(func() {
+		<-start
+		c.InjectPacket(ipv4.ProtocolNumber, packet)
+	})
+	close(start)
+	wg.Wait()
+	c.ReadFromEndpointExpectSuccess(payload, context.UnicastV4)
+}
+
+// TestV4ReadOnV4WithTrailingPadding tests that IP payload padding is trimmed
+// from UDP packets.
+func TestV4ReadOnV4WithTrailingPadding(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+	defer c.Cleanup()
+
+	c.CreateEndpointForFlow(context.UnicastV4, udp.ProtocolNumber)
+
+	// Bind to wildcard.
+	if err := c.EP.Bind(tcpip.FullAddress{Port: context.StackPort}); err != nil {
+		c.T.Fatalf("Bind failed: %s", err)
+	}
+
+	payload := newRandomPayload(arbitraryPayloadSize)
+	pkt := context.BuildUDPPacket(payload, context.UnicastV4, context.Incoming, testTOS, testTTL, false)
+
+	// Append extra padding bytes to the packet.
+	padding := make([]byte, 10)
+	pktWithPadding := append(pkt, padding...)
+
+	// Update IPv4 TotalLength and Checksum so the IP layer doesn't trim the padding.
+	ip := header.IPv4(pktWithPadding)
+	ip.SetTotalLength(uint16(len(pktWithPadding)))
+	ip.SetChecksum(0)
+	ip.SetChecksum(^ip.CalculateChecksum())
+
+	c.InjectPacket(header.IPv4ProtocolNumber, pktWithPadding)
+	c.ReadFromEndpointExpectSuccess(payload, context.UnicastV4)
 }
 
 // TestReadOnBoundToMulticast checks that an endpoint can bind to a multicast
@@ -2370,6 +2419,41 @@ func TestSetExperimentOptionIPv6(t *testing.T) {
 	v := stack.PayloadSince(pkt.LinkHeader())
 	defer v.Release()
 	checker.IPv6WithExtHdr(t, v, checker.IPv6ExtHdr(checker.IPv6ExperimentHeader(expval)))
+}
+
+func TestForwarder(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+	defer c.Cleanup()
+
+	var handledEP tcpip.Endpoint
+	shouldHandle := true
+	fwd := udp.NewForwarder(c.Stack, func(r *udp.ForwarderRequest) bool {
+		if !shouldHandle {
+			return false
+		}
+		ep, err := r.CreateEndpoint(&c.WQ)
+		if err != nil {
+			t.Fatalf("r.CreateEndpoint(&c.WQ) failed: %s", err)
+		}
+		handledEP = ep
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	flow := context.UnicastV4
+	payload := newRandomPayload(arbitraryPayloadSize)
+	c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
+	if handledEP == nil {
+		t.Fatal("Forwarder did not create endpoint")
+	}
+	c.EP = handledEP
+	c.ReadFromEndpointExpectSuccess(payload, flow)
+	handledEP.Close()
+	c.EP = nil
+
+	// Also test unhandled forwarder request (returning false) to ensure no PacketBuffer leak.
+	shouldHandle = false
+	c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
 }
 
 func TestMain(m *testing.M) {

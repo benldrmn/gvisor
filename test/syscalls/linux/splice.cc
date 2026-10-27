@@ -13,12 +13,23 @@
 // limitations under the License.
 
 #include <fcntl.h>
-#include <linux/unistd.h>
+#include <linux/limits.h>
+#include <signal.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <unistd.h>
+
+#include <atomic>
+#include <cerrno>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -27,7 +38,10 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/logging.h"
 #include "test/util/memory_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/signal_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -66,7 +80,7 @@ TEST(SpliceTest, TwoRegularFiles) {
 }
 
 int memfd_create(const std::string& name, unsigned int flags) {
-  return syscall(__NR_memfd_create, name.c_str(), flags);
+  return syscall(SYS_memfd_create, name.c_str(), flags);
 }
 
 TEST(SpliceTest, NegativeOffset) {
@@ -790,7 +804,7 @@ TEST(SpliceTest, ToPipeWithSmallCapacityDoesNotSpin) {
       TempPath::kDefaultFileMode));
   auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDONLY));
 
-  // Create a pipe with size 4096, and fill all but 128 bytes of it.
+  // Create a pipe with size kPageSize, and fill all but 128 bytes of it.
   int p[2];
   ASSERT_THAT(pipe(p), SyscallSucceeds());
   ASSERT_THAT(fcntl(p[1], F_SETPIPE_SZ, kPageSize), SyscallSucceeds());
@@ -818,9 +832,11 @@ TEST(SpliceTest, ToPipeWithSmallCapacityDoesNotSpin) {
   DisableSave ds;  // Asserting an EINTR.
   ASSERT_NO_ERRNO(timer.Set(0, its));
 
-  // Now splice the file to the pipe. This should block, but not spin, and
-  // should return EINTR because it is interrupted by the signal.
-  EXPECT_THAT(splice(fd.get(), nullptr, p[1], nullptr, kPageSize, 0),
+  // Now splice PIPE_BUF bytes of the file to the pipe. Writes of up to PIPE_BUF
+  // bytes must be atomic, so this should block, but not spin, and should return
+  // EINTR because it is interrupted by the signal. (A kPageSize splice could
+  // legally do a short write if kPageSize > PIPE_BUF, e.g. with 64K pages.)
+  EXPECT_THAT(splice(fd.get(), nullptr, p[1], nullptr, PIPE_BUF, 0),
               SyscallFailsWithErrno(EINTR));
 
   // Alarm should have been handled.

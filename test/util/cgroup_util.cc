@@ -14,13 +14,35 @@
 
 #include "test/util/cgroup_util.h"
 
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <ostream>
+#include <utility>
+#include <vector>
+
+#include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/mount_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/save_util.h"
+#include "test/util/temp_path.h"
+#include "test/util/test_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -61,9 +83,9 @@ PosixErrorOr<int64_t> Cgroup::ReadIntegerControlFile(
 }
 
 PosixError Cgroup::WriteControlFile(absl::string_view name,
-                                    const std::string& value) const {
+                                    absl::string_view value) const {
   ASSIGN_OR_RETURN_ERRNO(FileDescriptor fd, Open(Relpath(name), O_WRONLY));
-  RETURN_ERROR_IF_SYSCALL_FAIL(WriteFd(fd.get(), value.c_str(), value.size()));
+  RETURN_ERROR_IF_SYSCALL_FAIL(WriteFd(fd.get(), value.data(), value.size()));
   const std::string alias_path = absl::StrFormat("[cg#%d]/%s", id_, name);
   std::cerr << absl::StreamFormat("echo '%s' > %s", value, alias_path)
             << std::endl;
@@ -177,7 +199,7 @@ PosixErrorOr<absl::flat_hash_set<pid_t>> Cgroup::ParsePIDList(
 
 int64_t Cgroup::next_id_ = 0;
 
-PosixErrorOr<Cgroup> Mounter::MountCgroupfs(std::string mopts) {
+PosixErrorOr<Cgroup> Mounter::MountCgroupfs(const std::string& mopts) {
   ASSIGN_OR_RETURN_ERRNO(TempPath mountpoint,
                          TempPath::CreateDirIn(root_.path()));
   ASSIGN_OR_RETURN_ERRNO(
@@ -193,7 +215,7 @@ PosixErrorOr<Cgroup> Mounter::MountCgroupfs(std::string mopts) {
   return cg;
 }
 
-PosixErrorOr<Cgroup> Mounter::MountCgroup2fs(std::string mopts) {
+PosixErrorOr<Cgroup> Mounter::MountCgroup2fs(const std::string& mopts) {
   ASSIGN_OR_RETURN_ERRNO(TempPath mountpoint,
                          TempPath::CreateDirIn(root_.path()));
   ASSIGN_OR_RETURN_ERRNO(

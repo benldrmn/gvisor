@@ -50,7 +50,7 @@ type packet struct {
 	packetEntry
 	// data holds the actual packet data, including any headers and payload.
 	data       *stack.PacketBuffer
-	receivedAt time.Time `state:".(int64)"`
+	receivedAt time.Time
 	// senderAddr is the network address of the sender.
 	senderAddr tcpip.FullAddress
 	// packetInfo holds additional information like the protocol
@@ -195,11 +195,13 @@ func (ep *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResul
 	}
 
 	packet := ep.rcvList.Front()
-	if !opts.Peek {
+	if opts.Peek {
+		packet.data.IncRef()
+	} else {
 		ep.rcvList.Remove(packet)
-		defer packet.data.DecRef()
 		ep.rcvBufSize -= packet.data.Size()
 	}
+	defer packet.data.DecRef()
 
 	ep.rcvMu.Unlock()
 

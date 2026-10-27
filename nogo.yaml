@@ -1,4 +1,9 @@
 groups:
+  # Checklocks fixtures contain intentional violations. Check their analyzer
+  # output without the suppressions used for production code.
+  - name: checklocks_tests
+    regex: "^tools/checklocks/test/"
+    default: false
   # We define three basic groups: generated (all generated files),
   # external (all files outside the repository), and internal (all
   # files within the local repository). We can't enforce many style
@@ -47,7 +52,7 @@ global:
       # Generated proto code sometimes duplicates imports with aliases.
       - "duplicate import"
       # These will never be annotated.
-      - "unexpected call to atomic function"
+      - "^unexpected call to atomic function"
       - "may require checklocks annotation for"
       # Generated proto code creates declarations like 'var start int = iNdEx'
       - "should omit type .* from declaration; it will be inferred from the right-hand side"
@@ -76,7 +81,7 @@ global:
       - "should not use ALL_CAPS in Go names"
       - "should not use underscores in Go names"
       # These need to be annotated.
-      - "unexpected call to atomic function.*"
+      - "^unexpected call to atomic function.*"
       - "return with unexpected locks held.*"
       - "incompatible return states.*"
       - "may require checklocks annotation for.*"
@@ -93,8 +98,6 @@ analyzers:
     internal:
       suppress:
         # Valid reasons to break the rules.
-        - "xsetbv: invalid MOVL of value"
-        - "xsetbv: invalid offset value"
         - "xgetbv: invalid MOVL of ret"
         - "xgetbv: invalid offset ret"
         - "wrmsr: invalid MOVL of value"
@@ -121,6 +124,7 @@ analyzers:
   cgocall:
     external: # Enabled.
   checklocks:
+    checklocks_tests: # Enabled.
     internal:
       exclude:
         - "^-$" # b/181776900: analyzer fails on buildkite.
@@ -162,6 +166,8 @@ analyzers:
         - codes/codes.go # go.opentelemetry.io/otel
         - yaml.go # github.com/go-openapi/swag/yamlutils
         - staticcheck/sa1030/sa1030.go # staticcheck
+        # Starting in 1.27, printf reports misuse of %d with pointers.
+        - route.go # github.com/vishvananda/netlink
   shift:
     generated: # Disabled for generated code; these shifts are well-defined.
       exclude: [".*"]
@@ -250,21 +256,37 @@ analyzers:
         - "symbol \"runtime_pollWaitCanceled\".*"
         - "symbol \"runtime_procPin\".*"
   SA1019: # Use of deprecated identifier.
-    # disable for now due to misattribution from golang.org/issue/44195.
-    generated:
-      exclude: [".*"]
     internal:
-      exclude: [".*"]
+      suppress:
+        # Nogo's Go 1.27 compiler archives require NewReader before Read.
+        # Remove when the export-data producer switches to cmd/export:
+        # https://github.com/golang/tools/blob/ea2f152dc/go/gcexportdata/gcexportdata.go#L25-L34
+        - '^gcexportdata\.NewReader is deprecated:'
+        # OCI prestart hooks remain supported for existing container configurations.
+        - '^(c\.Spec|spec)\.Hooks\.Prestart is deprecated:'
+        # The cgroup v1 controller still honors this setting on older host kernels.
+        - '^spec\.Memory\.Kernel is deprecated:'
   SA2001: # Empty critical section.
     internal:
       exclude:
         - pkg/sentry/fs/fs.go          # Intentional.
         - pkg/sentry/fs/gofer/inode.go # Intentional.
         - pkg/refs/refcounter_test.go  # Intentional.
+        # Lock-order validator tests intentionally have no protected data.
+        - '^pkg/sync/locking/lockdep_test\.go:'
+  SA4006: # Unused value assigned to variable.
+    internal:
+      exclude:
+        - runsc/boot/network.go # Pattern increments fdOffset after every use.
   SA4016: # Useless bitwise operations.
     internal:
       exclude:
         - pkg/gohacks/noescape_unsafe.go # x ^ 0 always equals x.
+  SA4023: # Impossible condition.
+    internal:
+      exclude:
+        - runsc/boot/loader.go     # Intersect in native_arm64.go always returns error on arm64.
+        - runsc/sandbox/network.go # Stubs in no_xdp.go always return error when built without XDP.
   ST1019: # Multiple imports of the same package.
     generated:
       exclude:

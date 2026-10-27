@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/runsc/cmd"
+	"gvisor.dev/gvisor/runsc/cmd/sentry/sentrycmd"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
@@ -28,11 +29,14 @@ var fakeFlagValues = [...]string{
 	"2:2",
 	"foo",
 	"none",
+	"never",
+	"on",
 	"1,2,3",
 	"2h45m",
 	"1:1,2:2",
 	"0 0 1,100000 100000 65536",
 	"lisafs:self,lisafs:none",
+	"/foo",
 }
 
 func dupFlag(t *testing.T, cmd subcommands.Command, flagName string) *flag.Flag {
@@ -57,6 +61,7 @@ func TestFlagSetIdempotent(t *testing.T) {
 		new(cmd.Exec).Name(): true,
 	}
 	allCommands, _ := commands()
+	allCommands[new(sentrycmd.Boot)] = internalGroup
 	for cmd, group := range allCommands {
 		// Skip commands that are known to be non-idempotent.
 		if _, ok := nonIdempotentCommands[cmd.Name()]; ok {

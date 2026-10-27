@@ -32,6 +32,9 @@ const (
 	// drivers/net/tun.c:tun_net_init()
 	defaultDevMtu = 1500
 
+	// drivers/net/tun.c:MAX_MTU
+	maxMTU = 65535
+
 	// Queue length for outbound packet, arriving at fd side for read. Overflow
 	// causes packet drops. gVisor implementation-specific.
 	defaultDevOutQueueLen = 1024
@@ -41,14 +44,23 @@ var zeroMAC [6]byte
 
 // Device is an opened /dev/net/tun device.
 //
+// File lifetime must exclude final Release from concurrent file operations.
+// Capturing the endpoint under mu does not take an additional reference.
+//
 // +stateify savable
 type Device struct {
 	waiter.Queue
 
-	mu           deviceRWMutex `state:"nosave"`
-	endpoint     *tunEndpoint
+	mu deviceRWMutex `state:"nosave"`
+	// +checklocks:mu
+	endpoint *tunEndpoint
+	// +checklocks:mu
 	notifyHandle *channel.NotificationHandle
-	flags        Flags
+
+	// flags is set by SetIff and immutable for that association.
+	//
+	// +checklocks:mu
+	flags Flags
 }
 
 // Flags set properties of a Device
@@ -61,17 +73,10 @@ type Flags struct {
 	Exclusive    bool
 }
 
-// beforeSave is invoked by stateify.
-func (d *Device) beforeSave() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	// TODO(b/110961832): Restore the device to stack. At this moment, the stack
-	// is not savable.
-	if d.endpoint != nil {
-		panic("/dev/net/tun does not support save/restore when a device is associated with it.")
-	}
-}
-
+// SetPersistent sets whether the attached interface persists without open files.
+//
+// +checklocksexclude:d.mu
+// +checklocksexclude:d.endpoint.mu
 func (d *Device) SetPersistent(v bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -85,7 +90,9 @@ func (d *Device) SetPersistent(v bool) error {
 	return nil
 }
 
-// Release implements fs.FileOperations.Release.
+// Release releases the device's reference to its attached endpoint.
+//
+// +checklocksexclude:d.mu
 func (d *Device) Release(ctx context.Context) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -100,6 +107,8 @@ func (d *Device) Release(ctx context.Context) {
 }
 
 // SetIff services TUNSETIFF ioctl(2) request.
+//
+// +checklocksexclude:d.mu
 func (d *Device) SetIff(ctx context.Context, s *stack.Stack, name string, flags Flags) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -118,7 +127,7 @@ func (d *Device) SetIff(ctx context.Context, s *stack.Stack, name string, flags 
 		prefix = "tap"
 	}
 
-	linkCaps := stack.CapabilityNone
+	linkCaps := stack.CapabilitySaveRestore
 	if flags.TAP {
 		linkCaps |= stack.CapabilityResolutionRequired
 	}
@@ -161,8 +170,6 @@ func attachOrCreateNIC(ctx context.Context, s *stack.Stack, name, prefix string,
 		id := s.NextNICID()
 		endpoint := &tunEndpoint{
 			Endpoint: channel.New(defaultDevOutQueueLen, defaultDevMtu, ""),
-			stack:    s,
-			nicID:    id,
 			name:     name,
 			isTap:    prefix == "tap",
 		}
@@ -171,8 +178,13 @@ func attachOrCreateNIC(ctx context.Context, s *stack.Stack, name, prefix string,
 		if endpoint.name == "" {
 			endpoint.name = fmt.Sprintf("%s%d", prefix, id)
 		}
-		err := s.CreateNICWithOptions(endpoint.nicID, packetsocket.New(endpoint), stack.NICOptions{
-			Name: endpoint.name,
+		err := s.CreateNICWithOptions(id, packetsocket.New(endpoint), stack.NICOptions{
+			Name:   endpoint.name,
+			Kind:   "tun",
+			MinMTU: header.IPv4MinimumMTU,
+			// Linux drivers/net/tun.c:tun_net_initialize sets max_mtu to
+			// MAX_MTU minus hard_header_len, excluding packet-info bytes.
+			MaxMTU: maxMTU - uint32(endpoint.MaxHeaderLength()),
 		})
 		switch err.(type) {
 		case nil:
@@ -192,6 +204,8 @@ func attachOrCreateNIC(ctx context.Context, s *stack.Stack, name, prefix string,
 }
 
 // MTU returns the tun endpoint MTU (maximum transmission unit).
+//
+// +checklocksexclude:d.mu
 func (d *Device) MTU() (uint32, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
@@ -205,10 +219,13 @@ func (d *Device) MTU() (uint32, error) {
 	return endpoint.MTU(), nil
 }
 
-// Write inject one inbound packet to the network interface.
+// Write injects one inbound packet into the network interface.
+//
+// +checklocksexclude:d.mu
 func (d *Device) Write(data *buffer.View) (int64, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
+	flags := d.flags
 	d.mu.RUnlock()
 	if endpoint == nil {
 		return 0, linuxerr.EBADFD
@@ -221,7 +238,7 @@ func (d *Device) Write(data *buffer.View) (int64, error) {
 
 	// Packet information.
 	var pktInfoHdr PacketInfoHeader
-	if !d.flags.NoPacketInfo {
+	if !flags.NoPacketInfo {
 		if dataLen < PacketInfoHeaderSize {
 			// Ignore bad packet.
 			return dataLen, nil
@@ -235,7 +252,7 @@ func (d *Device) Write(data *buffer.View) (int64, error) {
 
 	// Ethernet header (TAP only).
 	var ethHdr header.Ethernet
-	if d.flags.TAP {
+	if flags.TAP {
 		if data.Size() < header.EthernetMinimumSize {
 			// Ignore bad packet.
 			return dataLen, nil
@@ -254,7 +271,7 @@ func (d *Device) Write(data *buffer.View) (int64, error) {
 		protocol = pktInfoHdr.Protocol()
 	case ethHdr != nil:
 		protocol = ethHdr.Type()
-	case d.flags.TUN:
+	case flags.TUN:
 		// TUN interface with IFF_NO_PI enabled, thus
 		// we need to determine protocol from version field
 		if data.Size() == 0 {
@@ -281,9 +298,12 @@ func (d *Device) Write(data *buffer.View) (int64, error) {
 }
 
 // Read reads one outgoing packet from the network interface.
+//
+// +checklocksexclude:d.mu
 func (d *Device) Read() (*buffer.View, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
+	noPacketInfo := d.flags.NoPacketInfo
 	d.mu.RUnlock()
 	if endpoint == nil {
 		return nil, linuxerr.EBADFD
@@ -293,17 +313,17 @@ func (d *Device) Read() (*buffer.View, error) {
 	if pkt == nil {
 		return nil, linuxerr.ErrWouldBlock
 	}
-	v := d.encodePkt(pkt)
+	v := encodePkt(pkt, noPacketInfo)
 	pkt.DecRef()
 	return v, nil
 }
 
 // encodePkt encodes packet for fd side.
-func (d *Device) encodePkt(pkt *stack.PacketBuffer) *buffer.View {
+func encodePkt(pkt *stack.PacketBuffer, noPacketInfo bool) *buffer.View {
 	var view *buffer.View
 
 	// Packet information.
-	if !d.flags.NoPacketInfo {
+	if !noPacketInfo {
 		view = buffer.NewView(PacketInfoHeaderSize + pkt.Size())
 		view.Grow(PacketInfoHeaderSize)
 		hdr := PacketInfoHeader(view.AsSlice())
@@ -322,6 +342,8 @@ func (d *Device) encodePkt(pkt *stack.PacketBuffer) *buffer.View {
 
 // Name returns the name of the attached network interface. Empty string if
 // unattached.
+//
+// +checklocksexclude:d.mu
 func (d *Device) Name() string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -332,13 +354,17 @@ func (d *Device) Name() string {
 }
 
 // Flags returns the flags set for d. Zero value if unset.
+//
+// +checklocksexclude:d.mu
 func (d *Device) Flags() Flags {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.flags
 }
 
-// Readiness implements watier.Waitable.Readiness.
+// Readiness implements waiter.Waitable.Readiness.
+//
+// +checklocksexclude:d.mu
 func (d *Device) Readiness(mask waiter.EventMask) waiter.EventMask {
 	if mask&waiter.ReadableEvents != 0 {
 		d.mu.RLock()
@@ -366,17 +392,19 @@ type tunEndpoint struct {
 	tunEndpointRefs
 	*channel.Endpoint
 
-	stack *stack.Stack
-	nicID tcpip.NICID
 	name  string
 	isTap bool
 
-	mu            endpointMutex `state:"nosave"`
-	onCloseAction func()        `state:"nosave"`
-	persistent    bool
-	closed        bool
+	mu endpointMutex `state:"nosave"`
+	// +checklocks:mu
+	onCloseAction func() `state:"nosave"`
+	// +checklocks:mu
+	persistent bool
+	// +checklocks:mu
+	closed bool
 }
 
+// +checklocksexclude:e.mu
 func (e *tunEndpoint) setPersistent(v bool) {
 	e.mu.Lock()
 	if e.persistent == v || e.closed {
@@ -393,6 +421,7 @@ func (e *tunEndpoint) setPersistent(v bool) {
 	}
 }
 
+// +checklocksexclude:e.mu
 func (e *tunEndpoint) Close() {
 	e.mu.Lock()
 	if e.closed {
@@ -414,6 +443,8 @@ func (e *tunEndpoint) Close() {
 }
 
 // SetOnCloseAction implements stack.LinkEndpoint.
+//
+// +checklocksexclude:e.mu
 func (e *tunEndpoint) SetOnCloseAction(action func()) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -421,6 +452,10 @@ func (e *tunEndpoint) SetOnCloseAction(action func()) {
 }
 
 // DecRef decrements refcount of e, removing NIC if it reaches 0.
+//
+// The final reference must be dropped without holding e.mu because
+// destruction calls Close. checklocks cannot express a precondition that
+// applies only to the final decrement.
 func (e *tunEndpoint) DecRef(ctx context.Context) {
 	e.tunEndpointRefs.DecRef(func() {
 		e.Close()

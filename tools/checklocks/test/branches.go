@@ -18,7 +18,7 @@ import (
 	"math/rand"
 )
 
-func testInconsistentReturn(tc *oneGuardStruct) { // +checklocksfail
+func testInconsistentReturn(tc *oneGuardStruct) { // +checklocksfail=unexpected locks held|incompatible return states
 	if x := rand.Intn(10); x%2 == 1 {
 		tc.mu.Lock()
 	}
@@ -39,7 +39,7 @@ func testConsistentBranching(tc *oneGuardStruct) {
 	}
 }
 
-func testInconsistentBranching(tc *oneGuardStruct) { // +checklocksfail=incompatible return states|incompatible return states
+func testInconsistentBranching(tc *oneGuardStruct) { // +checklocksfail=incompatible return states|unexpected locks held
 	// We traverse the control flow graph in all consistent ways. We cannot
 	// determine however, that the first if block and second if block will
 	// evaluate to the same condition. Therefore, there are two consistent
@@ -64,7 +64,7 @@ func testUnboundedLocks(tc []*oneGuardStruct) {
 	// expect the next loop to actually fail, and we force the unlock
 	// loop to succeed in exactly the same way.
 	for _, l := range tc {
-		l.guardedField = 1 // +checklocksfail
+		l.guardedField = 1 // +checklocksfail=invalid field access|invalid field access
 	}
 	for _, l := range tc {
 		l.mu.Unlock() // +checklocksforce

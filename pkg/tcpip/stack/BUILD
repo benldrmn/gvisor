@@ -287,6 +287,7 @@ go_test(
     size = "small",
     srcs = [
         "addressable_endpoint_state_test.go",
+        "ndp_restore_test.go",
         "ndp_test.go",
         "nud_test.go",
         "stack_test.go",
@@ -298,6 +299,7 @@ go_test(
         ":stack",
         "//pkg/buffer",
         "//pkg/rand",
+        "//pkg/state",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
@@ -332,7 +334,7 @@ go_test(
         "nic_test.go",
         "packet_buffer_test.go",
     ],
-    library = ":stack",
+    embed = [":stack"],
     deps = [
         "//pkg/atomicbitops",
         "//pkg/buffer",

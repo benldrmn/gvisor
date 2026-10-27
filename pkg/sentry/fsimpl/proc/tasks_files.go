@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -282,11 +283,13 @@ var _ dynamicInode = (*loadavgData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*loadavgData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	// TODO(b/62345059): Include real data in fields.
-	// Column 1-3: CPU and IO utilization of the last 1, 5, and 10 minute periods.
+	k := kernel.KernelFromContext(ctx)
+	pidns := kernel.PIDNamespaceFromContext(ctx)
+	// TODO(b/62345059): Include real data in fields 1-3.
+	// Column 1-3: CPU and IO utilization of the last 1, 5, and 15 minute periods.
 	// Column 4-5: currently running processes and the total number of processes.
 	// Column 6: the last process ID used.
-	fmt.Fprintf(buf, "%.2f %.2f %.2f %d/%d %d\n", 0.00, 0.00, 0.00, 0, 0, 0)
+	fmt.Fprintf(buf, "%.2f %.2f %.2f %d/%d %d\n", 0.00, 0.00, 0.00, k.RunningTasks(), k.RootPIDNamespace().NumTasks(), pidns.LastTID())
 	return nil
 }
 
@@ -308,7 +311,7 @@ func (*meminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	anon := snapshot.Anonymous + snapshot.Tmpfs
 	file := snapshot.PageCache + snapshot.Mapped
 	// We don't actually have active/inactive LRUs, so just make up numbers.
-	activeFile := (file / 2) &^ (hostarch.PageSize - 1)
+	activeFile := hostarch.PageRoundDown(file / 2)
 	inactiveFile := file - activeFile
 
 	fmt.Fprintf(buf, "MemTotal:       %8d kB\n", totalSize/1024)
@@ -394,8 +397,7 @@ func (*versionData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	// FIXME(mpratt): Using Version from the init task SyscallTable
 	// disregards the different version a task may have (e.g., in a uts
 	// namespace).
-	ver := kernelVersion(ctx)
-	fmt.Fprintf(buf, "%s version %s %s\n", ver.Sysname, ver.Release, ver.Version)
+	fmt.Fprintf(buf, "%s version %s %s\n", version.LinuxSysname, version.LinuxRelease(), version.LinuxVersion)
 	return nil
 }
 
@@ -442,21 +444,8 @@ var _ dynamicInode = (*cmdLineData)(nil)
 
 // Generate implements vfs.DynamicByteSource.Generate.
 func (*cmdLineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	fmt.Fprintf(buf, "BOOT_IMAGE=/vmlinuz-%s-gvisor quiet\n", kernelVersion(ctx).Release)
+	fmt.Fprintf(buf, "BOOT_IMAGE=/vmlinuz-%s quiet\n", version.LinuxRelease())
 	return nil
-}
-
-// kernelVersion returns the kernel version.
-func kernelVersion(ctx context.Context) kernel.Version {
-	k := kernel.KernelFromContext(ctx)
-	init := k.GlobalInit()
-	if init == nil {
-		// Attempted to read before the init Task is created. This can
-		// only occur during startup, which should never need to read
-		// this file.
-		panic("Attempted to read version before initial Task is available")
-	}
-	return init.Leader().SyscallTable().Version
 }
 
 // devicesData backs /proc/devices.

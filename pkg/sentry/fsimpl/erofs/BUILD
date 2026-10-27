@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
@@ -19,13 +19,14 @@ go_template_instance(
 )
 
 go_template_instance(
-    name = "dentry_refs",
-    out = "dentry_refs.go",
+    name = "dentry_list",
+    out = "dentry_list.go",
     package = "erofs",
     prefix = "dentry",
-    template = "//pkg/refs:refs_template",
+    template = "//pkg/ilist:generic_list",
     types = {
-        "T": "dentry",
+        "Element": "*dentry",
+        "Linker": "*dentry",
     },
 )
 
@@ -43,7 +44,7 @@ go_template_instance(
 go_library(
     name = "erofs",
     srcs = [
-        "dentry_refs.go",
+        "dentry_list.go",
         "directory.go",
         "erofs.go",
         "filesystem.go",
@@ -61,6 +62,7 @@ go_library(
         "//pkg/erofs",
         "//pkg/errors/linuxerr",
         "//pkg/fspath",
+        "//pkg/gomaxprocs",
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
@@ -68,11 +70,36 @@ go_library(
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsutil",
+        "//pkg/sentry/hostfd",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/socket/unix/transport",
+        "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "erofs_test",
+    size = "small",
+    srcs = ["regular_file_test.go"],
+    embed = [":erofs"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/erofs",
+        "//pkg/fspath",
+        "//pkg/hostarch",
+        "//pkg/safemem",
+        "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/vfs",
+        "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

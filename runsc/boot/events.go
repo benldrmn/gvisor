@@ -17,92 +17,19 @@ package boot
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
-// NetworkInterface is the network statistics of the particular network interface
-type NetworkInterface struct {
-	// Name is the name of the network interface.
-	Name      string
-	RxBytes   uint64
-	RxPackets uint64
-	RxErrors  uint64
-	RxDropped uint64
-	TxBytes   uint64
-	TxPackets uint64
-	TxErrors  uint64
-	TxDropped uint64
-}
-
-// EventOut is the return type of the Event command.
-type EventOut struct {
-	Event Event `json:"event"`
-
-	// ContainerUsage maps each container ID to its total CPU usage.
-	ContainerUsage map[string]uint64 `json:"containerUsage"`
-}
-
-// Event struct for encoding the event data to JSON. Corresponds to runc's
-// main.event struct.
-type Event struct {
-	Type string `json:"type"`
-	ID   string `json:"id"`
-	Data Stats  `json:"data"`
-}
-
-// Stats is the runc specific stats structure for stability when encoding and
-// decoding stats.
-type Stats struct {
-	CPU               CPU                 `json:"cpu"`
-	Memory            Memory              `json:"memory"`
-	Pids              Pids                `json:"pids"`
-	NetworkInterfaces []*NetworkInterface `json:"network_interfaces"`
-}
-
-// Pids contains stats on processes.
-type Pids struct {
-	Current uint64 `json:"current,omitempty"`
-	Limit   uint64 `json:"limit,omitempty"`
-}
-
-// MemoryEntry contains stats on a kind of memory.
-type MemoryEntry struct {
-	Limit   uint64 `json:"limit"`
-	Usage   uint64 `json:"usage,omitempty"`
-	Max     uint64 `json:"max,omitempty"`
-	Failcnt uint64 `json:"failcnt"`
-}
-
-// Memory contains stats on memory.
-type Memory struct {
-	Cache     uint64            `json:"cache,omitempty"`
-	Usage     MemoryEntry       `json:"usage,omitempty"`
-	Swap      MemoryEntry       `json:"swap,omitempty"`
-	Kernel    MemoryEntry       `json:"kernel,omitempty"`
-	KernelTCP MemoryEntry       `json:"kernelTCP,omitempty"`
-	Raw       map[string]uint64 `json:"raw,omitempty"`
-}
-
-// CPU contains stats on the CPU.
-type CPU struct {
-	Usage CPUUsage `json:"usage"`
-}
-
-// CPUUsage contains stats on CPU usage.
-type CPUUsage struct {
-	Kernel uint64   `json:"kernel,omitempty"`
-	User   uint64   `json:"user,omitempty"`
-	Total  uint64   `json:"total,omitempty"`
-	PerCPU []uint64 `json:"percpu,omitempty"`
-}
-
-func (cm *containerManager) getUsageFromCgroups(file control.CgroupControlFile) (uint64, error) {
-	var out control.CgroupsResults
-	args := control.CgroupsReadArgs{
-		Args: []control.CgroupsReadArg{
+func (cm *containerManager) readControlFile(file controlapi.CgroupControlFile) (string, error) {
+	var out controlapi.CgroupsResults
+	args := controlapi.CgroupsReadArgs{
+		Args: []controlapi.CgroupsReadArg{
 			{
 				File: file,
 			},
@@ -110,26 +37,26 @@ func (cm *containerManager) getUsageFromCgroups(file control.CgroupControlFile) 
 	}
 	cgroups := control.Cgroups{Kernel: cm.l.k}
 	if err := cgroups.ReadControlFiles(&args, &out); err != nil {
-		return 0, err
+		return "", err
 	}
 	if len(out.Results) != 1 {
-		return 0, fmt.Errorf("expected 1 result, got %d, raw: %+v", len(out.Results), out)
+		return "", fmt.Errorf("expected 1 result, got %d, raw: %+v", len(out.Results), out)
 	}
-	val, err := out.Results[0].Unpack()
+	return out.Results[0].Unpack()
+}
+
+func (cm *containerManager) getUsageFromCgroups(file controlapi.CgroupControlFile) (uint64, error) {
+	val, err := cm.readControlFile(file)
 	if err != nil {
 		return 0, err
 	}
-	usage, err := strconv.ParseUint(val, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return usage, nil
+	return strconv.ParseUint(val, 10, 64)
 }
 
 // Event gets the events from the container.
-func (cm *containerManager) Event(cid *string, out *EventOut) error {
-	*out = EventOut{
-		Event: Event{
+func (cm *containerManager) Event(cid *string, out *sentryapi.EventOut) error {
+	*out = sentryapi.EventOut{
+		Event: sentryapi.Event{
 			ID:   *cid,
 			Type: "stats",
 		},
@@ -154,10 +81,13 @@ func (cm *containerManager) Event(cid *string, out *EventOut) error {
 	}
 
 	// Memory usage.
-	memFile := control.CgroupControlFile{
+	memFile := controlapi.CgroupControlFile{
 		Controller: "memory",
 		Path:       "/" + *cid,
 		Name:       "memory.usage_in_bytes",
+	}
+	if cm.l.k.Cgroup2FS().EverMounted() {
+		memFile.Name = "memory.current"
 	}
 	memUsage, err := cm.getUsageFromCgroups(memFile)
 	if err != nil {
@@ -204,17 +134,48 @@ func (cm *containerManager) getCPUUsageFromCgroups() (map[string]uint64, error) 
 	cm.l.mu.Lock()
 	defer cm.l.mu.Unlock()
 
-	for cid := range cm.l.containerIDs {
-		cpuacctFile := control.CgroupControlFile{
+	isV2 := cm.l.k.Cgroup2FS().EverMounted()
+	for name, cid := range cm.l.containerIDs {
+		// Before the introduction of cgroup v2, the container name, not the ID, was incorrectly used in
+		// the cgroup path. For avoiding behavior changes when cgroup v1 is in use, we use the container
+		// ID only for cgroup v2.
+		id := name
+		if isV2 {
+			id = cid
+		}
+		file := controlapi.CgroupControlFile{
 			Controller: "cpuacct",
-			Path:       "/" + cid,
+			Path:       "/" + id,
 			Name:       "cpuacct.usage",
 		}
-		cpuUsage, err := cm.getUsageFromCgroups(cpuacctFile)
+		if isV2 {
+			file.Controller = "cpu"
+			file.Name = "cpu.stat"
+		}
+		valStr, err := cm.readControlFile(file)
 		if err != nil {
 			return nil, err
 		}
-		usage[cid] = cpuUsage
+		var cpuUsage uint64
+		if isV2 {
+			for _, line := range strings.Split(valStr, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "usage_usec ") {
+					usec, err := strconv.ParseUint(strings.TrimPrefix(line, "usage_usec "), 10, 64)
+					if err != nil {
+						return nil, fmt.Errorf("parsing usage_usec in cpu.stat: %w", err)
+					}
+					cpuUsage = usec * 1000
+					break
+				}
+			}
+		} else {
+			cpuUsage, err = strconv.ParseUint(valStr, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+		}
+		usage[id] = cpuUsage
 	}
 	return usage, nil
 }

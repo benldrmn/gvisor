@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/seccomp"
+	"gvisor.dev/gvisor/pkg/sentry/platform/kvm/mmapfilter"
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sighandling"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -91,6 +92,27 @@ type machine struct {
 
 	// useCPUNums indicates whether to enable the use vCPU numbers as CPU numbers.
 	useCPUNums bool
+
+	// tscOffset is the offset to apply to the guest TSC.
+	tscOffset uint64
+
+	// tscFrequency is the frequency in Hz at which the host TSC advances,
+	// or zero if it could not be determined.
+	tscFrequency uint64
+
+	// shadowVDSO is a binary-patched copy of the host [vdso] mapped at vdsoVirt
+	// in the guest page tables when tscOffset != 0.
+	shadowVDSO []byte
+
+	// vdsoVirt is the host virtual address of [vdso].
+	vdsoVirt uintptr
+
+	// tscOffsetHostVA and tscOffsetGuestVA are the pages returned by
+	// time.EnableGuestAliasedOffset when tscOffset != 0, or zero otherwise.
+	// The guest page tables map tscOffsetHostVA to the physical page backing
+	// tscOffsetGuestVA.
+	tscOffsetHostVA  uintptr
+	tscOffsetGuestVA uintptr
 }
 
 const (
@@ -281,6 +303,7 @@ func newMachine(vm int, config *Config) (*machine, error) {
 		fd:               vm,
 		applicationCores: config.ApplicationCores,
 		useCPUNums:       config.UseCPUNums,
+		tscOffset:        config.TSCOffset,
 	}
 	m.available.L = &m.mu
 
@@ -310,12 +333,30 @@ func newMachine(vm int, config *Config) (*machine, error) {
 	m.tscControl = errno == 0 && hasTSCControl == 1
 	log.Debugf("TSC scaling support: %t.", m.tscControl)
 
+	// Destroy cannot be used on the error paths below: the machine is not
+	// registered in machinePool yet, so release what was acquired directly.
+	if err := m.initShadowVDSO(); err != nil {
+		unix.Close(m.fd)
+		return nil, err
+	}
+	if m.tscOffset != 0 {
+		hostVA, guestVA, err := ktime.EnableGuestAliasedOffset()
+		if err != nil {
+			m.destroyShadowVDSO()
+			unix.Close(m.fd)
+			return nil, err
+		}
+		m.tscOffsetHostVA = hostVA
+		m.tscOffsetGuestVA = guestVA
+	}
+
 	// Create the upper shared pagetables and kernel(sentry) pagetables.
 	m.upperSharedPageTables = pagetables.New(newAllocator())
 	m.mapUpperHalf(m.upperSharedPageTables)
 	m.upperSharedPageTables.Allocator.(*allocator).base.Drain()
 	m.upperSharedPageTables.MarkReadOnlyShared()
 	m.kernel.PageTables = pagetables.NewWithUpper(newAllocator(), m.upperSharedPageTables, ring0.KernelStartAddress)
+	config.StartupTimer.Reached("kvm page tables created")
 
 	// On x86_64, we prefer not to map the entire sentry address space into
 	// the VM due to memory overhead. It is about 3MB for a 40-bit address
@@ -339,6 +380,7 @@ func newMachine(vm int, config *Config) (*machine, error) {
 		// be handled by seccompMmapHandler.
 		seccompMmapRules(m)
 	}
+	config.StartupTimer.Reached("kvm seccomp mmap rules installed")
 
 	// Apply the physical mappings. Note that these mappings may point to
 	// guest physical addresses that are not actually available. These
@@ -353,6 +395,7 @@ func newMachine(vm int, config *Config) (*machine, error) {
 
 		return true // Keep iterating.
 	})
+	config.StartupTimer.Reached("kvm physical regions mapped")
 
 	// Ensure that the currently mapped virtual regions are actually
 	// available in the VM. Note that this doesn't guarantee no future
@@ -360,7 +403,11 @@ func newMachine(vm int, config *Config) (*machine, error) {
 	// ensure successful vCPU entry.
 	mapRegion := func(vr virtualRegion, flags uint32) {
 		for virtual := vr.virtual; virtual < vr.virtual+vr.length; {
-			physical, length, ok := translateToPhysical(virtual)
+			translateVirt := virtual
+			if vr.filename == "[vdso]" && len(m.shadowVDSO) > 0 {
+				translateVirt = m.shadowVDSOVirt() + (virtual - vr.virtual)
+			}
+			physical, length, ok := translateToPhysical(translateVirt)
 			if !ok {
 				// This must be an invalid region that was
 				// knocked out by creation of the physical map.
@@ -393,9 +440,9 @@ func newMachine(vm int, config *Config) (*machine, error) {
 	// called while we hold the slot spinlock.
 	disableAsyncPreemption()
 
-	applyVirtualRegions(func(vr virtualRegion) {
+	applyVirtualRegions(func(vr virtualRegion) bool {
 		if excludeVirtualRegion(vr) {
-			return // skip region.
+			return false // skip region.
 		}
 		// Take into account that the stack can grow down.
 		if vr.filename == "[stack]" {
@@ -404,19 +451,26 @@ func newMachine(vm int, config *Config) (*machine, error) {
 		}
 
 		mapRegion(vr, 0)
-
+		return false
 	})
+	if len(m.shadowVDSO) > 0 {
+		m.protectShadowVDSO()
+	}
+	m.mapTSCOffsetAlias()
 	if mapEntireAddressSpace {
 		for _, r := range physicalRegions {
 			m.mapPhysical(r.physical, r.length)
 		}
 	}
 	enableAsyncPreemption()
+	config.StartupTimer.Reached("kvm virtual regions mapped")
+
 	// Initialize architecture state.
 	if err := m.initArchState(); err != nil {
 		m.Destroy()
 		return nil, err
 	}
+	config.StartupTimer.Reached("kvm arch state initialized")
 
 	// Ensure the machine is cleaned up properly.
 	runtime.SetFinalizer(m, (*machine).Destroy)
@@ -469,6 +523,25 @@ func (m *machine) mapPhysical(physical, length uintptr) {
 	}
 }
 
+// mapTSCOffsetAlias maps tscOffsetHostVA to the physical page backing
+// tscOffsetGuestVA in the guest page tables, so that the TSC offset word reads
+// as zero in guest mode. See time.EnableGuestAliasedOffset.
+func (m *machine) mapTSCOffsetAlias() {
+	if m.tscOffsetHostVA == 0 {
+		return
+	}
+	physical, length, ok := translateToPhysical(m.tscOffsetGuestVA)
+	if !ok || length < hostarch.PageSize {
+		panic(fmt.Sprintf("impossible translation: tscOffsetGuestVA %x", m.tscOffsetGuestVA))
+	}
+	m.kernel.PageTables.Map(
+		hostarch.Addr(m.tscOffsetHostVA),
+		hostarch.PageSize,
+		pagetables.MapOpts{AccessType: hostarch.Read},
+		physical)
+	m.mapPhysical(physical, hostarch.PageSize)
+}
+
 // Destroy frees associated resources.
 //
 // Destroy should only be called once all active users of the machine are gone.
@@ -503,6 +576,7 @@ func (m *machine) Destroy() {
 
 	machinePool[m.machinePoolIndex].Store(nil)
 	seccompMmapSync()
+	m.destroyShadowVDSO()
 
 	// vCPUs are gone: teardown machine state.
 	if err := unix.Close(m.fd); err != nil {
@@ -799,7 +873,7 @@ func (c *vCPU) setSystemTimeLegacy() error {
 		// Try to set the TSC to an estimate of where it will be
 		// on the host during a "fast" system call iteration.
 		start := uint64(ktime.Rdtsc())
-		if err := c.setTSC(start + (minimum / 2)); err != nil {
+		if err := c.setTSC(start + (minimum / 2) + c.machine.tscOffset); err != nil {
 			return err
 		}
 		// See if this is our new minimum call time. Note that this
@@ -844,31 +918,13 @@ func seccompMmapRules(m *machine) {
 		if err := sighandling.ReplaceSignalHandler(unix.SIGSYS, addrOfSigsysHandler(), &savedSigsysHandler); err != nil {
 			panic(fmt.Sprintf("Unable to set handler for signal %d: %v", unix.SIGSYS, err))
 		}
-		rules := []seccomp.RuleSet{
-			// Trap mmap system calls and handle them in sigsysGoHandler
-			{
-				Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-					unix.SYS_MMAP: seccomp.PerArg{
-						seccomp.AnyValue{},
-						seccomp.AnyValue{},
-						seccomp.MaskedEqual(unix.PROT_EXEC, 0),
-						/* MAP_DENYWRITE is ignored and used only for filtering. */
-						seccomp.MaskedEqual(unix.MAP_DENYWRITE, 0),
-					},
-				}),
-				Action: seccomp.Trap,
-			},
+		program, ok := GetPrecompiled(mmapfilter.ProgramName)
+		if !ok {
+			panic(fmt.Sprintf("precompiled seccomp program %q not found", mmapfilter.ProgramName))
 		}
-		program := &seccomp.Program{
-			RuleSets: rules,
-			Options: seccomp.ProgramOptions{
-				DefaultAction: seccomp.Allow,
-				BadArchAction: seccomp.Allow,
-			},
-		}
-		instrs, _, err := program.Build()
+		instrs, err := program.RenderInstructions(nil)
 		if err != nil {
-			panic(fmt.Sprintf("failed to build rules: %v", err))
+			panic(fmt.Sprintf("cannot render precompiled seccomp program %q: %v", mmapfilter.ProgramName, err))
 		}
 		// Perform the actual installation.
 		if err := seccomp.SetFilter(instrs); err != nil {

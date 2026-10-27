@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -8,10 +8,19 @@ package(
 go_library(
     name = "facts",
     srcs = ["facts.go"],
+    importpath = "gvisor.dev/gvisor/tools/nogo/facts",
     visibility = ["//tools:__subpackages__"],
     deps = [
+        "//pkg/zip",
         "//tools/checkconst",
         "@org_golang_x_tools//go/analysis:go_default_library",
         "@org_golang_x_tools//go/types/objectpath:go_default_library",
     ],
+)
+
+go_test(
+    name = "facts_test",
+    size = "small",
+    srcs = ["facts_test.go"],
+    embed = [":facts"],
 )

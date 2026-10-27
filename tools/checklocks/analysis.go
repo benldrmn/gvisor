@@ -17,6 +17,8 @@ package checklocks
 import (
 	"go/token"
 	"go/types"
+	"maps"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/ssa"
@@ -90,7 +92,7 @@ func (pc *passContext) checkTypeAlignment(pkg *types.Package, typ *types.Named) 
 	}
 }
 
-// atomicRules specify read constraints.
+// atomicRules specifies permitted access modes.
 type atomicRules int
 
 const (
@@ -98,22 +100,54 @@ const (
 	readWriteAtomic
 	readOnlyAtomic
 	mixedAtomic
+	readOnlyMixedAtomic
 )
 
-// checkAtomicCall checks for an atomic access.
-//
-// inst is the instruction analyzed, obj is used only for maybeFail.
-func (pc *passContext) checkAtomicCall(inst ssa.Instruction, obj types.Object, ar atomicRules) {
+// functionPackage also resolves methods from indirectly imported packages,
+// which buildssa may represent using type information without an SSA package.
+func functionPackage(fn *ssa.Function) *types.Package {
+	if pkg := fn.Package(); pkg != nil {
+		return pkg.Pkg
+	}
+	obj, ok := fn.Object().(*types.Func)
+	if !ok || fn.Signature.Recv() == nil {
+		return nil
+	}
+	recv := obj.Type().(*types.Signature).Recv()
+	// Wrappers may retain the original method object but change or remove
+	// its receiver. They must not inherit the method's atomic privileges.
+	if recv == nil || !types.Identical(fn.Signature.Recv().Type(), recv.Type()) {
+		return nil
+	}
+	return obj.Pkg()
+}
+
+// checkAtomicCall checks whether inst accesses the value atomically.
+func (pc *passContext) checkAtomicCall(inst ssa.Instruction, value ssa.Value, ar atomicRules) {
+	allowNonAtomicRead := ar == mixedAtomic || ar == readOnlyMixedAtomic
 	switch x := inst.(type) {
-	case *ssa.Call:
-		if x.Common().IsInvoke() {
+	case *ssa.Call, *ssa.Defer, *ssa.Go:
+		if _, immediate := x.(*ssa.Call); !immediate {
+			// Values combining atomic and mutex requirements need their locks
+			// checked at execution, not argument evaluation. Conservatively
+			// reject deferred and goroutine calls for those values.
+			if ar != readWriteAtomic && ar != nonAtomic {
+				break
+			}
+			// Honor force annotations as for other unsupported uses below.
+			if _, ok := pc.forced[pc.positionKey(inst.Pos())]; ok {
+				return
+			}
+		}
+		call := x.(ssa.CallInstruction).Common()
+		if call.IsInvoke() {
 			if ar != nonAtomic {
 				// This is an illegal interface dispatch.
 				pc.maybeFail(inst.Pos(), "dynamic dispatch with atomic-only field")
 			}
 			return
 		}
-		fn, ok := x.Common().Value.(*ssa.Function)
+		fn, ok := call.Value.(*ssa.Function)
 		if !ok {
 			if ar != nonAtomic {
 				// This is an illegal call to a non-static function.
@@ -121,7 +155,11 @@ func (pc *passContext) checkAtomicCall(inst ssa.Instruction, obj types.Object, a
 			}
 			return
 		}
-		pkg := fn.Package()
+		// Generic instantiation wrappers may have no package of their own.
+		if origin := fn.Origin(); origin != nil {
+			fn = origin
+		}
+		pkg := functionPackage(fn)
 		if pkg == nil {
 			if ar != nonAtomic {
 				// This is a call to some shared wrapper function.
@@ -133,12 +171,18 @@ func (pc *passContext) checkAtomicCall(inst ssa.Instruction, obj types.Object, a
 		if obj := fn.Object(); obj != nil && pc.pass.ImportObjectFact(obj, &lff) && lff.Ignore {
 			return
 		}
-		if name := pkg.Pkg.Name(); name != "atomic" && name != "atomicbitops" {
+		if path := pkg.Path(); path != "sync/atomic" && path != "gvisor.dev/gvisor/pkg/atomicbitops" {
 			if ar != nonAtomic {
 				// This is an illegal call to a non-atomic package function.
 				pc.maybeFail(inst.Pos(), "dispatch to non-atomic function with atomic-only field")
 			}
 			return
+		}
+		// Only the receiver (or first argument to a free function) is the
+		// atomic location. Storing the field's address as a pointer payload
+		// would let later accesses bypass its atomic requirement.
+		if len(call.Args) == 0 || call.Args[0] != value {
+			break
 		}
 		if ar == nonAtomic {
 			if fn.Signature.Recv() != nil {
@@ -151,8 +195,20 @@ func (pc *passContext) checkAtomicCall(inst ssa.Instruction, obj types.Object, a
 				pc.maybeFail(inst.Pos(), "unexpected call to atomic function")
 			}
 		}
-		if !strings.HasPrefix(fn.Name(), "Load") && ar == readOnlyAtomic {
-			// We are not allowing any reads in this context.
+		if pkg.Path() == "gvisor.dev/gvisor/pkg/atomicbitops" && strings.HasPrefix(fn.Name(), "Racy") {
+			// Racy methods are non-atomic. Mixed access permits non-atomic
+			// reads under the lock, but writes must remain atomic for
+			// concurrent lock-free readers.
+			if ar != nonAtomic && (!allowNonAtomicRead || fn.Name() != "RacyLoad") {
+				if _, ok := pc.forced[pc.positionKey(inst.Pos())]; !ok {
+					pc.maybeFail(inst.Pos(), "non-atomic operation %s on atomic-only field", fn.Name())
+				}
+			}
+			return
+		}
+		if (ar == readOnlyAtomic || ar == readOnlyMixedAtomic) &&
+			!strings.HasPrefix(fn.Name(), "Load") {
+			// We are not allowing any writes in this context.
 			if _, ok := pc.forced[pc.positionKey(inst.Pos())]; !ok {
 				pc.maybeFail(inst.Pos(), "unexpected call to atomic write function, is a lock missing?")
 			}
@@ -162,11 +218,11 @@ func (pc *passContext) checkAtomicCall(inst ssa.Instruction, obj types.Object, a
 	case *ssa.ChangeType:
 		// Allow casts for atomic values, but nothing else.
 		if refs := x.Referrers(); refs != nil && len(*refs) == 1 {
-			pc.checkAtomicCall((*refs)[0], obj, ar)
+			pc.checkAtomicCall((*refs)[0], x, ar)
 			return
 		}
 	case *ssa.UnOp:
-		if x.Op == token.MUL && ar == mixedAtomic {
+		if x.Op == token.MUL && allowNonAtomicRead {
 			// This is allowed; this is a strict reading.
 			return
 		}
@@ -181,13 +237,31 @@ func (pc *passContext) checkAtomicCall(inst ssa.Instruction, obj types.Object, a
 }
 
 func resolveStruct(typ types.Type) (*types.Struct, bool) {
-	switch typ := typ.Underlying().(type) {
-	case *types.Struct:
-		return typ, true
-	case *types.Pointer:
-		return resolveStruct(typ.Elem())
+	if typ == nil {
+		return nil, false
 	}
-	return nil, false
+	// Most pointer chains are very short (<= 2).
+	// Use a small fixed array on stack to avoid allocation.
+	var buf [4]types.Type
+	visited := buf[:0]
+
+	for {
+		for _, v := range visited {
+			if v == typ {
+				return nil, false
+			}
+		}
+		visited = append(visited, typ)
+
+		switch u := typ.Underlying().(type) {
+		case *types.Struct:
+			return u, true
+		case *types.Pointer:
+			typ = u.Elem()
+		default:
+			return nil, false
+		}
+	}
 }
 
 func (pc *passContext) applyTypeAliases(ls *lockState, v ssa.Value) {
@@ -227,6 +301,45 @@ type almostInst interface {
 	Referrers() *[]ssa.Instruction
 }
 
+// isImmediateFieldRead reports whether inst reads a value without retaining
+// its address. allowRacyLoad also accepts atomicbitops.RacyLoad.
+func isImmediateFieldRead(inst almostInst, allowRacyLoad bool) bool {
+	switch x := inst.(type) {
+	case *ssa.Field:
+		return true
+	case *ssa.FieldAddr:
+		refs := x.Referrers()
+		if refs == nil || len(*refs) != 1 || x.Block() == nil {
+			return false
+		}
+		// Use instruction order, not source positions: a retained address
+		// may be loaded after an unlock, including on another control path.
+		use := (*refs)[0]
+		instrs := x.Block().Instrs
+		i := slices.Index(instrs, ssa.Instruction(x))
+		if i < 0 || i+1 >= len(instrs) || instrs[i+1] != use {
+			return false
+		}
+		switch use := use.(type) {
+		case *ssa.UnOp:
+			return use.Op == token.MUL && use.X == x
+		case *ssa.Call:
+			call := use.Common()
+			fn := call.StaticCallee()
+			if !allowRacyLoad || fn == nil || len(call.Args) != 1 || call.Args[0] != x {
+				return false
+			}
+			if origin := fn.Origin(); origin != nil {
+				fn = origin
+			}
+			pkg := functionPackage(fn)
+			return pkg != nil && pkg.Path() == "gvisor.dev/gvisor/pkg/atomicbitops" &&
+				fn.Signature.Recv() != nil && fn.Name() == "RacyLoad"
+		}
+	}
+	return false
+}
+
 // checkGuards checks the guards held.
 //
 // This also enforces atomicity constraints for fields that must be accessed
@@ -235,15 +348,24 @@ type almostInst interface {
 //
 // Note that this function is not called if lff.Ignore is true, since it cannot
 // discover any local anonymous functions or closures.
-func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj types.Object, ls *lockState, isWrite bool) {
+func (pc *passContext) checkGuards(inst almostInst, value, from ssa.Value, accessObj types.Object, ls *lockState, isWrite bool) {
 	var (
 		lgf         lockGuardFacts
 		guardsFound int
-		guardsHeld  = make(map[string]struct{}) // Keyed by resolved string.
+		// guardsResolved contains canonical keys for declared guards,
+		// regardless of whether they are held in the required mode.
+		guardsResolved = make(map[string]struct{})
+		// guardsHeld maps resolved names to exclusive (true) or shared (false).
+		guardsHeld = make(map[string]bool)
 	)
 
 	// Load the facts for the object accessed.
 	pc.importLockGuardFacts(accessObj, &lgf)
+	if lgf.ReadAny && lgf.AtomicDisposition == atomicDisallow {
+		// Unlike the optimistic isWrite check, alternative reader guards
+		// must not admit an address used for mutation or escaping aliases.
+		isWrite = isWrite || !isImmediateFieldRead(inst, false /* allowRacyLoad */)
+	}
 	pc.applyTypeAliases(ls, from)
 
 	// Check guards held.
@@ -256,15 +378,17 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 			continue
 		}
 		s, ok := ls.isHeld(r, isWrite)
+		guardsResolved[s] = struct{}{}
 		if ok {
-			guardsHeld[s] = struct{}{}
+			_, exclusive := ls.isHeld(r, true)
+			guardsHeld[s] = exclusive
 			continue
 		}
 		if _, ok := pc.forced[pc.positionKey(inst.Pos())]; ok {
 			// Mark this as locked, since it has been forced. All
 			// forces are treated as an exclusive lock.
 			s, _ := ls.lockField(r, true /* exclusive */)
-			guardsHeld[s] = struct{}{}
+			guardsHeld[s] = true
 			continue
 		}
 		// Note that we may allow this if the disposition is atomic,
@@ -273,10 +397,15 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 		// access is atomic. Further, len(guardsHeld) < guardsFound
 		// will be true for this case, so we require it to be
 		// read-only.
-		if lgf.AtomicDisposition != atomicRequired {
+		if lgf.AtomicDisposition != atomicRequired && (!lgf.ReadAny || isWrite) {
 			// There is no force key, no atomic access and no lock held.
 			pc.maybeFail(inst.Pos(), "invalid field access, %s (%s) must be locked when accessing %s (locks: %s)", guardName, s, accessObj.Name(), ls.String())
 		}
+	}
+
+	if lgf.ReadAny && lgf.AtomicDisposition == atomicDisallow && !isWrite && len(guardsHeld) == 0 {
+		guards := strings.Join(slices.Sorted(maps.Keys(lgf.GuardedBy)), ", ")
+		pc.maybeFail(inst.Pos(), "invalid field access, at least one of %s must be locked when reading %s (locks: %s)", guards, accessObj.Name(), ls.String())
 	}
 
 	// Check the atomic access for this field.
@@ -289,11 +418,22 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 				ar = readOnlyAtomic
 			} else {
 				ar = mixedAtomic
+				for _, exclusive := range guardsHeld {
+					if !exclusive {
+						ar = readOnlyMixedAtomic
+						break
+					}
+				}
 			}
+		}
+		if ar == readOnlyAtomic && lgf.ReadAny && len(guardsHeld) > 0 && isImmediateFieldRead(inst, true /* allowRacyLoad */) {
+			// Permit only an immediate non-atomic read under an alternative
+			// guard. Writes still need every guard held exclusively.
+			ar = readOnlyMixedAtomic
 		}
 		if refs := inst.Referrers(); refs != nil {
 			for _, otherInst := range *refs {
-				pc.checkAtomicCall(otherInst, accessObj, ar)
+				pc.checkAtomicCall(otherInst, value, ar)
 			}
 		}
 		// Check that this is not otherwise written non-atomically,
@@ -309,7 +449,7 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 		// Check that this is *not* used atomically.
 		if refs := inst.Referrers(); refs != nil {
 			for _, otherInst := range *refs {
-				pc.checkAtomicCall(otherInst, accessObj, nonAtomic)
+				pc.checkAtomicCall(otherInst, value, nonAtomic)
 			}
 		}
 	}
@@ -327,9 +467,8 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 			if info.object == nil || accessObj == info.object {
 				continue
 			}
-			// Has this already been held?
-			if _, ok := guardsHeld[s]; ok {
-				oo.counts[info.object]++
+			// Do not infer a guard already declared for this access.
+			if _, ok := guardsResolved[s]; ok {
 				continue
 			}
 			// Is this a global? Record directly.
@@ -355,22 +494,32 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 }
 
 // checkFieldAccess checks the validity of a field access.
-func (pc *passContext) checkFieldAccess(inst almostInst, structObj ssa.Value, field int, ls *lockState, isWrite bool) {
+func (pc *passContext) checkFieldAccess(inst ssa.Value, structObj ssa.Value, field int, ls *lockState, isWrite bool) {
 	fieldObj, _ := findField(structObj.Type(), field)
-	pc.checkGuards(inst, structObj, fieldObj, ls, isWrite)
+	pc.checkGuards(inst, inst, structObj, fieldObj, ls, isWrite)
 }
 
-// noReferrers wraps an instruction as an almostInst.
-type noReferrers struct {
+// globalAccess exposes a global's consuming instruction to atomic checks.
+type globalAccess struct {
 	ssa.Instruction
+	checkAtomic bool
 }
 
 // Referrers implements almostInst.Referrers.
-func (noReferrers) Referrers() *[]ssa.Instruction { return nil }
+func (a globalAccess) Referrers() *[]ssa.Instruction {
+	if !a.checkAtomic {
+		return nil
+	}
+	return &[]ssa.Instruction{a.Instruction}
+}
 
 // checkGlobalAccess checks the validity of a global access.
 func (pc *passContext) checkGlobalAccess(inst ssa.Instruction, g *ssa.Global, ls *lockState, isWrite bool) {
-	pc.checkGuards(noReferrers{inst}, g, g.Object(), ls, isWrite)
+	pc.checkGuards(globalAccess{
+		Instruction: inst,
+		// Direct writes are diagnosed separately by checkGuards.
+		checkAtomic: !isWrite,
+	}, g, g, g.Object(), ls, isWrite)
 }
 
 func (pc *passContext) checkCall(call callCommon, lff *lockFunctionFacts, ls *lockState) {
@@ -417,11 +566,7 @@ func (pc *passContext) checkCall(call callCommon, lff *lockFunctionFacts, ls *lo
 			// annotated.  We don't check for violations using the
 			// function facts, since they cannot exist. Instead, we
 			// do a fresh analysis using the current lock state.
-			fnls := ls.fork()
-			for i, arg := range call.Common().Args {
-				fnls.store(fn.Params[i], arg)
-			}
-			pc.checkFunction(call, fn, &nlff, fnls, true /* force */)
+			ls.returnFrom(pc.checkFunction(call, fn, &nlff, ls, true /* force */))
 		}
 	case *ssa.MakeClosure:
 		// Note that creating and then invoking closures locally is
@@ -460,6 +605,10 @@ func (pc *passContext) postFunctionCallUpdate(call callCommon, lff *lockFunction
 		}
 		// Acquire the lock per the annotation.
 		r := fg.Resolver.resolveCall(pc, ls, call.Common().Args, call.Value())
+		if !r.valid() {
+			pc.maybeFail(call.Pos(), "field %s cannot be resolved", fieldName)
+			continue
+		}
 		if s, ok := ls.lockField(r, fg.Exclusive); !ok && !lff.Ignore {
 			if _, ok := pc.forced[pc.positionKey(call.Pos())]; !ok && !lff.Ignore {
 				pc.maybeFail(call.Pos(), "attempt to acquire %s (%s), but already held (locks: %s)", fieldName, s, ls.String())
@@ -477,10 +626,10 @@ func exclusiveStr(exclusive bool) string {
 }
 
 // checkFunctionCall checks preconditions for function calls, and tracks the
-// lock state by recording relevant calls to sync functions. Note that calls to
-// atomic functions are tracked by checkFieldAccess by looking directly at the
-// referrers (because ordering doesn't matter there, so we need not scan in
-// instruction order).
+// lock state by recording relevant calls to sync functions. Atomic field
+// referrers are checked by checkFieldAccess using the lock state at the field
+// access, not at a later use of a retained field address. Direct global atomic
+// operations are checked at their consuming instructions.
 func (pc *passContext) checkFunctionCall(call callCommon, fn *types.Func, lff *lockFunctionFacts, ls *lockState) {
 	// Extract the "receiver" properly.
 	var args []ssa.Value
@@ -507,6 +656,10 @@ func (pc *passContext) checkFunctionCall(call callCommon, fn *types.Func, lff *l
 	// Check that excluded locks are not held on entry.
 	for fieldName, fg := range lff.ExcludedOnEntry {
 		r := resolve(fg)
+		if !r.valid() {
+			pc.maybeFail(callPos, "field %s cannot be resolved", fieldName)
+			continue
+		}
 		if s, ok := ls.isHeld(r, fg.Exclusive); ok {
 			if !forced && !lff.Ignore {
 				if fg.Exclusive {
@@ -521,6 +674,10 @@ func (pc *passContext) checkFunctionCall(call callCommon, fn *types.Func, lff *l
 	// Check all guards required are held.
 	for fieldName, fg := range lff.HeldOnEntry {
 		r := resolve(fg)
+		if !r.valid() {
+			pc.maybeFail(callPos, "field %s cannot be resolved", fieldName)
+			continue
+		}
 		if s, ok := ls.isHeld(r, fg.Exclusive); !ok {
 			if !forced && !lff.Ignore {
 				pc.maybeFail(callPos, "must hold %s %s (%s) to call %s, but not held (locks: %s)", fieldName, exclusiveStr(fg.Exclusive), s, fn.Name(), ls.String())
@@ -578,7 +735,7 @@ func (pc *passContext) checkClosure(call callCommon, fn *ssa.MakeClosure, lff *l
 	clls := ls.fork()
 	clfn := fn.Fn.(*ssa.Function)
 	for i, fv := range clfn.FreeVars {
-		clls.store(fv, fn.Bindings[i])
+		clls.bind(fv, fn.Bindings[i])
 	}
 
 	// Note that this is *not* a call to check function call, which checks
@@ -587,7 +744,31 @@ func (pc *passContext) checkClosure(call callCommon, fn *ssa.MakeClosure, lff *l
 	nlff := lockFunctionFacts{
 		Ignore: lff.Ignore, // Inherit ignore.
 	}
-	pc.checkFunction(call, clfn, &nlff, clls, true /* force */)
+	ls.returnFrom(pc.checkFunction(call, clfn, &nlff, clls, true /* force */))
+}
+
+// directInvocation distinguishes calling a function from passing it to a call.
+// Only synchronous calls and defers inherit the lock state at execution.
+func directInvocation(inst ssa.Instruction, fn ssa.Value) bool {
+	switch x := inst.(type) {
+	case *ssa.Call:
+		return x.Common().Value == fn
+	case *ssa.Defer:
+		return x.Common().Value == fn
+	default:
+		return false
+	}
+}
+
+// checkEscapedFunction checks a function without borrowing its caller's locks,
+// even if an earlier inline invocation already analyzed it with those locks.
+func (pc *passContext) checkEscapedFunction(fn *ssa.Function, lff *lockFunctionFacts) {
+	if _, ok := pc.escapedFunctions[fn]; ok {
+		return
+	}
+	pc.escapedFunctions[fn] = struct{}{}
+	nlff := lockFunctionFacts{Ignore: lff.Ignore}
+	pc.checkFunction(nil, fn, &nlff, nil, true /* force */)
 }
 
 // freshAlloc indicates that v has been allocated within the local scope. There
@@ -640,20 +821,26 @@ type callCommon interface {
 // checkInstruction checks the legality the single instruction based on the
 // current lockState.
 func (pc *passContext) checkInstruction(inst ssa.Instruction, lff *lockFunctionFacts, ls *lockState) (*ssa.Return, *lockState) {
-	// Record any observed globals, and check for violations. The global
-	// value is not itself an instruction, but we check all referrers to
-	// see where they are consumed.
+	// Globals are values, not instructions. Check each use with the current
+	// instruction's lock state.
 	var stackLocal [16]*ssa.Value
 	ops := inst.Operands(stackLocal[:])
 	for _, v := range ops {
 		if v == nil {
 			continue
 		}
+		if fn, ok := (*v).(*ssa.Function); ok && fn.Object() == nil {
+			// Capturing functions are handled by MakeClosure below.
+			if _, closure := inst.(*ssa.MakeClosure); !closure && !directInvocation(inst, fn) {
+				pc.checkEscapedFunction(fn, lff)
+			}
+		}
 		g, ok := (*v).(*ssa.Global)
-		if !ok {
+		if !ok || lff.Ignore {
 			continue
 		}
-		_, isWrite := inst.(*ssa.Store)
+		store, ok := inst.(*ssa.Store)
+		isWrite := ok && store.Addr == g
 		pc.checkGlobalAccess(inst, g, ls, isWrite)
 	}
 
@@ -669,6 +856,10 @@ func (pc *passContext) checkInstruction(inst ssa.Instruction, lff *lockFunctionF
 		// Note that this may overwrite an existing value in the lock
 		// state, but this is intentional.
 		ls.store(x.Addr, x.Val)
+	case *ssa.UnOp:
+		if x.Op == token.MUL {
+			ls.load(x)
+		}
 	case *ssa.Field:
 		if !freshAlloc(x.X) && !lff.Ignore {
 			pc.checkFieldAccess(x, x.X, x.Field, ls, false)
@@ -692,18 +883,9 @@ func (pc *passContext) checkInstruction(inst ssa.Instruction, lff *lockFunctionF
 				nonCalls int
 			)
 			for _, ref := range *refs {
-				switch ref.(type) {
-				case *ssa.Call, *ssa.Defer:
-					// Analysis will be done on the call
-					// itself subsequently, including the
-					// lock state at the time of the call.
+				if directInvocation(ref, x) {
 					calls++
-				default:
-					// We need to analyze separately. Per
-					// below, this means that we'll analyze
-					// at closure construction time no zero
-					// assumptions about when it will be
-					// called.
+				} else {
 					nonCalls++
 				}
 			}
@@ -715,10 +897,7 @@ func (pc *passContext) checkInstruction(inst ssa.Instruction, lff *lockFunctionF
 		// assume no lock facts or have any existing lock state. Only
 		// trivial closures are acceptable in this case.
 		clfn := x.Fn.(*ssa.Function)
-		nlff := lockFunctionFacts{
-			Ignore: lff.Ignore, // Inherit ignore.
-		}
-		pc.checkFunction(nil, clfn, &nlff, nil, false /* force */)
+		pc.checkEscapedFunction(clfn, lff)
 	case *ssa.Return:
 		return x, ls // Valid return state.
 	}
@@ -727,24 +906,38 @@ func (pc *passContext) checkInstruction(inst ssa.Instruction, lff *lockFunctionF
 
 // checkBasicBlock traverses the control flow graph starting at a set of given
 // block and checks each instruction for allowed operations.
-func (pc *passContext) checkBasicBlock(fn *ssa.Function, block *ssa.BasicBlock, lff *lockFunctionFacts, parent *lockState, seen map[*ssa.BasicBlock]*lockState, rg map[*ssa.BasicBlock]struct{}) *lockState {
-	// Check for cached results from entering this block from a *different*
-	// execution path. Note that this is not the same path, which is
-	// checked with the recursion guard below.
-	if oldLS, ok := seen[block]; ok && oldLS.isCompatible(parent) {
-		return nil
+func (pc *passContext) checkBasicBlock(fn *ssa.Function, block *ssa.BasicBlock, lff *lockFunctionFacts, parent *lockState, seen map[*ssa.BasicBlock][]*lockState, rg map[*ssa.BasicBlock]struct{}, implicitPos token.Pos, inline bool) *lockState {
+	// Preserve distinct lock states and pending defers. For matching states,
+	// retain only value facts established on every incoming path. Enumerating
+	// every combination of stored values would be exponential in branch count.
+	var cached *lockState
+	for _, oldLS := range seen[block] {
+		if !oldLS.isCompatible(parent) || !slices.Equal(oldLS.defers, parent.defers) {
+			continue
+		}
+		merged := oldLS.fork()
+		merged.intersect(parent)
+		if oldLS.equivalent(merged) {
+			return nil
+		}
+		cached = oldLS
+		parent = merged
+		break
 	}
 
-	// Prevent recursion. If the lock state is constantly changing and we
-	// are a recursive path, then there will never be a return block.
+	// Prevent recursion through changing lock states or pending defers. A
+	// matching cached entry can be revisited when it loses value facts: each
+	// such visit removes facts, so this converges even across loop backedges.
 	if rg == nil {
 		rg = make(map[*ssa.BasicBlock]struct{})
 	}
-	if _, ok := rg[block]; ok {
+	if _, ok := rg[block]; ok && cached == nil {
 		return nil
 	}
-	rg[block] = struct{}{}
-	defer func() { delete(rg, block) }()
+	if _, ok := rg[block]; !ok {
+		rg[block] = struct{}{}
+		defer func() { delete(rg, block) }()
+	}
 
 	// If the lock state is not compatible, then we need to do the
 	// recursive analysis to ensure that it is still sane. For example, the
@@ -764,23 +957,39 @@ func (pc *passContext) checkBasicBlock(fn *ssa.Function, block *ssa.BasicBlock, 
 	)
 
 	// Analyze this block.
-	seen[block] = parent
+	if cached == nil {
+		seen[block] = append(seen[block], parent.fork())
+	} else {
+		*cached = *parent.fork()
+	}
 	ls := parent.fork()
 	for _, inst := range block.Instrs {
 		rv, rls = pc.checkInstruction(inst, lff, ls)
 		if rls != nil {
+			// Inline calls transfer their locks back to the caller. Only
+			// standalone analysis checks a function's exit contract.
+			if inline {
+				continue
+			}
+			rvPos := rv.Pos()
+			if !rvPos.IsValid() {
+				rvPos = implicitPos
+			}
+			if !rvPos.IsValid() {
+				continue
+			}
 			failed := false
 			// Validate held locks.
 			for fieldName, fg := range lff.HeldOnExit {
 				r := fg.Resolver.resolveStatic(pc, ls, fn, rv)
 				if !r.valid() {
 					// This cannot be forced, since we have no reference.
-					pc.maybeFail(rv.Pos(), "lock %s cannot be resolved", fieldName)
+					pc.maybeFail(rvPos, "lock %s cannot be resolved", fieldName)
 					continue
 				}
 				if s, ok := rls.isHeld(r, fg.Exclusive); !ok {
-					if _, ok := pc.forced[pc.positionKey(rv.Pos())]; !ok && !lff.Ignore {
-						pc.maybeFail(rv.Pos(), "lock %s (%s) not held %s (locks: %s)", fieldName, s, exclusiveStr(fg.Exclusive), rls.String())
+					if _, ok := pc.forced[pc.positionKey(rvPos)]; !ok && !lff.Ignore {
+						pc.maybeFail(rvPos, "lock %s (%s) not held %s (locks: %s)", fieldName, s, exclusiveStr(fg.Exclusive), rls.String())
 						failed = true
 					} else {
 						// Force the lock to be acquired.
@@ -790,32 +999,48 @@ func (pc *passContext) checkBasicBlock(fn *ssa.Function, block *ssa.BasicBlock, 
 			}
 			// Check for other locks, but only if the above didn't trip.
 			if !failed && rls.count() != len(lff.HeldOnExit) && !lff.Ignore {
-				pc.maybeFail(rv.Pos(), "return with unexpected locks held (locks: %s)", rls.String())
+				pc.maybeFail(rvPos, "return with unexpected locks held (locks: %s)", rls.String())
 			}
 		}
 	}
 
-	// Analyze all successors.
-	for _, succ := range block.Succs {
+	// A captured Boolean may make an inline closure's branch impossible,
+	// such as an idempotent unlock called explicitly and again by defer.
+	successors := block.Succs
+	if branch, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+		if value, known := ls.booleanValue(branch.Cond); known {
+			if value {
+				successors = successors[:1]
+			} else {
+				successors = successors[1:]
+			}
+		}
+	}
+	// Analyze all possible successors.
+	for _, succ := range successors {
 		// Collect possible return values, and make sure that the lock
 		// state aligns with any return value that we may have found
 		// above. Note that checkBasicBlock will recursively analyze
 		// the lock state to ensure that Releases and Acquires are
 		// respected.
-		if pls := pc.checkBasicBlock(fn, succ, lff, ls, seen, rg); pls != nil {
-			if rls != nil && !rls.isCompatible(pls) {
+		if pls := pc.checkBasicBlock(fn, succ, lff, ls, seen, rg, implicitPos, inline); pls != nil {
+			if rls != nil && !rls.hasSameLocks(pls) {
 				if _, ok := pc.forced[pc.positionKey(fn.Pos())]; !ok && !lff.Ignore {
 					pc.maybeFail(fn.Pos(), "incompatible return states (first: %s, second: %s)", rls.String(), pls.String())
 				}
 			}
-			rls = pls
+			if rls == nil {
+				rls = pls.fork()
+			} else {
+				rls.intersect(pls)
+			}
 		}
 	}
 	return rls
 }
 
 // checkFunction checks a function invocation, typically starting with nil lockState.
-func (pc *passContext) checkFunction(call callCommon, fn *ssa.Function, lff *lockFunctionFacts, parent *lockState, force bool) {
+func (pc *passContext) checkFunction(call callCommon, fn *ssa.Function, lff *lockFunctionFacts, parent *lockState, force bool) *lockState {
 	defer func() {
 		// Mark this function as checked. This is used by the top-level
 		// loop to ensure that all anonymous functions are scanned, if
@@ -829,7 +1054,7 @@ func (pc *passContext) checkFunction(call callCommon, fn *ssa.Function, lff *loc
 		// That's all we permit for each function, although this may
 		// cause some anonymous functions to be analyzed in only one
 		// context.
-		return
+		return nil
 	}
 
 	// If no return value is provided, then synthesize one. This is used
@@ -844,6 +1069,13 @@ func (pc *passContext) checkFunction(call callCommon, fn *ssa.Function, lff *loc
 	// of cases, parent will be nil. However, in the case of closures and
 	// anonymous functions, we may start with a non-nil lock state.
 	ls := parent.fork()
+	// A callee executes its own defers, not those pending in its caller.
+	ls.defers = nil
+	if parent != nil {
+		for i, arg := range call.Common().Args {
+			ls.bind(fn.Params[i], arg)
+		}
+	}
 	for _, param := range fn.Params {
 		pc.applyTypeAliases(ls, param)
 	}
@@ -869,21 +1101,17 @@ func (pc *passContext) checkFunction(call callCommon, fn *ssa.Function, lff *loc
 	}
 
 	// Scan the blocks.
-	seen := make(map[*ssa.BasicBlock]*lockState)
+	seen := make(map[*ssa.BasicBlock][]*lockState)
+	var result *lockState
 	if len(fn.Blocks) > 0 {
-		pc.checkBasicBlock(fn, fn.Blocks[0], lff, ls, seen, nil)
+		result = pc.checkBasicBlock(fn, fn.Blocks[0], lff, ls, seen, nil, fn.Pos(), parent != nil)
 	}
 
-	// Scan the recover block.
+	// Scan the recover block. Locks are not tracked across a panic.
 	if fn.Recover != nil {
-		pc.checkBasicBlock(fn, fn.Recover, lff, ls, seen, nil)
+		pc.checkBasicBlock(fn, fn.Recover, lff, ls, seen, nil, token.NoPos, parent != nil)
 	}
-
-	// Update all lock state accordingly. This will be called only if we
-	// are doing inline analysis for e.g. an anonymous function.
-	if call != nil && parent != nil {
-		pc.postFunctionCallUpdate(call, lff, parent)
-	}
+	return result
 }
 
 // checkInferred checks for any inferred lock annotations.
@@ -891,16 +1119,18 @@ func (pc *passContext) checkInferred() {
 	for obj, oo := range pc.observations {
 		var lgf lockGuardFacts
 		pc.importLockGuardFacts(obj, &lgf)
+		if lgf.AtomicDisposition == atomicIgnore {
+			continue
+		}
 		for other, count := range oo.counts {
-			// Is this already a guard?
+			// Do not suggest an annotation that is already present.
 			if _, ok := lgf.GuardedBy[other.Name()]; ok {
 				continue
 			}
 			// Check to see if this field is used with a given lock
 			// held above the threshold. If yes, provide a helpful
 			// hint that this may something you wish to annotate.
-			const threshold = 0.9
-			if usage := float64(count) / float64(oo.total); usage >= threshold {
+			if usage := float64(count) / float64(oo.total); usage >= inferredThreshold {
 				pc.maybeFail(obj.Pos(), "may require checklocks annotation for %s, used with lock held %2.0f%% of the time", other.Name(), usage*100)
 			}
 		}

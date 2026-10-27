@@ -20,10 +20,10 @@ go_library(
 go_test(
     name = "hello_test",
     srcs = ["hello_test.go"],
-    library = ":hello",
+    embed = [":hello"],
+    local = True,
     nogo = False,
     tags = [
-        "local",
         "noguitar",
         "notap",
     ],
@@ -46,9 +46,9 @@ go_library(
 go_test(
     name = "driver_test",
     srcs = ["driver_version_test.go"],
-    library = ":driver",
+    embed = [":driver"],
+    local = True,
     tags = [
-        "local",
         "noguitar",
         "notap",
     ],
@@ -71,9 +71,9 @@ go_library(
 go_test(
     name = "cuda_test",
     srcs = ["cuda_test.go"],
-    library = ":cudatest",
+    embed = [":cudatest"],
+    local = True,
     tags = [
-        "local",
         "noguitar",
         "notap",
     ],

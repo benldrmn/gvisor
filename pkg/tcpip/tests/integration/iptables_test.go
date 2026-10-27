@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -3738,6 +3739,152 @@ func TestRejectWithTCPReset(t *testing.T) {
 	}
 }
 
+var _ stack.Matcher = (*tcpDestinationPortMatcher)(nil)
+
+type tcpDestinationPortMatcher struct {
+	port uint16
+}
+
+func (*tcpDestinationPortMatcher) Name() string {
+	return "tcpDestinationPortMatcher"
+}
+
+func (m *tcpDestinationPortMatcher) Match(_ stack.Hook, pkt *stack.PacketBuffer, _, _ string) (matches, hotdrop bool) {
+	tcp := header.TCP(pkt.TransportHeader().Slice())
+	if len(tcp) < header.TCPMinimumSize {
+		return false, true
+	}
+
+	return tcp.DestinationPort() == m.port, false
+}
+
+func TestRejectResetsConnect(t *testing.T) {
+	const port = 12345
+
+	tests := []struct {
+		name     string
+		netProto tcpip.NetworkProtocolNumber
+		addr     tcpip.AddressWithPrefix
+		hook     stack.Hook
+	}{
+		{
+			name:     "IPv4 Input",
+			netProto: ipv4.ProtocolNumber,
+			addr:     utils.Ipv4Addr,
+			hook:     stack.Input,
+		},
+		{
+			name:     "IPv4 Output",
+			netProto: ipv4.ProtocolNumber,
+			addr:     utils.Ipv4Addr,
+			hook:     stack.Output,
+		},
+		{
+			name:     "IPv6 Input",
+			netProto: ipv6.ProtocolNumber,
+			addr:     utils.Ipv6Addr,
+			hook:     stack.Input,
+		},
+		{
+			name:     "IPv6 Output",
+			netProto: ipv6.ProtocolNumber,
+			addr:     utils.Ipv6Addr,
+			hook:     stack.Output,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+			})
+			defer s.Destroy()
+
+			if err := s.CreateNIC(nicID, loopback.New()); err != nil {
+				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
+			}
+			protocolAddr := tcpip.ProtocolAddress{
+				Protocol:          test.netProto,
+				AddressWithPrefix: test.addr,
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
+			}
+			s.SetRouteTable([]tcpip.Route{
+				{
+					Destination: test.addr.Subnet(),
+					NIC:         nicID,
+				},
+			})
+
+			ipv6 := test.netProto == ipv6.ProtocolNumber
+			ipt := s.IPTables()
+			filter := ipt.GetTable(stack.FilterID, ipv6)
+			ruleIdx := filter.BuiltinChains[test.hook]
+			filter.Rules[ruleIdx].Filter = stack.IPHeaderFilter{
+				Protocol:      header.TCPProtocolNumber,
+				CheckProtocol: true,
+			}
+			filter.Rules[ruleIdx].Matchers = []stack.Matcher{&tcpDestinationPortMatcher{port: port}}
+			netInst := s.NetworkProtocolInstance(test.netProto)
+			if ipv6 {
+				filter.Rules[ruleIdx].Target = &stack.RejectIPv6Target{
+					Handler:    netInst.(stack.RejectIPv6WithHandler),
+					RejectWith: stack.RejectIPv6WithTCPReset,
+				}
+			} else {
+				filter.Rules[ruleIdx].Target = &stack.RejectIPv4Target{
+					Handler:    netInst.(stack.RejectIPv4WithHandler),
+					RejectWith: stack.RejectIPv4WithTCPReset,
+				}
+			}
+			filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
+			ipt.ForceReplaceTable(stack.FilterID, filter, ipv6)
+
+			var listenerWQ waiter.Queue
+			listenerEP, err := s.NewEndpoint(tcp.ProtocolNumber, test.netProto, &listenerWQ)
+			if err != nil {
+				t.Fatalf("s.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, test.netProto, err)
+			}
+			defer listenerEP.Close()
+			if err := listenerEP.Bind(tcpip.FullAddress{Port: port}); err != nil {
+				t.Fatalf("listenerEP.Bind(%d): %s", port, err)
+			}
+			if err := listenerEP.Listen(1); err != nil {
+				t.Fatalf("listenerEP.Listen(1): %s", err)
+			}
+
+			var wq waiter.Queue
+			we, ch := waiter.NewChannelEntry(waiter.WritableEvents | waiter.EventErr)
+			wq.EventRegister(&we)
+			defer wq.EventUnregister(&we)
+			ep, err := s.NewEndpoint(tcp.ProtocolNumber, test.netProto, &wq)
+			if err != nil {
+				t.Fatalf("s.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, test.netProto, err)
+			}
+			defer ep.Close()
+
+			connectAddr := tcpip.FullAddress{Addr: test.addr.Address, Port: port}
+			if err := ep.Connect(connectAddr); err != nil {
+				if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
+					t.Fatalf("ep.Connect(%#v): %s", connectAddr, err)
+				}
+			}
+			select {
+			case <-ch:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for ep.Connect(%#v) to be refused", connectAddr)
+			}
+			if err := ep.LastError(); err == nil {
+				t.Errorf("got ep.LastError() = nil, want = %s", &tcpip.ErrConnectionRefused{})
+			} else if _, ok := err.(*tcpip.ErrConnectionRefused); !ok {
+				t.Errorf("got ep.LastError() = %s, want = %s", err, &tcpip.ErrConnectionRefused{})
+			}
+		})
+	}
+}
+
 // TestInvalidTransportHeader tests that bad transport headers (with a bad
 // length/offset field) don't panic.
 func TestInvalidTransportHeader(t *testing.T) {
@@ -3984,4 +4131,244 @@ func genUDP6(offset int8) *stack.PacketBuffer {
 
 	buf := buffer.MakeWithData(append([]byte{}, hdr.View()...))
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
+}
+
+func TestMasqueradePortRange(t *testing.T) {
+	const (
+		srcPort    = 6000
+		dstPort    = 5432
+		mappedPort = 5000
+	)
+
+	tests := []struct {
+		name       string
+		netProto   tcpip.NetworkProtocolNumber
+		transProto tcpip.TransportProtocolNumber
+		buf        []byte
+		check      func(*testing.T, *buffer.View)
+	}{
+		{
+			name:       "IPv4 UDP",
+			netProto:   ipv4.ProtocolNumber,
+			transProto: header.UDPProtocolNumber,
+			buf:        udpv4Packet(utils.Host2IPv4Addr.AddressWithPrefix.Address, utils.Host1IPv4Addr.AddressWithPrefix.Address, srcPort, dstPort, 0 /* dataSize */),
+			check: func(t *testing.T, v *buffer.View) {
+				checker.IPv4(t, v,
+					checker.SrcAddr(utils.RouterNIC1IPv4Addr.AddressWithPrefix.Address),
+					checker.UDP(checker.SrcPort(mappedPort), checker.DstPort(dstPort)),
+				)
+			},
+		},
+		{
+			name:       "IPv4 TCP",
+			netProto:   ipv4.ProtocolNumber,
+			transProto: header.TCPProtocolNumber,
+			buf:        tcpv4Packet(utils.Host2IPv4Addr.AddressWithPrefix.Address, utils.Host1IPv4Addr.AddressWithPrefix.Address, srcPort, dstPort, 0 /* dataSize */),
+			check: func(t *testing.T, v *buffer.View) {
+				checker.IPv4(t, v,
+					checker.SrcAddr(utils.RouterNIC1IPv4Addr.AddressWithPrefix.Address),
+					checker.TCP(checker.SrcPort(mappedPort), checker.DstPort(dstPort)),
+				)
+			},
+		},
+		{
+			name:       "IPv6 UDP",
+			netProto:   ipv6.ProtocolNumber,
+			transProto: header.UDPProtocolNumber,
+			buf:        udpv6Packet(utils.Host2IPv6Addr.AddressWithPrefix.Address, utils.Host1IPv6Addr.AddressWithPrefix.Address, srcPort, dstPort, 4 /* dataSize */),
+			check: func(t *testing.T, v *buffer.View) {
+				checker.IPv6WithExtHdr(t, v,
+					checker.SrcAddr(utils.RouterNIC1IPv6Addr.AddressWithPrefix.Address),
+					checker.UDP(checker.SrcPort(mappedPort), checker.DstPort(dstPort), func(t *testing.T, transport header.Transport) {
+						t.Helper()
+						udp := transport.(header.UDP)
+						if !udp.IsChecksumValid(utils.RouterNIC1IPv6Addr.AddressWithPrefix.Address, utils.Host1IPv6Addr.AddressWithPrefix.Address, checksum.Checksum(udp.Payload(), 0)) {
+							t.Errorf("invalid UDP checksum: %#x", udp.Checksum())
+						}
+					}),
+				)
+			},
+		},
+		{
+			name:       "IPv6 TCP",
+			netProto:   ipv6.ProtocolNumber,
+			transProto: header.TCPProtocolNumber,
+			buf:        tcpv6Packet(utils.Host2IPv6Addr.AddressWithPrefix.Address, utils.Host1IPv6Addr.AddressWithPrefix.Address, srcPort, dstPort, 4 /* dataSize */),
+			check: func(t *testing.T, v *buffer.View) {
+				checker.IPv6WithExtHdr(t, v,
+					checker.SrcAddr(utils.RouterNIC1IPv6Addr.AddressWithPrefix.Address),
+					checker.TCP(checker.SrcPort(mappedPort), checker.DstPort(dstPort)),
+				)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		if test.netProto != header.IPv6ProtocolNumber {
+			continue
+		}
+		for _, extension := range []struct {
+			name string
+			kind header.IPv6ExtensionHeaderIdentifier
+		}{
+			{name: "HopByHop", kind: header.IPv6HopByHopOptionsExtHdrIdentifier},
+			{name: "DestinationOptions", kind: header.IPv6DestinationOptionsExtHdrIdentifier},
+		} {
+			extended := test
+			extended.name += "/" + extension.name
+			extended.buf = append([]byte(nil), test.buf[:header.IPv6MinimumSize]...)
+			extended.buf = append(extended.buf, byte(test.transProto), 0, 0, 0, 0, 0, 0, 0)
+			extended.buf = append(extended.buf, test.buf[header.IPv6MinimumSize:]...)
+			ip := header.IPv6(extended.buf)
+			ip.SetNextHeader(uint8(extension.kind))
+			ip.SetPayloadLength(uint16(len(extended.buf) - header.IPv6MinimumSize))
+			tests = append(tests, extended)
+		}
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol, tcp.NewProtocol},
+			})
+			defer s.Destroy()
+
+			ep1 := channel.New(1, header.IPv6MinimumMTU, "")
+			ep2 := channel.New(1, header.IPv6MinimumMTU, "")
+			utils.SetupRouterStack(t, s, ep1, ep2)
+
+			setupSNAT(t, s, test.netProto, test.transProto, &stack.MasqueradeTarget{
+				NetworkProtocol: test.netProto,
+				Ports:           stack.PortOrIdentRange{Start: mappedPort, Size: 1},
+			})
+
+			ep2.InjectInbound(test.netProto, stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload: buffer.MakeWithData(test.buf),
+			}))
+			pkt := ep1.Read()
+			if pkt == nil {
+				t.Fatal("expected to read a packet on ep1")
+			}
+			v := stack.PayloadSince(pkt.NetworkHeader())
+			defer v.Release()
+			pkt.DecRef()
+			test.check(t, v)
+		})
+	}
+}
+
+// TestOutputDNATReroutesByDestination tests that a locally generated packet
+// whose destination is rewritten by OUTPUT DNAT is routed by its new
+// destination, even when its source address belongs to a different NIC, and
+// keeps its source address. This matches Linux ip_route_me_harder and
+// ip6_route_me_harder.
+func TestOutputDNATReroutesByDestination(t *testing.T) {
+	const port = 8080
+
+	tests := []struct {
+		name         string
+		netProto     tcpip.NetworkProtocolNumber
+		defaultRoute tcpip.Subnet
+		// preDNATDst is reached through NIC1's default route, so the packet's
+		// source is NIC1's address.
+		preDNATDst tcpip.Address
+		srcAddr    tcpip.Address
+		// backend is only reachable through NIC2.
+		backend tcpip.Address
+		check   func(*testing.T, *buffer.View, ...checker.NetworkChecker)
+	}{
+		{
+			name:         "IPv4",
+			netProto:     ipv4.ProtocolNumber,
+			defaultRoute: header.IPv4EmptySubnet,
+			preDNATDst:   testutil.MustParse4("203.0.113.10"),
+			srcAddr:      utils.RouterNIC1IPv4Addr.AddressWithPrefix.Address,
+			backend:      utils.Host2IPv4Addr.AddressWithPrefix.Address,
+			check:        checker.IPv4,
+		},
+		{
+			name:         "IPv6",
+			netProto:     ipv6.ProtocolNumber,
+			defaultRoute: header.IPv6EmptySubnet,
+			preDNATDst:   testutil.MustParse6("2001:db8::10"),
+			srcAddr:      utils.RouterNIC1IPv6Addr.AddressWithPrefix.Address,
+			backend:      utils.Host2IPv6Addr.AddressWithPrefix.Address,
+			check:        checker.IPv6,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+			})
+			defer s.Destroy()
+
+			ep1 := channel.New(1, header.IPv6MinimumMTU, "")
+			ep2 := channel.New(1, header.IPv6MinimumMTU, "")
+			// Force rerouting to transition from hardware checksum offload on
+			// NIC1 to software checksumming on NIC2.
+			ep1.LinkEPCapabilities = stack.CapabilityTXChecksumOffload
+			utils.SetupRouterStack(t, s, ep1, ep2)
+			s.AddRoute(tcpip.Route{Destination: test.defaultRoute, NIC: utils.RouterNICID1})
+
+			setupNAT(t, s, test.netProto, stack.Output,
+				stack.IPHeaderFilter{
+					Protocol:      udp.ProtocolNumber,
+					CheckProtocol: true,
+				},
+				&stack.DNATTarget{
+					NetworkProtocol: test.netProto,
+					Addr:            test.backend,
+					Port:            port,
+					ChangeAddress:   true,
+					ChangePort:      true,
+				})
+
+			var wq waiter.Queue
+			ep, err := s.NewEndpoint(udp.ProtocolNumber, test.netProto, &wq)
+			if err != nil {
+				t.Fatalf("s.NewEndpoint(%d, %d, _): %s", udp.ProtocolNumber, test.netProto, err)
+			}
+			defer ep.Close()
+
+			var r bytes.Reader
+			r.Reset([]byte{1, 2, 3, 4})
+			wOpts := tcpip.WriteOptions{To: &tcpip.FullAddress{Addr: test.preDNATDst, Port: port}}
+			if _, err := ep.Write(&r, wOpts); err != nil {
+				t.Fatalf("ep.Write(_, %#v): %s", wOpts, err)
+			}
+
+			if pkt := ep1.Read(); pkt != nil {
+				pkt.DecRef()
+				t.Errorf("got a packet on NIC1, want the DNATed packet to leave through NIC2 only")
+			}
+			pkt := ep2.Read()
+			if pkt == nil {
+				t.Fatal("expected the DNATed packet on NIC2")
+			}
+			v := stack.PayloadSince(pkt.NetworkHeader())
+			defer v.Release()
+			pkt.DecRef()
+			test.check(t, v,
+				checker.SrcAddr(test.srcAddr),
+				checker.DstAddr(test.backend),
+				checker.UDP(
+					checker.DstPort(port),
+					func(t *testing.T, transportHdr header.Transport) {
+						t.Helper()
+						udp, ok := transportHdr.(header.UDP)
+						if !ok {
+							t.Fatalf("got transport header type %T, want header.UDP", transportHdr)
+						}
+						if !udp.IsChecksumValid(test.srcAddr, test.backend, checksum.Checksum(udp.Payload(), 0)) {
+							t.Errorf("invalid UDP checksum: %#x", udp.Checksum())
+						}
+					},
+				),
+			)
+		})
+	}
 }

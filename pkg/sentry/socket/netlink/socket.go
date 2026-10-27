@@ -62,7 +62,11 @@ const (
 	maxSendBufferSize = 4 << 20 // 4MB
 
 	// supportedGroups is the set of multicast groups that are supported.
-	supportedGroups = 1 << (linux.RTNLGRP_LINK - 1)
+	supportedGroups = 1<<(linux.RTNLGRP_LINK-1) |
+		1<<(linux.RTNLGRP_IPV4_IFADDR-1) |
+		1<<(linux.RTNLGRP_IPV4_ROUTE-1) |
+		1<<(linux.RTNLGRP_IPV6_IFADDR-1) |
+		1<<(linux.RTNLGRP_IPV6_ROUTE-1)
 )
 
 var errNoFilter = syserr.New("no filter attached", errno.ENOENT)
@@ -98,7 +102,7 @@ type Socket struct {
 
 	// connection is the kernel's connection to ep, used to write messages
 	// sent to userspace.
-	connection transport.ConnectedEndpoint
+	connection transport.Sender
 
 	// netns is the network namespace associated with the socket.
 	// A netlink socket is immutably bound to a network namespace.
@@ -444,6 +448,45 @@ func (s *Socket) HandleInterfaceDeleteEvent(ctx context.Context, idx int32, i in
 	s.SendResponse(ctx, ms)
 }
 
+// HandleAddressEvent implements inet.NetlinkSocket.HandleAddressEvent.
+func (s *Socket) HandleAddressEvent(ctx context.Context, idx int32, i inet.Interface, a inet.InterfaceAddr, added bool) {
+	routeProtocol, ok := s.protocol.(RouteProtocol)
+	if !ok {
+		panic(fmt.Sprintf("Non-ROUTE netlink socket (protocol %d) cannot handle address events", s.Protocol()))
+	}
+
+	typ := uint16(linux.RTM_NEWADDR)
+	if !added {
+		typ = linux.RTM_DELADDR
+	}
+	// IPv4 notifications carry the requester's port ID and sequence number
+	// (rtmsg_ifa); IPv6 notifications leave both 0 (inet6_ifa_notify).
+	var origin inet.NetlinkOrigin
+	if a.Family == linux.AF_INET {
+		origin = inet.NetlinkOriginFromContext(ctx)
+	}
+	ms := nlmsg.NewMessageSet(origin.PortID, origin.Seq)
+	routeProtocol.AddAddrMessage(ms, typ, idx, i, a)
+	s.SendResponse(ctx, ms)
+}
+
+// HandleRouteEvent implements inet.NetlinkSocket.HandleRouteEvent.
+func (s *Socket) HandleRouteEvent(ctx context.Context, rt inet.Route, added bool, nlFlags uint16) {
+	routeProtocol, ok := s.protocol.(RouteProtocol)
+	if !ok {
+		panic(fmt.Sprintf("Non-ROUTE netlink socket (protocol %d) cannot handle route events", s.Protocol()))
+	}
+
+	typ := uint16(linux.RTM_NEWROUTE)
+	if !added {
+		typ = linux.RTM_DELROUTE
+	}
+	origin := inet.NetlinkOriginFromContext(ctx)
+	ms := nlmsg.NewMessageSet(origin.PortID, origin.Seq)
+	routeProtocol.AddRouteMessage(ms, typ, nlFlags, rt, nil /* prefSrc */)
+	s.SendResponse(ctx, ms)
+}
+
 // Bind implements socket.Socket.Bind.
 func (s *Socket) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 	a, err := ExtractSockAddr(sockaddr)
@@ -547,7 +590,7 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr hostarch
 	case linux.SOL_NETLINK:
 		switch name {
 		case linux.NETLINK_LIST_MEMBERSHIPS:
-			return primitive.AllocateUint64(s.groups.Load()), nil
+			return &memberships{Uint64: primitive.Uint64(s.groups.Load())}, nil
 
 		case linux.NETLINK_BROADCAST_ERROR,
 			linux.NETLINK_CAP_ACK,
@@ -561,6 +604,22 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr hostarch
 	}
 	// TODO(b/68878065): other sockopts are not supported.
 	return nil, syserr.ErrProtocolNotAvailable
+}
+
+// memberships copies NETLINK_LIST_MEMBERSHIPS results in whole uint32 words,
+// as Linux netlink_getsockopt does, while reporting the full bitmap size.
+type memberships struct {
+	primitive.Uint64
+}
+
+// SizeBytes implements marshal.Marshallable.SizeBytes, including nil receivers.
+func (*memberships) SizeBytes() int {
+	return (*primitive.Uint64)(nil).SizeBytes()
+}
+
+// CopyOutN implements marshal.Marshallable.CopyOutN.
+func (m *memberships) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
+	return m.Uint64.CopyOutN(cc, addr, limit/sizeOfInt32*sizeOfInt32)
 }
 
 // SetSockOpt implements socket.Socket.SetSockOpt.
@@ -835,7 +894,7 @@ func (s *Socket) sendBufs(ctx context.Context, bufs [][]byte, cms transport.Cont
 		return err
 	}
 	if notify {
-		s.connection.SendNotify()
+		s.connection.NotifyDataReady()
 	}
 	return nil
 }

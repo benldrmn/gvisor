@@ -1,4 +1,6 @@
-# Introduction
+# gVisor - SecCheck
+
+## Introduction
 
 This package provides a remote interface to observe behavior of the application
 running inside the sandbox. It was built with runtime monitoring in mind, e.g.
@@ -9,7 +11,7 @@ generate alerts when something unexpected occurs, log these actions, etc.
 
 First, let's go over a few concepts before we get into the details.
 
-## Concepts
+### Concepts
 
 -   **Points:** these are discrete places (or points) in the code where
     instrumentation was added. Each point has a unique name and schema. They can
@@ -39,9 +41,9 @@ First, let's go over a few concepts before we get into the details.
 If you're interested in exploring further, there are more details in the
 [design doc](https://docs.google.com/document/d/1RQQKzeFpO-zOoBHZLA-tr5Ed_bvAOLDqgGgKhqUff2A/edit).
 
-# Points
+## Points
 
-Every trance point in the system is identified by a unique name. The naming
+Every trace point in the system is identified by a unique name. The naming
 convention is to scope the point with a main component followed by its name to
 avoid conflicts. Here are a few examples:
 
@@ -94,10 +96,10 @@ The following command lists all trace points available in the system:
 
 ```shell
 $ runsc trace metadata
-POINTS (973)
-Name: container/start, optional fields: [env], context fields: [time|thread_id|task_start_time|group_id|thread_group_start_time|container_id|credentials|cwd|process_name]
-Name: sentry/clone, optional fields: [], context fields: [time|thread_id|task_start_time|group_id|thread_group_start_time|container_id|credentials|cwd|process_name]
-Name: syscall/accept/enter, optional fields: [fd_path], context fields: [time|thread_id|task_start_time|group_id|thread_group_start_time|container_id|credentials|cwd|process_name]
+POINTS (998)
+Name: container/start, optional fields: [env], context fields: [time|thread_id|task_start_time|group_id|thread_group_start_time|container_id|credentials|cwd|process_name|parent_thread_group_id|is_exec_session]
+Name: sentry/clone, optional fields: [], context fields: [time|thread_id|task_start_time|group_id|thread_group_start_time|container_id|credentials|cwd|process_name|parent_thread_group_id|is_exec_session]
+Name: syscall/accept/enter, optional fields: [fd_path], context fields: [time|thread_id|task_start_time|group_id|thread_group_start_time|container_id|credentials|cwd|process_name|parent_thread_group_id|is_exec_session]
 ...
 ```
 
@@ -109,7 +111,7 @@ each trace point. Optional fields schema is part of the trace point proto, like
 points and is defined in
 [gvisor.common.ContextData](https://cs.opensource.google/gvisor/gvisor/+/master:pkg/sentry/seccheck/points/common.proto;bpv=1;bpt=1;l=77?gsn=ContextData&gs=kythe%3A%2F%2Fgithub.com%2Fgoogle%2Fgvisor%3Flang%3Dprotobuf%3Fpath%3Dpkg%2Fsentry%2Fseccheck%2Fpoints%2Fcommon.proto%234.2).
 
-# Sinks
+## Sinks
 
 Sinks receive enabled trace points and do something useful with them. They are
 identified by a unique name. The same `runsc trace metadata` command used above
@@ -162,16 +164,57 @@ points to it.
 
 > Note: It requires more than one trace session to be supported.
 
-# Sessions
+## Sessions
 
 Trace sessions scope a set of trace points with their corresponding
-configuration and a set of sinks that receive the points. Sessions can be
-created at sandbox initialization time or during runtime. Creating sessions at
-init time guarantees that no trace points are missed, which is important for
-threat detection. It is configured using the `--pod-init-config` flag (more on
-it below). To manage sessions during runtime, `runsc trace create|delete|list`
-is used to manipulate trace sessions. Here are few examples assuming there is a
-running container with ID=cont123 using Docker:
+configuration and a set of sinks that receive the points.
+
+> Note: There is a current limitation that only a single session can exist in
+> the system and it must be called `Default`. This restriction can be lifted in
+> the future when more than one session is needed.
+
+There are **two ways** to set up a trace session configuration:
+
+### 1. At Sandbox Initialization (`--pod-init-config`)
+
+Creating a session at sandbox initialization time guarantees that tracing is
+active before the container application starts running, ensuring no early trace
+points are missed (which is important for threat detection).
+
+This is configured by passing `--pod-init-config=<path-to-json>` to `runsc`,
+pointing to a JSON file containing a `"trace_session"` object (see
+[Config](#config) below):
+
+*   **With `containerd` (`containerd-shim-runsc-v1`):** Set `pod-init-config`
+    under `[runsc_config]` in `/run/containerd/runsc/config.toml` (or
+    `/etc/containerd/runsc/config.toml`):
+
+    ```toml
+    [runsc_config]
+      pod-init-config = "/path/to/pod_init.json"
+    ```
+
+    > Note: `config.toml` only accepts `runsc` flags under `[runsc_config]`. The
+    > trace session configuration itself must be stored in the separate JSON
+    > file referenced by `pod-init-config`, not embedded as TOML in
+    > `config.toml`.
+
+*   **With Docker:** Pass `--pod-init-config` when registering the runtime:
+
+    ```shell
+    $ sudo runsc --install --runtime=runsc-trace -- --pod-init-config=/path/to/pod_init.json
+    ```
+
+### 2. Dynamically at Runtime (`runsc trace create`)
+
+To manage sessions on already-running sandboxes during runtime, use `runsc trace
+create|delete|list`. Dynamic session creation is also useful when a monitoring
+process starts after sandboxes are already running, or when the monitoring
+process restarts and needs to re-establish a `remote` sink connection using
+`--force`.
+
+Here are a few examples assuming there is a running container with `ID=cont123`
+using Docker:
 
 ```shell
 $ sudo runsc --root /run/docker/runtime-runc/moby trace create --config session.json cont123
@@ -185,14 +228,18 @@ $ sudo runsc --root /var/run/docker/runtime-runc/moby trace list cont123
 SESSIONS (0)
 ```
 
-> Note: There is a current limitation that only a single session can exist in
-> the system and it must be called `Default`. This restriction can be lifted in
-> the future when more than one session is needed.
+Pass `--force` to `runsc trace create` to replace an existing session of the
+same name (for example, to attach a new sink socket FD after a remote consumer
+restart):
+
+```shell
+$ sudo runsc --root /run/docker/runtime-runc/moby trace create --force --config session.json cont123
+```
 
 ## Config
 
-The event session can be defined using JSON for the `runsc trace create`
-command. The session definition has 3 main parts:
+Both setup methods use a JSON configuration file. The session definition has 3
+main parts:
 
 1.  `name`: name of the session being created. Only `Default` for now.
 1.  `points`: array of points being enabled in the session. Each point has:
@@ -208,15 +255,27 @@ command. The session definition has 3 main parts:
         remote sink case, for example, it doesn't fail container startup if the
         remote process cannot be reached.
 
-The session configuration above can also be used with the `--pod-init-config`
-flag under the `"trace_session"` JSON object. There is a full example
-[here](https://cs.opensource.google/gvisor/gvisor/+/master:examples/seccheck/pod_init.json)
+In addition, the session definition supports the following optional fields:
 
-> Note: For convenience, the `--pod-init-config` file can also be used with
-> `runsc trace create` command. The portions of the Pod init config file that
-> are not related to the session configuration are ignored.
+*   `ignore_missing`: boolean indicating whether to skip missing points and
+    optional/context fields not found. This can be used to apply a single
+    configuration file containing newer points/fields with older versions of
+    gVisor which do not have them yet. Note that it does not apply to sinks.
+*   `options`: map of session-level configuration options (for example,
+    `"execve_hash_cache_capacity"` to configure the maximum capacity of the
+    per-session execve hash cache).
 
-# Full Example
+When used with `--pod-init-config`, the session configuration must be nested
+under a top-level `"trace_session"` JSON key (see the full example in
+[`examples/seccheck/pod_init.json`](https://cs.opensource.google/gvisor/gvisor/+/master:examples/seccheck/pod_init.json)).
+
+> Note: For convenience, `runsc trace create --config` accepts **both** a
+> top-level session JSON object and a `--pod-init-config` file containing a
+> `"trace_session"` wrapper object (ignoring any other fields in the init config
+> file). This allows you to use the same JSON file for both `--pod-init-config`
+> and `runsc trace create`.
+
+## Full Example
 
 Here, we're going to explore a how to use runtime monitoring end to end. Under
 the `examples` directory there is an implementation of the monitoring process

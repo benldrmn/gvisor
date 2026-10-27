@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <vector>
 
-#include "gtest/gtest.h"
+#include "gmock/gmock.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "benchmark/benchmark.h"
 #include "test/util/file_descriptor.h"
@@ -53,9 +59,7 @@ class Message {
     hdr_.msg_controllen = cmsg_sz;
   }
 
-  struct msghdr* header() {
-    return &hdr_;
-  }
+  struct msghdr* header() { return &hdr_; }
 
  private:
   std::vector<char> buffer_;
@@ -340,7 +344,6 @@ void BM_SendmsgTCP(benchmark::State& state) {
   });
 
   int64_t bytes_sent = 0;
-  int ncalls = 0;
   for (auto ignored : state) {
     int sent = 0;
     while (true) {
@@ -352,7 +355,6 @@ void BM_SendmsgTCP(benchmark::State& state) {
       hdr.msg_iov = &iov;
       hdr.msg_iovlen = 1;
       int n = RetryEINTR(sendmsg)(send_socket.get(), &hdr, 0);
-      ncalls++;
       if (n > 0) {
         sent += n;
         if (sent == buf_size) {
@@ -362,10 +364,11 @@ void BM_SendmsgTCP(benchmark::State& state) {
         // poll.
         continue;
       }
+      TEST_CHECK_ERRNO(n, EAGAIN);
       // Poll the fd for it to become writable.
-      struct pollfd poll_fd = {send_socket.get(), POLL_OUT, 0};
-      EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, 10),
-                  SyscallSucceedsWithValue(0));
+      struct pollfd poll_fd = {send_socket.get(), POLLOUT, 0};
+      TEST_PCHECK(RetryEINTR(poll)(&poll_fd, 1, -1) == 1);
+      TEST_CHECK(poll_fd.revents == POLLOUT);
     }
     bytes_sent += static_cast<int64_t>(sent);
   }
@@ -375,15 +378,10 @@ void BM_SendmsgTCP(benchmark::State& state) {
   state.SetBytesProcessed(bytes_sent);
 }
 
-void Args(benchmark::internal::Benchmark* benchmark) {
-  for (int blocking = 0; blocking < 2; blocking++) {
-    for (int buf_size = 1024; buf_size <= 256 << 20; buf_size *= 2) {
-      benchmark->Args({blocking, buf_size});
-    }
-  }
-}
-
-BENCHMARK(BM_SendmsgTCP)->Apply(&Args)->UseRealTime();
+BENCHMARK(BM_SendmsgTCP)
+    ->RangeMultiplier(2)
+    ->Ranges({{0, 1}, {1024, 256 << 20}})
+    ->UseRealTime();
 
 }  // namespace
 

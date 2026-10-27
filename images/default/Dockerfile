@@ -9,29 +9,29 @@ ENV DEBIAN_FRONTEND="noninteractive"
 #-------------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y curl gnupg2 git \
         python-is-python3 python3 python3-setuptools python3-pip \
-        build-essential crossbuild-essential-arm64 qemu-user-static \
-        openjdk-11-jdk-headless zip unzip \
+        python3-build python3-wheel python3-venv \
+        build-essential crossbuild-essential-arm64 \
+        zip unzip \
         apt-transport-https ca-certificates gnupg-agent \
         software-properties-common \
         pkg-config libffi-dev patch diffutils libssl-dev iptables kmod \
-        clang crossbuild-essential-amd64 erofs-utils busybox-static libbpf-dev \
+        clang clangd crossbuild-essential-amd64 erofs-utils busybox-static \
         iproute2 netcat-openbsd libnuma-dev
 
-# This package is needed to build eBPF on amd64, but not on arm64 where it
-# doesn't exist.
-RUN test "$(uname -m)" != x86_64 && exit 0 || apt-get install -y libc6-dev-i386
 #-------------------------------------------------------------------------------
 # The rest of the file is unnecessary for building `runsc`, but are necessary
-# for test targets.
+# for test targets and/or dev containers.
 #-------------------------------------------------------------------------------
 
 # Install Docker client for the website build.
-RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-RUN add-apt-repository \
-   "deb https://download.docker.com/linux/ubuntu \
-   $(lsb_release -cs) \
-   stable"
-RUN apt-get -y install docker-ce-cli
+
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+      gpg --dearmor --yes --output /usr/share/keyrings/docker.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu" \
+      "$(lsb_release -cs)" \
+      "stable" > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get -y install docker-ce-cli
 
 # Install gcloud.
 RUN ARCH="$(uname -m | sed s/aarch64/arm/)" && \
@@ -39,6 +39,11 @@ RUN ARCH="$(uname -m | sed s/aarch64/arm/)" && \
     tar zxf - google-cloud-sdk && \
     google-cloud-sdk/install.sh --quiet && \
     ln -s /google-cloud-sdk/bin/gcloud /usr/bin/gcloud
+
+# Install buildifier.
+RUN ARCH="$(uname -m | sed -e s/aarch64/arm64/ -e s/x86_64/amd64/)" && \
+    curl -fsSL https://github.com/bazelbuild/buildtools/releases/download/v8.5.1/buildifier-linux-${ARCH} -o /usr/local/bin/buildifier && \
+    chmod ugo+x /usr/local/bin/buildifier
 
 # Download the official bazel binary. The APT repository isn't used because there is not packages for arm64.
 COPY bazelversion .

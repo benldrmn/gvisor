@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
+// +checklocksexclude:t.mu
 func getTaskFD(t *kernel.Task, fd int32) (*vfs.FileDescription, kernel.FDFlags) {
 	var (
 		file  *vfs.FileDescription
@@ -42,6 +43,7 @@ func getTaskFD(t *kernel.Task, fd int32) (*vfs.FileDescription, kernel.FDFlags) 
 	return file, flags
 }
 
+// +checklocksexclude:t.mu
 func taskFDExists(ctx context.Context, fs *filesystem, t *kernel.Task, fd int32) bool {
 	var exists bool
 	t.WithMuLocked(func(task *kernel.Task) {
@@ -65,6 +67,8 @@ type fdDir struct {
 }
 
 // IterDirents implements kernfs.inodeDirectory.IterDirents.
+//
+// +checklocksexclude:i.task.mu
 func (i *fdDir) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	var fds []int32
 	i.task.WithMuLocked(func(t *kernel.Task) {
@@ -131,25 +135,25 @@ func (fs *filesystem) newFDDirInode(ctx context.Context, task *kernel.Task) kern
 			produceSymlink: true,
 		},
 	}
-	inode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0500)
+	inode.InodeAttrs.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0500)
 	inode.InitRefs()
 	inode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	return inode
 }
 
 // IterDirents implements kernfs.inodeDirectory.IterDirents.
+//
+// +checklocksexclude:i.fdDir.task.mu
 func (i *fdDirInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	return i.fdDir.IterDirents(ctx, mnt, cb, offset, relOffset)
 }
 
 // Lookup implements kernfs.inodeDirectory.Lookup.
+//
+// +checklocksexclude:i.fdDir.task.mu
 func (i *fdDirInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
-	fdInt, err := strconv.ParseInt(name, 10, 32)
-	if err != nil {
-		return nil, linuxerr.ENOENT
-	}
-	fd := int32(fdInt)
-	if !taskFDExists(ctx, i.fs, i.task, fd) {
+	fd, ok := parseIDName(name)
+	if !ok || !taskFDExists(ctx, i.fs, i.task, fd) {
 		return nil, linuxerr.ENOENT
 	}
 	return i.fs.newFDSymlink(ctx, i.task, fd, i.fs.NextIno()), nil
@@ -218,10 +222,11 @@ func (fs *filesystem) newFDSymlink(ctx context.Context, task *kernel.Task, fd in
 		task: task,
 		fd:   fd,
 	}
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
+// +checklocksexclude:s.task.mu
 func (s *fdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return "", linuxerr.EACCES
@@ -238,6 +243,7 @@ func (s *fdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) 
 	return s.task.Kernel().VFS().PathnameWithDeleted(ctx, root, file.VirtualDentry())
 }
 
+// +checklocksexclude:s.task.mu
 func (s *fdSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return vfs.VirtualDentry{}, "", linuxerr.EACCES
@@ -253,6 +259,8 @@ func (s *fdSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDen
 }
 
 // Valid implements kernfs.Inode.Valid.
+//
+// +checklocksexclude:s.task.mu
 func (s *fdSymlink) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return taskFDExists(ctx, s.fs, s.task, s.fd)
 }
@@ -284,20 +292,18 @@ func (fs *filesystem) newFDInfoDirInode(ctx context.Context, task *kernel.Task) 
 			task: task,
 		},
 	}
-	inode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	inode.InodeAttrs.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
 	inode.InitRefs()
 	inode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	return inode
 }
 
 // Lookup implements kernfs.inodeDirectory.Lookup.
+//
+// +checklocksexclude:i.fdDir.task.mu
 func (i *fdInfoDirInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
-	fdInt, err := strconv.ParseInt(name, 10, 32)
-	if err != nil {
-		return nil, linuxerr.ENOENT
-	}
-	fd := int32(fdInt)
-	if !taskFDExists(ctx, i.fs, i.task, fd) {
+	fd, ok := parseIDName(name)
+	if !ok || !taskFDExists(ctx, i.fs, i.task, fd) {
 		return nil, linuxerr.ENOENT
 	}
 	data := &fdInfoData{
@@ -309,6 +315,8 @@ func (i *fdInfoDirInode) Lookup(ctx context.Context, name string) (kernfs.Inode,
 }
 
 // IterDirents implements Inode.IterDirents.
+//
+// +checklocksexclude:i.fdDir.task.mu
 func (i *fdInfoDirInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, relOffset int64) (newOffset int64, err error) {
 	return i.fdDir.IterDirents(ctx, mnt, cb, offset, relOffset)
 }
@@ -343,6 +351,8 @@ type fdInfoData struct {
 var _ dynamicInode = (*fdInfoData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
+//
+// +checklocksexclude:d.task.mu
 func (d *fdInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	file, descriptorFlags := getTaskFD(d.task, d.fd)
 	if file == nil {
@@ -376,6 +386,8 @@ func (d *fdInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Valid implements kernfs.Inode.Valid.
+//
+// +checklocksexclude:d.task.mu
 func (d *fdInfoData) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return taskFDExists(ctx, d.fs, d.task, d.fd)
 }

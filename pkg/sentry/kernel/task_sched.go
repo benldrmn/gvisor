@@ -64,34 +64,49 @@ const (
 	TaskGoroutineStopped
 )
 
+// gostateBits is the width of the `TaskGoroutineState` bits in `Task`'s
+// `gostate` field. The remainder of the bits holds `Kernel.cpuClock`
+// nanoseconds. With gostateBits = 3, this is enough for 73 years.
+const gostateBits = 3
+
 // TaskGoroutineState returns the current state of the task goroutine.
 func (t *Task) TaskGoroutineState() TaskGoroutineState {
-	return TaskGoroutineState(t.gostate.Load())
+	return TaskGoroutineState(t.gostate.Load() & (1<<gostateBits - 1))
+}
+
+// ownTaskGoroutineState returns the current state of the task goroutine,
+// without using an atomic load. This is appropriate to do when running on
+// the task goroutine, since the task goroutine is the only writer.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) ownTaskGoroutineState() TaskGoroutineState {
+	return TaskGoroutineState(t.gostate.RacyLoad() & (1<<gostateBits - 1))
 }
 
 // TaskGoroutineStateTime returns the current state of the task goroutine, and
 // the value of Kernel.CPUClockNow() when that state was last updated or
 // refreshed.
 func (t *Task) TaskGoroutineStateTime() (state TaskGoroutineState, time ktime.Time) {
-	for {
-		epoch := t.gostateSeq.BeginRead()
-		state = t.TaskGoroutineState()
-		time = ktime.FromNanoseconds(t.gostateTime.Load())
-		if t.gostateSeq.ReadOk(epoch) {
-			return
-		}
-	}
+	v := t.gostate.Load()
+	return TaskGoroutineState(v & (1<<gostateBits - 1)), ktime.FromNanoseconds(int64(v >> gostateBits))
+}
+
+// setGostate sets the task goroutine state, timestamped with the current
+// `Kernel.cpuClock`.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) setGostate(state TaskGoroutineState) {
+	// StoreRelaxed due to this being on the syscall hot path, and all readers
+	// are expected to tolerate stale reads.
+	t.gostate.StoreRelaxed(uint64(t.k.cpuClock.Load())<<gostateBits | uint64(state))
 }
 
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) accountTaskGoroutineEnter(state TaskGoroutineState) {
-	if oldState := t.TaskGoroutineState(); oldState != TaskGoroutineRunningSys {
+	if oldState := t.ownTaskGoroutineState(); oldState != TaskGoroutineRunningSys {
 		panic(fmt.Sprintf("Task goroutine switching from state %v (expected %v) to %v", oldState, TaskGoroutineRunningSys, state))
 	}
-	t.gostateSeq.BeginWrite()
-	t.gostate.Store(uint32(state))
-	t.touchGostateTime()
-	t.gostateSeq.EndWrite()
+	t.setGostate(state)
 	if state != TaskGoroutineRunningApp {
 		// Task is blocking/stopping.
 		t.k.decRunningTasks()
@@ -115,18 +130,17 @@ func (t *Task) accountTaskGoroutineLeave(state TaskGoroutineState) {
 		// Task is leaving uninterruptible sleep.
 		t.k.blockedTasks.Add(-1)
 	}
-	if oldState := t.TaskGoroutineState(); oldState != state {
+	if oldState := t.ownTaskGoroutineState(); oldState != state {
 		panic(fmt.Sprintf("Task goroutine switching from state %v (expected %v) to %v", oldState, state, TaskGoroutineRunningSys))
 	}
-	t.gostateSeq.BeginWrite()
-	t.gostate.Store(uint32(TaskGoroutineRunningSys))
-	t.touchGostateTime()
-	t.gostateSeq.EndWrite()
+	t.setGostate(TaskGoroutineRunningSys)
 }
 
+// touchGostateTime refreshes the timestamp of the current task goroutine state.
+//
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) touchGostateTime() {
-	t.gostateTime.Store(t.k.cpuClock.Load())
+	t.setGostate(t.ownTaskGoroutineState())
 }
 
 // CPUClockNow returns the current value of the kernel CPU clock, which
@@ -378,6 +392,8 @@ func (t *Task) StateStatus() string {
 }
 
 // CPUMask returns a copy of t's allowed CPU mask.
+//
+// +checklocksexclude:t.mu
 func (t *Task) CPUMask() sched.CPUSet {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -389,6 +405,9 @@ func (t *Task) CPUMask() sched.CPUSet {
 //
 // Preconditions: mask.Size() ==
 // sched.CPUSetSize(t.Kernel().ApplicationCores()).
+//
+// +checklocksexclude:t.mu
+// +checklocksexclude:t.tg.pidns.owner.mu
 func (t *Task) SetCPUMask(mask sched.CPUSet) error {
 	if want := sched.CPUSetSize(t.k.applicationCores); mask.Size() != want {
 		panic(fmt.Sprintf("Invalid CPUSet %v (expected %d bytes)", mask, want))
@@ -448,6 +467,8 @@ func assignCPU(allowed sched.CPUSet, tid ThreadID) (cpu int32) {
 }
 
 // Niceness returns t's niceness.
+//
+// +checklocksexclude:t.mu
 func (t *Task) Niceness() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -455,6 +476,8 @@ func (t *Task) Niceness() int {
 }
 
 // Priority returns t's priority.
+//
+// +checklocksexclude:t.mu
 func (t *Task) Priority() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -463,6 +486,8 @@ func (t *Task) Priority() int {
 
 // SetNiceness sets t's niceness to n.
 // Values outside of [-20, 19] are clamped to fit within the range.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetNiceness(n int) {
 	if n < -20 {
 		n = -20
@@ -476,6 +501,8 @@ func (t *Task) SetNiceness(n int) {
 }
 
 // SetIOPrio sets t's ioprio.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetIOPrio(ioprio int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -483,6 +510,8 @@ func (t *Task) SetIOPrio(ioprio int) {
 }
 
 // GetIOPrio fetches t's ioprio.
+//
+// +checklocksexclude:t.mu
 func (t *Task) GetIOPrio() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -490,6 +519,8 @@ func (t *Task) GetIOPrio() int {
 }
 
 // SetScheduler sets t's scheduler.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetScheduler(scheduler uint) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -497,6 +528,8 @@ func (t *Task) SetScheduler(scheduler uint) {
 }
 
 // GetScheduler fetches t's scheduler.
+//
+// +checklocksexclude:t.mu
 func (t *Task) GetScheduler() uint {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -504,6 +537,8 @@ func (t *Task) GetScheduler() uint {
 }
 
 // NumaPolicy returns t's current numa policy.
+//
+// +checklocksexclude:t.mu
 func (t *Task) NumaPolicy() (policy linux.NumaPolicy, nodeMask uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -511,6 +546,8 @@ func (t *Task) NumaPolicy() (policy linux.NumaPolicy, nodeMask uint64) {
 }
 
 // SetNumaPolicy sets t's numa policy.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetNumaPolicy(policy linux.NumaPolicy, nodeMask uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package config providides helper functions to configure trace sessions.
+// Package config provides helper functions to configure trace sessions.
 package config
 
 import (
@@ -21,11 +21,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
 // Builder helps with building of trace session configuration.
@@ -37,7 +38,7 @@ type Builder struct {
 // WriteInitConfig writes the current configuration in a format compatible with
 // the flag --pod-init-config.
 func (b *Builder) WriteInitConfig(w io.Writer) error {
-	init := &boot.InitConfig{
+	init := &sentryapi.InitConfig{
 		TraceSession: seccheck.SessionConfig{
 			Name:   seccheck.DefaultSessionName,
 			Points: b.points,
@@ -53,7 +54,8 @@ func (b *Builder) WriteInitConfig(w io.Writer) error {
 // fields.
 func (b *Builder) LoadAllPoints(runscPath string) error {
 	cmd := exec.Command(runscPath, "trace", "metadata")
-	out, err := cmd.CombinedOutput()
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
 	if err != nil {
 		return err
 	}

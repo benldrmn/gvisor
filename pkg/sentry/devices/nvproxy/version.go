@@ -26,9 +26,7 @@ import (
 )
 
 const (
-	// ChecksumNoDriver is a special value that indicates that the driver runfile
-	// does not exist. This is mostly for ARM drivers that NVIDIA does not
-	// provide a driver installer.
+	// ChecksumNoDriver marks an architecture without an NVIDIA .run installer.
 	ChecksumNoDriver = "NO_DRIVER"
 )
 
@@ -41,11 +39,36 @@ type driverABIFunc func() *driverABI
 // the driver ABI is not needed.
 type driverABIInfoFunc func() *DriverABIInfo
 
-// Checksums is a struct containing the SHA256 checksum of the linux .run
-// driver installer file from NVIDIA.
+// Checksums contains NVIDIA .run installer hashes and public availability.
 type Checksums struct {
 	X86_64 string
 	ARM64  string
+
+	// These flags preserve known hashes for installers that are unavailable at
+	// NVIDIA's public download locations. ABI support is independent of public
+	// installer availability.
+	NoPublicX86_64Installer bool
+	NoPublicARM64Installer  bool
+}
+
+// PublicInstallerUnavailable reports whether the public installer URL for arch
+// is expected to return HTTP 404. A known hash is retained even when its public
+// installer is unavailable. Empty hashes and unknown architectures are errors.
+func (c Checksums) PublicInstallerUnavailable(arch string) (bool, error) {
+	var checksum string
+	var unavailable bool
+	switch arch {
+	case "amd64":
+		checksum, unavailable = c.X86_64, c.NoPublicX86_64Installer
+	case "arm64":
+		checksum, unavailable = c.ARM64, c.NoPublicARM64Installer
+	default:
+		return false, fmt.Errorf("unsupported driver architecture %q", arch)
+	}
+	if checksum == "" {
+		return false, fmt.Errorf("empty NVIDIA installer checksum for arch %q", arch)
+	}
+	return checksum == ChecksumNoDriver || unavailable, nil
 }
 
 // NewChecksums creates a new Checksums struct.
@@ -107,6 +130,7 @@ type DriverABIInfo struct {
 	UvmInfos        map[uint32]IoctlInfo
 	ControlInfos    map[uint32]IoctlInfo
 	AllocationInfos map[nvgpu.ClassID]IoctlInfo
+	UvmConstants    map[string]uint64
 }
 
 // IoctlName is the name of the constant used by the Nvidia driver to define
@@ -134,10 +158,14 @@ var abis map[nvconf.DriverVersion]driverABIEntry
 var abisOnce sync.Once
 
 func addDriverABI(major, minor, patch int, checksumX86_64, checksumARM64 string, cons driverABIFunc) driverABIFunc {
+	return addDriverABIWithChecksums(major, minor, patch, NewChecksums(checksumX86_64, checksumARM64), cons)
+}
+
+func addDriverABIWithChecksums(major, minor, patch int, checksums Checksums, cons driverABIFunc) driverABIFunc {
 	version := nvconf.NewDriverVersion(major, minor, patch)
 	abis[version] = driverABIEntry{
 		cons:      cons,
-		checksums: NewChecksums(checksumX86_64, checksumARM64),
+		checksums: checksums,
 		supported: true,
 	}
 	return cons
@@ -175,6 +203,7 @@ func Init() {
 					nvgpu.NV_ESC_ALLOC_OS_EVENT:                feHandler(frontendIoctlHasFD[nvgpu.IoctlAllocOSEvent], compUtil),
 					nvgpu.NV_ESC_FREE_OS_EVENT:                 feHandler(frontendIoctlHasFD[nvgpu.IoctlFreeOSEvent], compUtil),
 					nvgpu.NV_ESC_NUMA_INFO:                     feHandler(rmNumaInfo, compUtil),
+					nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD:           feHandler(frontendExportToDMABufFD[nvgpu.IoctlExportToDMABufFD], nvconf.CapRDMA),
 					nvgpu.NV_ESC_RM_ALLOC_CONTEXT_DMA2:         feHandler(rmAllocContextDMA2, nvconf.CapGraphics),
 					nvgpu.NV_ESC_RM_ALLOC_MEMORY:               feHandler(rmAllocMemory, compUtil|nvconf.CapGraphics),
 					nvgpu.NV_ESC_RM_FREE:                       feHandler(rmFree, compUtil),
@@ -220,6 +249,7 @@ func Init() {
 				controlCmd: map[uint32]controlCmdHandler{
 					nvgpu.NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE:                       ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY:                ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION:                           ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS:                             ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS:                               ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:                               ctrlHandler(rmControlSimple, compUtil),
@@ -261,7 +291,7 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_BUS_GET_INFO_V2:                                  ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_BUS_GET_PCIE_SUPPORTED_GPU_ATOMICS:               ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_BUS_GET_C2C_INFO:                                 ctrlHandler(rmControlSimple, compUtil),
-					nvgpu.NV2080_CTRL_CMD_CE_GET_CE_PCE_MASK:                               ctrlHandler(rmControlSimple, nvconf.CapGraphics),
+					nvgpu.NV2080_CTRL_CMD_CE_GET_CE_PCE_MASK:                               ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_CE_GET_CAPS_V2:                                   ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_CE_GET_ALL_CAPS:                                  ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION:                           ctrlHandler(rmControlSimple, compUtil),
@@ -290,11 +320,16 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT:                    ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_ENCODER_CAPACITY:                         ctrlHandler(rmControlSimple, nvconf.CapVideo),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_ENGINES_V2:                               ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV2080_CTRL_CMD_GPU_GET_PARTITION_CAPACITY:                       ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV2080_CTRL_CMD_GPU_DESCRIBE_PARTITIONS:                          ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_ACTIVE_PARTITION_IDS:                     ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_PIDS:                                     ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_PID_INFO:                                 ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GPU_GET_COMPUTE_POLICY_CONFIG:                    ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO:                        ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV2080_CTRL_CMD_GPU_GET_RESET_STATUS:                             ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV2080_CTRL_CMD_GPU_GET_DRAIN_AND_RESET_STATUS:                   ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS:                         ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GR_GET_ZCULL_INFO:                                ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND:                              ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE:                     ctrlHandler(rmControlSimple, compUtil),
@@ -305,6 +340,11 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_GR_GET_TPC_MASK:                                  ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER:                    ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_GR_GET_SM_TO_GPC_TPC_MAPPINGS:                    ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV2080_CTRL_CMD_GR_FECS_BIND_EVTBUF_FOR_UID:                      ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV2080_CTRL_CMD_EVENT_VIDEO_BIND_EVTBUF:                          ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS:                           ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET:                              ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV_EVENT_BUFFER_CTRL_CMD_FLUSH:                                   ctrlHandler(rmControlSimple, nvconf.CapProfiling),
 					nvgpu.NV2080_CTRL_CMD_GRMGR_GET_GR_FS_INFO:                             ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_OS_UNIX_VIDMEM_PERSISTENCE_STATUS:                ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_GSP_GET_FEATURES:                                 ctrlHandler(rmControlSimple, compUtil),
@@ -313,6 +353,7 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_NVLINK_GET_NVLINK_CAPS:                           ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_NVLINK_GET_NVLINK_STATUS:                         ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_PERF_BOOST:                                       ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2:          ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_RC_GET_WATCHDOG_INFO:                             ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_RC_RELEASE_WATCHDOG_REQUESTS:                     ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_RC_SOFT_DISABLE_WATCHDOG:                         ctrlHandler(rmControlSimple, compUtil),
@@ -326,11 +367,17 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_FB_GET_INFO:                                      ctrlHandler(ctrlIoctlHasInfoList[nvgpu.NvxxxCtrlXxxGetInfoParams], nvconf.CapGraphics),
 					nvgpu.NV503C_CTRL_CMD_REGISTER_VIDMEM:                                  ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV503C_CTRL_CMD_UNREGISTER_VIDMEM:                                ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG:                         ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV83DE_CTRL_CMD_DEBUG_SET_EXCEPTION_MASK:                         ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES:                   ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV83DE_CTRL_CMD_DEBUG_CLEAR_ALL_SM_ERROR_STATES:                  ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV83DE_CTRL_CMD_DEBUG_READ_MEMORY:                                ctrlHandler(ctrlDebugReadMemory, compUtil),
+					nvgpu.NV83DE_CTRL_CMD_DEBUG_SUSPEND_CONTEXT:                            ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV83DE_CTRL_CMD_DEBUG_RESUME_CONTEXT:                             ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG:                      ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV906F_CTRL_GET_CLASS_ENGINEID:                                   ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV906F_CTRL_CMD_RESET_CHANNEL:                                    ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV906F_CTRL_CMD_GET_MMU_FAULT_INFO:                               ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV9096_CTRL_CMD_GET_ZBC_CLEAR_TABLE_SIZE:                         ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV9096_CTRL_CMD_GET_ZBC_CLEAR_TABLE_ENTRY:                        ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV90CC_CTRL_CMD_POWER_REQUEST_FEATURES:                           ctrlHandler(rmControlSimple, nvconf.CapProfiling),
@@ -349,14 +396,20 @@ func Init() {
 					nvgpu.NVB0CC_CTRL_CMD_RELEASE_PM_AREA_PC_SAMPLER:                       ctrlHandler(rmControlSimple, nvconf.CapProfiling),
 					nvgpu.NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS:                             ctrlHandler(rmControlSimple, nvconf.CapProfiling),
 					nvgpu.NVB0CC_CTRL_CMD_SET_HS_CREDITS:                                   ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NVB0CC_CTRL_CMD_RESERVE_HES:                                      ctrlHandler(rmControlSimple, nvconf.CapProfiling),
 					nvgpu.NVB0CC_CTRL_CMD_POWER_REQUEST_FEATURES:                           ctrlHandler(rmControlSimple, nvconf.CapProfiling),
 					nvgpu.NVB0CC_CTRL_CMD_POWER_RELEASE_FEATURES:                           ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_SUBSCRIBE:                    ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_UNSUBSCRIBE:                  ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_SET_STREAM_STATE:             ctrlHandler(rmControlSimple, nvconf.CapProfiling),
+					nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_GET_STREAM_STATE:             ctrlHandler(rmControlSimple, nvconf.CapProfiling),
 					nvgpu.NV90E6_CTRL_CMD_MASTER_GET_VIRTUAL_FUNCTION_ERROR_CONT_INTR_MASK: ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NVC36F_CTRL_GET_CLASS_ENGINEID:                                   ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:                     ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX:         ctrlHandler(rmControlSimple, nvconf.CapGraphics|nvconf.CapVideo),
 					nvgpu.NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_CAPABILITIES:                 ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_GPUS_STATE:                   ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_VIDMEM_SIZE:                     ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_NUM_SECURE_CHANNELS:             ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE:                                  ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NVA06C_CTRL_CMD_SET_TIMESLICE:                                    ctrlHandler(rmControlSimple, compUtil),
@@ -384,6 +437,7 @@ func Init() {
 					nvgpu.NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD:                     ctrlHandler(ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS], compUtil),
 					nvgpu.NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD:                   ctrlHandler(ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS], compUtil),
 					nvgpu.NV0041_CTRL_CMD_GET_SURFACE_INFO:                                 ctrlHandler(ctrlIoctlHasInfoList[nvgpu.NvxxxCtrlXxxGetInfoParams], compUtil),
+					nvgpu.NV0041_CTRL_CMD_GET_MEM_PAGE_SIZE:                                ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV00FD_CTRL_CMD_ATTACH_GPU:                                       ctrlHandler(ctrlMemoryMulticastFabricAttachGPU, compUtil),
 					nvgpu.NV503C_CTRL_CMD_REGISTER_VA_SPACE:                                ctrlHandler(ctrlRegisterVASpace, compUtil),
 					nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM:                               ctrlHandler(rmControlSimple, compUtil),
@@ -404,8 +458,10 @@ func Init() {
 					nvgpu.NV01_CONTEXT_DMA:           allocHandler(rmAllocContextDMA, nvconf.CapVideo),
 					nvgpu.NV01_MEMORY_SYSTEM:         allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS], compUtil),
 					nvgpu.NV01_MEMORY_LOCAL_USER:     allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS], compUtil),
+					nvgpu.NV01_MEMORY_DEVICELESS:     allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS], compUtil),
 					nvgpu.NV01_ROOT_CLIENT:           allocHandler(rmAllocRootClient, compUtil),
 					nvgpu.NV01_EVENT_OS_EVENT:        allocHandler(rmAllocEventOSEvent, compUtil),
+					nvgpu.NV_EVENT_BUFFER:            allocHandler(rmAllocEventBuffer, nvconf.CapProfiling),
 					nvgpu.NV01_MEMORY_VIRTUAL:        allocHandler(rmAllocMemoryVirtual, nvconf.CapGraphics|nvconf.CapVideo),
 					nvgpu.NV01_DEVICE_0:              allocHandler(rmAllocSimple[nvgpu.NV0080_ALLOC_PARAMETERS], compUtil),
 					nvgpu.NV_SEMAPHORE_SURFACE:       allocHandler(rmAllocSimple[nvgpu.NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS], nvconf.CapGraphics),
@@ -452,6 +508,7 @@ func Init() {
 					nvgpu.HOPPER_CHANNEL_GPFIFO_A:    allocHandler(rmAllocChannel, compUtil),
 					nvgpu.TURING_A:                   allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics),
 					nvgpu.AMPERE_A:                   allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics),
+					nvgpu.AMPERE_B:                   allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics),
 					nvgpu.ADA_A:                      allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics),
 					nvgpu.HOPPER_A:                   allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics),
 					nvgpu.TURING_DMA_COPY_A:          allocHandler(rmAllocSimple[nvgpu.NVB0B5_ALLOCATION_PARAMETERS], compUtil),
@@ -490,6 +547,7 @@ func Init() {
 							nvgpu.NV_ESC_ALLOC_OS_EVENT:                ioctlInfoWithStructName("NV_ESC_ALLOC_OS_EVENT", nvgpu.IoctlAllocOSEvent{}, "nv_ioctl_alloc_os_event_t"),
 							nvgpu.NV_ESC_FREE_OS_EVENT:                 ioctlInfoWithStructName("NV_ESC_FREE_OS_EVENT", nvgpu.IoctlFreeOSEvent{}, "nv_ioctl_free_os_event_t"),
 							nvgpu.NV_ESC_NUMA_INFO:                     simpleIoctlInfo("NV_ESC_NUMA_INFO"), // No params struct because nvproxy ignores this ioctl
+							nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD:           ioctlInfoWithStructName("NV_ESC_EXPORT_TO_DMABUF_FD", nvgpu.IoctlExportToDMABufFD{}, "nv_ioctl_export_to_dma_buf_fd_t"),
 							nvgpu.NV_ESC_RM_ALLOC_MEMORY:               ioctlInfoWithStructName("NV_ESC_RM_ALLOC_MEMORY", nvgpu.IoctlNVOS02ParametersWithFD{}, "nv_ioctl_nvos02_parameters_with_fd"),
 							nvgpu.NV_ESC_RM_FREE:                       ioctlInfo("NV_ESC_RM_FREE", nvgpu.NVOS00_PARAMETERS{}),
 							nvgpu.NV_ESC_RM_CONTROL:                    ioctlInfo("NV_ESC_RM_CONTROL", nvgpu.NVOS54_PARAMETERS{}),
@@ -534,6 +592,7 @@ func Init() {
 						ControlInfos: map[uint32]IoctlInfo{
 							nvgpu.NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE:                       simpleIoctlInfo("NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE", "NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY:                simpleIoctlInfo("NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY", "NV0000_CTRL_CLIENT_SET_INHERITED_SHARE_POLICY_PARAMS"),
+							nvgpu.NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION:                           simpleIoctlInfo("NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION", "NV0000_CTRL_EVENT_SET_NOTIFICATION_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS:                             simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS", "NV0000_CTRL_GPU_GET_ATTACHED_IDS_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS:                               simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS", "NV0000_CTRL_GPU_GET_DEVICE_IDS_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:                               simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2", "NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS"),
@@ -604,11 +663,16 @@ func Init() {
 							nvgpu.NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT:                    simpleIoctlInfo("NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT"), // No params.
 							nvgpu.NV2080_CTRL_CMD_GPU_GET_ENCODER_CAPACITY:                         simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_ENCODER_CAPACITY", "NV2080_CTRL_GPU_GET_ENCODER_CAPACITY_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GPU_GET_ENGINES_V2:                               simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_ENGINES_V2", "NV2080_CTRL_GPU_GET_ENGINES_V2_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_GPU_GET_PARTITION_CAPACITY:                       simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_PARTITION_CAPACITY", "NV2080_CTRL_GPU_GET_PARTITION_CAPACITY_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_GPU_DESCRIBE_PARTITIONS:                          simpleIoctlInfo("NV2080_CTRL_CMD_GPU_DESCRIBE_PARTITIONS", "NV2080_CTRL_GPU_DESCRIBE_PARTITIONS_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GPU_GET_ACTIVE_PARTITION_IDS:                     simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_ACTIVE_PARTITION_IDS", "NV2080_CTRL_GPU_GET_ACTIVE_PARTITION_IDS_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GPU_GET_PIDS:                                     simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_PIDS", "NV2080_CTRL_GPU_GET_PIDS_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GPU_GET_PID_INFO:                                 simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_PID_INFO", "NV2080_CTRL_GPU_GET_PID_INFO_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GPU_GET_COMPUTE_POLICY_CONFIG:                    simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_COMPUTE_POLICY_CONFIG", "NV2080_CTRL_GPU_GET_COMPUTE_POLICY_CONFIG_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO:                        simpleIoctlInfo("NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO", "NV2080_CTRL_CMD_GET_GPU_FABRIC_PROBE_INFO_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_GPU_GET_RESET_STATUS:                             simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_RESET_STATUS", "NV2080_CTRL_GPU_GET_RESET_STATUS_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_GPU_GET_DRAIN_AND_RESET_STATUS:                   simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_DRAIN_AND_RESET_STATUS", "NV2080_CTRL_GPU_GET_DRAIN_AND_RESET_STATUS_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS:                         simpleIoctlInfo("NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS", "NV2080_CTRL_FLA_GET_FABRIC_MEM_STATS_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GR_GET_ZCULL_INFO:                                simpleIoctlInfo("NV2080_CTRL_CMD_GR_GET_ZCULL_INFO", "NV2080_CTRL_GR_GET_ZCULL_INFO_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND:                              simpleIoctlInfo("NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND", "NV2080_CTRL_GR_CTXSW_ZCULL_BIND_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE:                     simpleIoctlInfo("NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE", "NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_PARAMS"),
@@ -619,6 +683,11 @@ func Init() {
 							nvgpu.NV2080_CTRL_CMD_GR_GET_TPC_MASK:                                  simpleIoctlInfo("NV2080_CTRL_CMD_GR_GET_TPC_MASK", "NV2080_CTRL_GR_GET_TPC_MASK_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER:                    simpleIoctlInfo("NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER", "NV2080_CTRL_GR_GET_SM_ISSUE_RATE_MODIFIER_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GR_GET_SM_TO_GPC_TPC_MAPPINGS:                    simpleIoctlInfo("NV2080_CTRL_CMD_GR_GET_SM_TO_GPC_TPC_MAPPINGS", "NV2080_CTRL_GR_GET_SM_TO_GPC_TPC_MAPPINGS_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_GR_FECS_BIND_EVTBUF_FOR_UID:                      simpleIoctlInfo("NV2080_CTRL_CMD_GR_FECS_BIND_EVTBUF_FOR_UID", "NV2080_CTRL_GR_FECS_BIND_EVTBUF_FOR_UID_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_EVENT_VIDEO_BIND_EVTBUF:                          simpleIoctlInfo("NV2080_CTRL_CMD_EVENT_VIDEO_BIND_EVTBUF", "NV2080_CTRL_EVENT_VIDEO_BIND_EVTBUF_PARAMS"),
+							nvgpu.NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS:                           simpleIoctlInfo("NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS", "NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS_PARAMS"),
+							nvgpu.NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET:                              simpleIoctlInfo("NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET", "NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET_PARAMS"),
+							nvgpu.NV_EVENT_BUFFER_CTRL_CMD_FLUSH:                                   simpleIoctlInfo("NV_EVENT_BUFFER_CTRL_CMD_FLUSH"), // No params.
 							nvgpu.NV2080_CTRL_CMD_GRMGR_GET_GR_FS_INFO:                             simpleIoctlInfo("NV2080_CTRL_CMD_GRMGR_GET_GR_FS_INFO", "NV2080_CTRL_GRMGR_GET_GR_FS_INFO_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_OS_UNIX_VIDMEM_PERSISTENCE_STATUS:                simpleIoctlInfo("NV2080_CTRL_CMD_OS_UNIX_VIDMEM_PERSISTENCE_STATUS", "NV2080_CTRL_OS_UNIX_VIDMEM_PERSISTENCE_STATUS_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_GSP_GET_FEATURES:                                 simpleIoctlInfo("NV2080_CTRL_CMD_GSP_GET_FEATURES", "NV2080_CTRL_GSP_GET_FEATURES_PARAMS"),
@@ -627,6 +696,7 @@ func Init() {
 							nvgpu.NV2080_CTRL_CMD_NVLINK_GET_NVLINK_CAPS:                           simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_NVLINK_CAPS", "NV2080_CTRL_CMD_NVLINK_GET_NVLINK_CAPS_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_NVLINK_GET_NVLINK_STATUS:                         simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_NVLINK_STATUS", "NV2080_CTRL_CMD_NVLINK_GET_NVLINK_STATUS_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_PERF_BOOST:                                       simpleIoctlInfo("NV2080_CTRL_CMD_PERF_BOOST", "NV2080_CTRL_PERF_BOOST_PARAMS"),
+							nvgpu.NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2:          simpleIoctlInfo("NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2", "NV2080_CTRL_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_RC_GET_WATCHDOG_INFO:                             simpleIoctlInfo("NV2080_CTRL_CMD_RC_GET_WATCHDOG_INFO", "NV2080_CTRL_RC_GET_WATCHDOG_INFO_PARAMS"),
 							nvgpu.NV2080_CTRL_CMD_RC_RELEASE_WATCHDOG_REQUESTS:                     simpleIoctlInfo("NV2080_CTRL_CMD_RC_RELEASE_WATCHDOG_REQUESTS"), // No params.
 							nvgpu.NV2080_CTRL_CMD_RC_SOFT_DISABLE_WATCHDOG:                         simpleIoctlInfo("NV2080_CTRL_CMD_RC_SOFT_DISABLE_WATCHDOG"),     // No params.
@@ -640,11 +710,17 @@ func Init() {
 							nvgpu.NV2080_CTRL_CMD_FB_GET_INFO:                                      ioctlInfoWithStructName("NV2080_CTRL_CMD_FB_GET_INFO", nvgpu.NvxxxCtrlXxxGetInfoParams{}, "NV2080_CTRL_FB_GET_INFO_PARAMS"),
 							nvgpu.NV503C_CTRL_CMD_REGISTER_VIDMEM:                                  simpleIoctlInfo("NV503C_CTRL_CMD_REGISTER_VIDMEM", "NV503C_CTRL_REGISTER_VIDMEM_PARAMS"),
 							nvgpu.NV503C_CTRL_CMD_UNREGISTER_VIDMEM:                                simpleIoctlInfo("NV503C_CTRL_CMD_UNREGISTER_VIDMEM", "NV503C_CTRL_UNREGISTER_VIDMEM_PARAMS"),
+							nvgpu.NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG:                         simpleIoctlInfo("NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG", "NV83DE_CTRL_DEBUG_SET_MODE_MMU_DEBUG_PARAMS"),
 							nvgpu.NV83DE_CTRL_CMD_DEBUG_SET_EXCEPTION_MASK:                         simpleIoctlInfo("NV83DE_CTRL_CMD_DEBUG_SET_EXCEPTION_MASK", "NV83DE_CTRL_DEBUG_SET_EXCEPTION_MASK_PARAMS"),
 							nvgpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES:                   simpleIoctlInfo("NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES", "NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS"),
 							nvgpu.NV83DE_CTRL_CMD_DEBUG_CLEAR_ALL_SM_ERROR_STATES:                  simpleIoctlInfo("NV83DE_CTRL_CMD_DEBUG_CLEAR_ALL_SM_ERROR_STATES", "NV83DE_CTRL_DEBUG_CLEAR_ALL_SM_ERROR_STATES_PARAMS"),
+							nvgpu.NV83DE_CTRL_CMD_DEBUG_READ_MEMORY:                                ioctlInfo("NV83DE_CTRL_CMD_DEBUG_READ_MEMORY", nvgpu.NV83DE_CTRL_DEBUG_READ_MEMORY_PARAMS{}),
+							nvgpu.NV83DE_CTRL_CMD_DEBUG_SUSPEND_CONTEXT:                            simpleIoctlInfo("NV83DE_CTRL_CMD_DEBUG_SUSPEND_CONTEXT", "NV83DE_CTRL_CMD_DEBUG_SUSPEND_CONTEXT_PARAMS"),
+							nvgpu.NV83DE_CTRL_CMD_DEBUG_RESUME_CONTEXT:                             simpleIoctlInfo("NV83DE_CTRL_CMD_DEBUG_RESUME_CONTEXT"), // No params.
+							nvgpu.NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG:                      simpleIoctlInfo("NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG", "NV83DE_CTRL_DEBUG_SET_MODE_ERRBAR_DEBUG_PARAMS"),
 							nvgpu.NV906F_CTRL_GET_CLASS_ENGINEID:                                   simpleIoctlInfo("NV906F_CTRL_GET_CLASS_ENGINEID", "NV906F_CTRL_GET_CLASS_ENGINEID_PARAMS"),
 							nvgpu.NV906F_CTRL_CMD_RESET_CHANNEL:                                    simpleIoctlInfo("NV906F_CTRL_CMD_RESET_CHANNEL", "NV906F_CTRL_CMD_RESET_CHANNEL_PARAMS"),
+							nvgpu.NV906F_CTRL_CMD_GET_MMU_FAULT_INFO:                               simpleIoctlInfo("NV906F_CTRL_CMD_GET_MMU_FAULT_INFO", "NV906F_CTRL_GET_MMU_FAULT_INFO_PARAMS"),
 							nvgpu.NV9096_CTRL_CMD_GET_ZBC_CLEAR_TABLE_SIZE:                         simpleIoctlInfo("NV9096_CTRL_CMD_GET_ZBC_CLEAR_TABLE_SIZE", "NV9096_CTRL_GET_ZBC_CLEAR_TABLE_SIZE_PARAMS"),
 							nvgpu.NV9096_CTRL_CMD_GET_ZBC_CLEAR_TABLE_ENTRY:                        simpleIoctlInfo("NV9096_CTRL_CMD_GET_ZBC_CLEAR_TABLE_ENTRY", "NV9096_CTRL_GET_ZBC_CLEAR_TABLE_ENTRY_PARAMS"),
 							nvgpu.NV90CC_CTRL_CMD_POWER_REQUEST_FEATURES:                           simpleIoctlInfo("NV90CC_CTRL_CMD_POWER_REQUEST_FEATURES", "NV90CC_CTRL_POWER_REQUEST_FEATURES_PARAMS"),
@@ -663,14 +739,20 @@ func Init() {
 							nvgpu.NVB0CC_CTRL_CMD_RELEASE_PM_AREA_PC_SAMPLER:                       simpleIoctlInfo("NVB0CC_CTRL_CMD_RELEASE_PM_AREA_PC_SAMPLER"),
 							nvgpu.NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS:                             simpleIoctlInfo("NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS", "NVB0CC_CTRL_GET_TOTAL_HS_CREDITS_PARAMS"),
 							nvgpu.NVB0CC_CTRL_CMD_SET_HS_CREDITS:                                   simpleIoctlInfo("NVB0CC_CTRL_CMD_SET_HS_CREDITS", "NVB0CC_CTRL_SET_HS_CREDITS_PARAMS"),
+							nvgpu.NVB0CC_CTRL_CMD_RESERVE_HES:                                      simpleIoctlInfo("NVB0CC_CTRL_CMD_RESERVE_HES", "NVB0CC_CTRL_RESERVE_HES_PARAMS"),
 							nvgpu.NVB0CC_CTRL_CMD_POWER_REQUEST_FEATURES:                           simpleIoctlInfo("NVB0CC_CTRL_CMD_POWER_REQUEST_FEATURES", "NVB0CC_CTRL_POWER_REQUEST_FEATURES_PARAMS"),
 							nvgpu.NVB0CC_CTRL_CMD_POWER_RELEASE_FEATURES:                           simpleIoctlInfo("NVB0CC_CTRL_CMD_POWER_RELEASE_FEATURES", "NVB0CC_CTRL_POWER_RELEASE_FEATURES_PARAMS"),
+							nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_SUBSCRIBE:                    simpleIoctlInfo("NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_SUBSCRIBE", "NV_COUNTER_COLLECTION_UNIT_SUBSCRIBE_PARAMS"),
+							nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_UNSUBSCRIBE:                  simpleIoctlInfo("NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_UNSUBSCRIBE"), // No params.
+							nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_SET_STREAM_STATE:             simpleIoctlInfo("NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_SET_STREAM_STATE", "NV_COUNTER_COLLECTION_UNIT_STREAM_STATE_PARAMS"),
+							nvgpu.NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_GET_STREAM_STATE:             simpleIoctlInfo("NV_COUNTER_COLLECTION_UNIT_CTRL_CMD_GET_STREAM_STATE", "NV_COUNTER_COLLECTION_UNIT_STREAM_STATE_PARAMS"),
 							nvgpu.NV90E6_CTRL_CMD_MASTER_GET_VIRTUAL_FUNCTION_ERROR_CONT_INTR_MASK: simpleIoctlInfo("NV90E6_CTRL_CMD_MASTER_GET_VIRTUAL_FUNCTION_ERROR_CONT_INTR_MASK", "NV90E6_CTRL_MASTER_GET_VIRTUAL_FUNCTION_ERROR_CONT_INTR_MASK_PARAMS"),
 							nvgpu.NVC36F_CTRL_GET_CLASS_ENGINEID:                                   simpleIoctlInfo("NVC36F_CTRL_GET_CLASS_ENGINEID", "NVC36F_CTRL_GET_CLASS_ENGINEID_PARAMS"),
 							nvgpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:                     simpleIoctlInfo("NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN", "NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS"),
 							nvgpu.NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX:         simpleIoctlInfo("NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX", "NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS"),
 							nvgpu.NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_CAPABILITIES:                 simpleIoctlInfo("NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_CAPABILITIES", "NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_CAPABILITIES_PARAMS"),
 							nvgpu.NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_GPUS_STATE:                   simpleIoctlInfo("NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_GPUS_STATE", "NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_GPUS_STATE_PARAMS"),
+							nvgpu.NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_VIDMEM_SIZE:                     simpleIoctlInfo("NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_VIDMEM_SIZE", "NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_VIDMEM_SIZE_PARAMS"),
 							nvgpu.NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_NUM_SECURE_CHANNELS:             simpleIoctlInfo("NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_NUM_SECURE_CHANNELS", "NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_NUM_SECURE_CHANNELS_PARAMS"),
 							nvgpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE:                                  simpleIoctlInfo("NVA06C_CTRL_CMD_GPFIFO_SCHEDULE", "NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS"),
 							nvgpu.NVA06C_CTRL_CMD_SET_TIMESLICE:                                    simpleIoctlInfo("NVA06C_CTRL_CMD_SET_TIMESLICE", "NVA06C_CTRL_SET_TIMESLICE_PARAMS"),
@@ -698,6 +780,7 @@ func Init() {
 							nvgpu.NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD:                     ioctlInfo("NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD", nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS{}),
 							nvgpu.NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD:                   ioctlInfo("NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD", nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS{}),
 							nvgpu.NV0041_CTRL_CMD_GET_SURFACE_INFO:                                 ioctlInfoWithStructName("NV0041_CTRL_CMD_GET_SURFACE_INFO", nvgpu.NvxxxCtrlXxxGetInfoParams{}, "NV0041_CTRL_GET_SURFACE_INFO_PARAMS"),
+							nvgpu.NV0041_CTRL_CMD_GET_MEM_PAGE_SIZE:                                simpleIoctlInfo("NV0041_CTRL_CMD_GET_MEM_PAGE_SIZE", "NV0041_CTRL_GET_MEM_PAGE_SIZE_PARAMS"),
 							nvgpu.NV00FD_CTRL_CMD_ATTACH_GPU:                                       ioctlInfo("NV00FD_CTRL_CMD_ATTACH_GPU", nvgpu.NV00FD_CTRL_ATTACH_GPU_PARAMS{}),
 							nvgpu.NV503C_CTRL_CMD_REGISTER_VA_SPACE:                                ioctlInfo("NV503C_CTRL_CMD_REGISTER_VA_SPACE", nvgpu.NV503C_CTRL_REGISTER_VA_SPACE_PARAMS{}),
 							nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM:                               ioctlInfo("NV208F_CTRL_CMD_GPU_VERIFY_INFOROM", nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}),
@@ -718,8 +801,10 @@ func Init() {
 							nvgpu.NV01_CONTEXT_DMA:           ioctlInfo("NV01_CONTEXT_DMA", nvgpu.NV_CONTEXT_DMA_ALLOCATION_PARAMS{}),
 							nvgpu.NV01_MEMORY_SYSTEM:         ioctlInfo("NV01_MEMORY_SYSTEM", nvgpu.NV_MEMORY_ALLOCATION_PARAMS{}),
 							nvgpu.NV01_MEMORY_LOCAL_USER:     ioctlInfo("NV01_MEMORY_LOCAL_USER", nvgpu.NV_MEMORY_ALLOCATION_PARAMS{}),
+							nvgpu.NV01_MEMORY_DEVICELESS:     ioctlInfo("NV01_MEMORY_DEVICELESS", nvgpu.NV_MEMORY_ALLOCATION_PARAMS{}),
 							nvgpu.NV01_ROOT_CLIENT:           ioctlInfoWithStructName("NV01_ROOT_CLIENT", nvgpu.Handle{}, "NvHandle"),
 							nvgpu.NV01_EVENT_OS_EVENT:        ioctlInfo("NV01_EVENT_OS_EVENT", nvgpu.NV0005_ALLOC_PARAMETERS{}),
+							nvgpu.NV_EVENT_BUFFER:            ioctlInfo("NV_EVENT_BUFFER", nvgpu.NV_EVENT_BUFFER_ALLOC_PARAMETERS{}),
 							nvgpu.NV01_MEMORY_VIRTUAL:        ioctlInfo("NV01_MEMORY_VIRTUAL", nvgpu.NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS{}),
 							nvgpu.NV01_DEVICE_0:              ioctlInfo("NV01_DEVICE_0", nvgpu.NV0080_ALLOC_PARAMETERS{}),
 							nvgpu.NV_SEMAPHORE_SURFACE:       ioctlInfo("NV_SEMAPHORE_SURFACE", nvgpu.NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS{}),
@@ -766,6 +851,7 @@ func Init() {
 							nvgpu.HOPPER_CHANNEL_GPFIFO_A:    ioctlInfo("HOPPER_CHANNEL_GPFIFO_A", nvgpu.NV_CHANNEL_ALLOC_PARAMS{}),
 							nvgpu.TURING_A:                   ioctlInfo("TURING_A", nvgpu.NV_GR_ALLOCATION_PARAMETERS{}),
 							nvgpu.AMPERE_A:                   ioctlInfo("AMPERE_A", nvgpu.NV_GR_ALLOCATION_PARAMETERS{}),
+							nvgpu.AMPERE_B:                   ioctlInfo("AMPERE_B", nvgpu.NV_GR_ALLOCATION_PARAMETERS{}),
 							nvgpu.ADA_A:                      ioctlInfo("ADA_A", nvgpu.NV_GR_ALLOCATION_PARAMETERS{}),
 							nvgpu.HOPPER_A:                   ioctlInfo("HOPPER_A", nvgpu.NV_GR_ALLOCATION_PARAMETERS{}),
 							nvgpu.TURING_DMA_COPY_A:          ioctlInfo("TURING_DMA_COPY_A", nvgpu.NVB0B5_ALLOCATION_PARAMETERS{}),
@@ -785,6 +871,7 @@ func Init() {
 							nvgpu.NV04_DISPLAY_COMMON:        simpleIoctlInfo("NV04_DISPLAY_COMMON"),       // No params
 							nvgpu.NV20_SUBDEVICE_DIAG:        simpleIoctlInfo("NV20_SUBDEVICE_DIAG"),       // No params
 						},
+						UvmConstants: map[string]uint64{},
 					}
 				},
 			}
@@ -814,6 +901,7 @@ func Init() {
 			abi.allocationClass[nvgpu.NV_MEMORY_MULTICAST_FABRIC] = allocHandler(rmAllocMulticastFabric[nvgpu.NV00FD_ALLOCATION_PARAMETERS_V545], compUtil)
 			abi.allocationClass[nvgpu.NV01_MEMORY_SYSTEM] = allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545], compUtil)
 			abi.allocationClass[nvgpu.NV01_MEMORY_LOCAL_USER] = allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545], compUtil)
+			abi.allocationClass[nvgpu.NV01_MEMORY_DEVICELESS] = allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545], compUtil)
 			abi.allocationClass[nvgpu.NV50_MEMORY_VIRTUAL] = allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545], compUtil)
 			abi.allocationClass[nvgpu.NVB8FA_VIDEO_OFA] = allocHandler(rmAllocSimple[nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545], nvconf.CapVideo)
 			abi.allocationClass[nvgpu.NVC6FA_VIDEO_OFA] = allocHandler(rmAllocSimple[nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545], nvconf.CapVideo)
@@ -831,6 +919,7 @@ func Init() {
 				info.AllocationInfos[nvgpu.NV_MEMORY_MULTICAST_FABRIC] = ioctlInfoWithStructName("NV_MEMORY_MULTICAST_FABRIC", nvgpu.NV00FD_ALLOCATION_PARAMETERS_V545{}, "NV00FD_ALLOCATION_PARAMETERS")
 				info.AllocationInfos[nvgpu.NV01_MEMORY_SYSTEM] = ioctlInfoWithStructName("NV01_MEMORY_SYSTEM", nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545{}, "NV_MEMORY_ALLOCATION_PARAMS")
 				info.AllocationInfos[nvgpu.NV01_MEMORY_LOCAL_USER] = ioctlInfoWithStructName("NV01_MEMORY_LOCAL_USER", nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545{}, "NV_MEMORY_ALLOCATION_PARAMS")
+				info.AllocationInfos[nvgpu.NV01_MEMORY_DEVICELESS] = ioctlInfoWithStructName("NV01_MEMORY_DEVICELESS", nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545{}, "NV_MEMORY_ALLOCATION_PARAMS")
 				info.AllocationInfos[nvgpu.NV50_MEMORY_VIRTUAL] = ioctlInfoWithStructName("NV50_MEMORY_VIRTUAL", nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545{}, "NV_MEMORY_ALLOCATION_PARAMS")
 				info.AllocationInfos[nvgpu.NVB8FA_VIDEO_OFA] = ioctlInfoWithStructName("NVB8FA_VIDEO_OFA", nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545{}, "NV_OFA_ALLOCATION_PARAMETERS")
 				info.AllocationInfos[nvgpu.NVC6FA_VIDEO_OFA] = ioctlInfoWithStructName("NVC6FA_VIDEO_OFA", nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545{}, "NV_OFA_ALLOCATION_PARAMETERS")
@@ -859,6 +948,7 @@ func Init() {
 			abi.controlCmd[nvgpu.NV00FD_CTRL_CMD_SET_FAILURE] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS] = ctrlHandler(ctrlClientSystemGetP2PCapsV550, compUtil)
+			abi.controlCmd[nvgpu.NV00FE_CTRL_CMD_SUBMIT_OPERATIONS] = ctrlHandler(rmControlSimple, compUtil)
 			abi.uvmIoctl[nvgpu.UVM_SET_PREFERRED_LOCATION] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_SET_PREFERRED_LOCATION_PARAMS_V550], compUtil)
 			abi.uvmIoctl[nvgpu.UVM_MIGRATE] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_MIGRATE_PARAMS_V550], compUtil)
 			abi.allocationClass[nvgpu.NV_IMEX_SESSION] = allocHandler(rmAllocIMEXSession, nvconf.CapFabricIMEXManagement)
@@ -883,6 +973,7 @@ func Init() {
 				info.ControlInfos[nvgpu.NV00FD_CTRL_CMD_SET_FAILURE] = simpleIoctlInfo("NV00FD_CTRL_CMD_SET_FAILURE", "NV00FD_CTRL_SET_FAILURE_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE] = simpleIoctlInfo("NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE", "NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS")
 				info.ControlInfos[nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS] = ioctlInfoWithStructName("NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS", nvgpu.NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS_V550{}, "NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS")
+				info.ControlInfos[nvgpu.NV00FE_CTRL_CMD_SUBMIT_OPERATIONS] = simpleIoctlInfo("NV00FE_CTRL_CMD_SUBMIT_OPERATIONS", "NV00FE_CTRL_SUBMIT_OPERATIONS_PARAMS")
 				info.UvmInfos[nvgpu.UVM_SET_PREFERRED_LOCATION] = ioctlInfoWithStructName("UVM_SET_PREFERRED_LOCATION", nvgpu.UVM_SET_PREFERRED_LOCATION_PARAMS_V550{}, "UVM_SET_PREFERRED_LOCATION_PARAMS")
 				info.UvmInfos[nvgpu.UVM_MIGRATE] = ioctlInfoWithStructName("UVM_MIGRATE", nvgpu.UVM_MIGRATE_PARAMS_V550{}, "UVM_MIGRATE_PARAMS")
 				info.AllocationInfos[nvgpu.NV_IMEX_SESSION] = ioctlInfo("NV_IMEX_SESSION", nvgpu.NV00F1_ALLOCATION_PARAMETERS{})
@@ -932,11 +1023,15 @@ func Init() {
 		v555_42_02 := addUnsupportedDriverABI(555, 42, 02, func() *driverABI {
 			abi := v550_90_07()
 			abi.allocationClass[nvgpu.NV_MEMORY_MAPPER] = allocHandler(rmAllocSimple[nvgpu.NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V555], nvconf.CapVideo)
+			abi.controlCmd[nvgpu.NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
+			abi.controlCmd[nvgpu.NV00FE_CTRL_CMD_RESIZE_QUEUE] = ctrlHandler(rmControlSimple, compUtil)
 			delete(abi.controlCmd, nvgpu.NVC36F_CTRL_GET_CLASS_ENGINEID)
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
 				info.AllocationInfos[nvgpu.NV_MEMORY_MAPPER] = ioctlInfoWithStructName("NV_MEMORY_MAPPER", nvgpu.NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V555{}, "NV_MEMORY_MAPPER_ALLOCATION_PARAMS")
+				info.ControlInfos[nvgpu.NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME] = simpleIoctlInfo("NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME", "NV90E7_CTRL_BBX_GET_LAST_FLUSH_TIME_PARAMS")
+				info.ControlInfos[nvgpu.NV00FE_CTRL_CMD_RESIZE_QUEUE] = simpleIoctlInfo("NV00FE_CTRL_CMD_RESIZE_QUEUE", "NV00FE_CTRL_RESIZE_QUEUE_PARAMS")
 				delete(info.ControlInfos, nvgpu.NVC36F_CTRL_GET_CLASS_ENGINEID)
 				return info
 			}
@@ -957,6 +1052,9 @@ func Init() {
 			abi.controlCmd[nvgpu.NV_SEMAPHORE_SURFACE_CTRL_CMD_UNBIND_CHANNEL] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_PLATFORM_INFO] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_BUS_GET_PCIE_CPL_ATOMICS_CAPS] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
+			abi.controlCmd[nvgpu.NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL] = ctrlHandler(rmControlSimple, nvconf.CapProfiling)
+			abi.controlCmd[nvgpu.NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING] = ctrlHandler(rmControlSimple, nvconf.CapProfiling)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_CE_GET_LCE_SHIM_INFO] = ctrlHandler(rmControlSimple, compUtil)
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
@@ -971,6 +1069,9 @@ func Init() {
 				info.ControlInfos[nvgpu.NV_SEMAPHORE_SURFACE_CTRL_CMD_UNBIND_CHANNEL] = simpleIoctlInfo("NV_SEMAPHORE_SURFACE_CTRL_CMD_UNBIND_CHANNEL", "NV_SEMAPHORE_SURFACE_CTRL_UNBIND_CHANNEL_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_PLATFORM_INFO] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_PLATFORM_INFO", "NV2080_CTRL_NVLINK_GET_PLATFORM_INFO_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_BUS_GET_PCIE_CPL_ATOMICS_CAPS] = simpleIoctlInfo("NV2080_CTRL_CMD_BUS_GET_PCIE_CPL_ATOMICS_CAPS", "NV2080_CTRL_CMD_BUS_GET_PCIE_CPL_ATOMICS_CAPS_PARAMS")
+				info.ControlInfos[nvgpu.NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL] = simpleIoctlInfo("NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL", "NVB0CC_CTRL_GET_CHIPLET_HS_CREDIT_POOL")
+				info.ControlInfos[nvgpu.NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING] = simpleIoctlInfo("NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING", "NVB0CC_CTRL_GET_HS_CREDITS_POOL_MAPPING_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_CE_GET_LCE_SHIM_INFO] = simpleIoctlInfo("NV2080_CTRL_CMD_CE_GET_LCE_SHIM_INFO", "NV2080_CTRL_CE_GET_LCE_SHIM_INFO_PARAMS")
 				return info
 			}
 			return abi
@@ -980,10 +1081,42 @@ func Init() {
 		v565_57_01 := addUnsupportedDriverABI(565, 57, 01, func() *driverABI {
 			abi := v560_28_03()
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GPU_GET_RECOVERY_ACTION] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
+			abi.allocationClass[nvgpu.MAXWELL_PROFILER_CONTEXT] = allocHandler(rmAllocSimple[nvgpu.NVB1CC_ALLOC_PARAMETERS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER] = uvmHandler(uvmToolsInitEventTracker, nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_ENABLE_COUNTERS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_DISABLE_COUNTERS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE] = uvmHandler(uvmToolsGetProcessorUUIDTable, nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_FLUSH_EVENTS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_FLUSH_EVENTS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_V2] = uvmHandler(uvmToolsInitEventTracker, nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2] = uvmHandler(uvmToolsGetProcessorUUIDTable, nvconf.CapProfiling)
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.UvmInfos[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER] = ioctlInfo("UVM_TOOLS_INIT_EVENT_TRACKER", nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_PARAMS{}, nvgpu.UvmEventEntry{}, nvgpu.UvmToolsEventControlData{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD] = ioctlInfo("UVM_TOOLS_SET_NOTIFICATION_THRESHOLD", nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD_PARAMS{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS] = ioctlInfoWithStructName("UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS] = ioctlInfoWithStructName("UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_ENABLE_COUNTERS] = ioctlInfoWithStructName("UVM_TOOLS_ENABLE_COUNTERS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_ENABLE_COUNTERS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_DISABLE_COUNTERS] = ioctlInfoWithStructName("UVM_TOOLS_DISABLE_COUNTERS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_DISABLE_COUNTERS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE] = ioctlInfo("UVM_TOOLS_GET_PROCESSOR_UUID_TABLE", nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_PARAMS{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_FLUSH_EVENTS] = ioctlInfo("UVM_TOOLS_FLUSH_EVENTS", nvgpu.UVM_TOOLS_FLUSH_EVENTS_PARAMS{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_V2] = IoctlInfo{
+					Name: "UVM_TOOLS_INIT_EVENT_TRACKER_V2",
+					Structs: []DriverStruct{
+						newDriverStruct(reflect.TypeFor[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_PARAMS](), "UVM_TOOLS_INIT_EVENT_TRACKER_V2_PARAMS"),
+						newDriverStruct(reflect.TypeFor[nvgpu.UvmEventEntry_V2](), "UvmEventEntry_V2"),
+						newDriverStruct(reflect.TypeFor[nvgpu.UvmToolsEventControlData](), "UvmToolsEventControlData"),
+					},
+				}
+				info.UvmInfos[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2] = ioctlInfoWithStructName("UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2", nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_PARAMS{}, "UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2_PARAMS")
+				info.UvmConstants["UVM_TOTAL_COUNTERS"] = nvgpu.UVM_TOTAL_COUNTERS
+				info.UvmConstants["UVM_MAX_PROCESSORS_V1"] = nvgpu.UVM_MAX_PROCESSORS_V1
+				info.UvmConstants["UVM_MAX_PROCESSORS"] = nvgpu.UVM_MAX_PROCESSORS
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_GPU_GET_RECOVERY_ACTION] = simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_RECOVERY_ACTION", "NV2080_CTRL_GPU_GET_RECOVERY_ACTION_PARAMS")
+				info.AllocationInfos[nvgpu.MAXWELL_PROFILER_CONTEXT] = ioctlInfo("MAXWELL_PROFILER_CONTEXT", nvgpu.NVB1CC_ALLOC_PARAMETERS{})
 				return info
 			}
 			return abi
@@ -991,10 +1124,12 @@ func Init() {
 
 		v570_86_15 := addUnsupportedDriverABI(570, 86, 15, func() *driverABI {
 			abi := v565_57_01()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_EVENT_SET_TRIGGER_FIFO] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NVB0CC_CTRL_CMD_RESERVE_CCU_PROF] = ctrlHandler(rmControlSimple, nvconf.CapProfiling)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_PENDING_CONFIGURATION] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
+			abi.controlCmd[nvgpu.NV0090_CTRL_CMD_SET_LG_SECTOR_PROMOTION] = ctrlHandler(rmControlSimple, compUtil)
 			abi.allocationClass[nvgpu.TURING_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 			abi.allocationClass[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 			abi.allocationClass[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
@@ -1005,13 +1140,20 @@ func Init() {
 			abi.allocationClass[nvgpu.BLACKWELL_COMPUTE_B] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], compUtil)
 			abi.allocationClass[nvgpu.BLACKWELL_USERMODE_A] = allocHandler(rmAllocSimple[nvgpu.NV_HOPPER_USERMODE_A_PARAMS], compUtil)
 			abi.allocationClass[nvgpu.NVCFB7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVCFB0_VIDEO_DECODER] = allocHandler(rmAllocSimple[nvgpu.NV_BSP_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVCFD1_VIDEO_NVJPG] = allocHandler(rmAllocSimple[nvgpu.NV_NVJPG_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVCFFA_VIDEO_OFA] = allocHandler(rmAllocSimple[nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545], nvconf.CapVideo)
+			abi.frontendIoctl[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = feHandler(frontendExportToDMABufFD[nvgpu.IoctlExportToDMABufFD_V570], nvconf.CapRDMA)
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.FrontendInfos[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = ioctlInfoWithStructName("NV_ESC_EXPORT_TO_DMABUF_FD", nvgpu.IoctlExportToDMABufFD_V570{}, "nv_ioctl_export_to_dma_buf_fd_t")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_EVENT_SET_TRIGGER_FIFO] = simpleIoctlInfo("NV2080_CTRL_CMD_EVENT_SET_TRIGGER_FIFO", "NV2080_CTRL_EVENT_SET_TRIGGER_FIFO_PARAMS")
 				info.ControlInfos[nvgpu.NVB0CC_CTRL_CMD_RESERVE_CCU_PROF] = simpleIoctlInfo("NVB0CC_CTRL_CMD_RESERVE_CCU_PROF", "NVB0CC_CTRL_RESERVE_CCUPROF_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT", "NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS", "NV2080_CTRL_FB_QUERY_DRAM_ENCRYPTION_STATUS_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_PENDING_CONFIGURATION] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_PENDING_CONFIGURATION", "NV2080_CTRL_FB_QUERY_DRAM_ENCRYPTION_PENDING_CONFIGURATION_PARAMS")
+				info.ControlInfos[nvgpu.NV0090_CTRL_CMD_SET_LG_SECTOR_PROMOTION] = simpleIoctlInfo("NV0090_CTRL_CMD_SET_LG_SECTOR_PROMOTION", "NV0090_CTRL_SET_LG_SECTOR_PROMOTION_PARAMS")
 				info.AllocationInfos[nvgpu.TURING_CHANNEL_GPFIFO_A] = ioctlInfoWithStructName("TURING_CHANNEL_GPFIFO_A", nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				info.AllocationInfos[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = ioctlInfoWithStructName("AMPERE_CHANNEL_GPFIFO_A", nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				info.AllocationInfos[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = ioctlInfoWithStructName("HOPPER_CHANNEL_GPFIFO_A", nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
@@ -1022,6 +1164,9 @@ func Init() {
 				info.AllocationInfos[nvgpu.BLACKWELL_COMPUTE_B] = ioctlInfo("BLACKWELL_COMPUTE_B", nvgpu.NV_GR_ALLOCATION_PARAMETERS{})
 				info.AllocationInfos[nvgpu.BLACKWELL_USERMODE_A] = ioctlInfo("BLACKWELL_USERMODE_A", nvgpu.NV_HOPPER_USERMODE_A_PARAMS{})
 				info.AllocationInfos[nvgpu.NVCFB7_VIDEO_ENCODER] = ioctlInfo("NVCFB7_VIDEO_ENCODER", nvgpu.NV_MSENC_ALLOCATION_PARAMETERS{})
+				info.AllocationInfos[nvgpu.NVCFB0_VIDEO_DECODER] = ioctlInfo("NVCFB0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{})
+				info.AllocationInfos[nvgpu.NVCFD1_VIDEO_NVJPG] = ioctlInfo("NVCFD1_VIDEO_NVJPG", nvgpu.NV_NVJPG_ALLOCATION_PARAMETERS{})
+				info.AllocationInfos[nvgpu.NVCFFA_VIDEO_OFA] = ioctlInfoWithStructName("NVCFFA_VIDEO_OFA", nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545{}, "NV_OFA_ALLOCATION_PARAMETERS")
 				return info
 			}
 			return abi
@@ -1043,6 +1188,7 @@ func Init() {
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT_V575] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS_V575] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2] = ctrlHandler(rmControlSimple, compUtil)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER_V2] = ctrlHandler(rmControlSimple, compUtil)
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
@@ -1051,6 +1197,7 @@ func Init() {
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT_V575] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT", "NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS_V575] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS", "NV2080_CTRL_FB_QUERY_DRAM_ENCRYPTION_STATUS_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2] = simpleIoctlInfo("NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2", "NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER_V2] = simpleIoctlInfo("NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER_V2", "NV2080_CTRL_GR_GET_SM_ISSUE_RATE_MODIFIER_V2_PARAMS")
 				return info
 			}
 			return abi
@@ -1062,31 +1209,59 @@ func Init() {
 			abi.allocationClass[nvgpu.FERMI_VASPACE_A] = allocHandler(rmAllocSimple[nvgpu.NV_VASPACE_ALLOCATION_PARAMETERS_V580], compUtil)
 			abi.allocationClass[nvgpu.NVCEB7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)
 			abi.allocationClass[nvgpu.NVD1B7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVCEB0_VIDEO_DECODER] = allocHandler(rmAllocSimple[nvgpu.NV_BSP_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVD1B0_VIDEO_DECODER] = allocHandler(rmAllocSimple[nvgpu.NV_BSP_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVCEFA_VIDEO_OFA] = allocHandler(rmAllocSimple[nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVD1FA_VIDEO_OFA] = allocHandler(rmAllocSimple[nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545], nvconf.CapVideo)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GPU_GET_SKYLINE_INFO] = ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_ECC_GET_REPAIR_STATUS] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GR_GET_SM_ISSUE_THROTTLE_CTRL] = ctrlHandler(rmControlSimple, nvconf.CapProfiling)
+			abi.frontendIoctl[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = feHandler(frontendExportToDMABufFD[nvgpu.IoctlExportToDMABufFD_V580], nvconf.CapRDMA)
 
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.FrontendInfos[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = ioctlInfoWithStructName("NV_ESC_EXPORT_TO_DMABUF_FD", nvgpu.IoctlExportToDMABufFD_V580{}, "nv_ioctl_export_to_dma_buf_fd_t")
 				info.FrontendInfos[nvgpu.NV_ESC_RM_MAP_MEMORY_DMA] = ioctlInfoWithStructName("NV_ESC_RM_MAP_MEMORY_DMA", nvgpu.NVOS46_PARAMETERS_V580{}, "NVOS46_PARAMETERS")
 				info.AllocationInfos[nvgpu.FERMI_VASPACE_A] = ioctlInfoWithStructName("FERMI_VASPACE_A", nvgpu.NV_VASPACE_ALLOCATION_PARAMETERS_V580{}, "NV_VASPACE_ALLOCATION_PARAMETERS")
 				info.AllocationInfos[nvgpu.NVCEB7_VIDEO_ENCODER] = ioctlInfo("NVCEB7_VIDEO_ENCODER", nvgpu.NV_MSENC_ALLOCATION_PARAMETERS{})
 				info.AllocationInfos[nvgpu.NVD1B7_VIDEO_ENCODER] = ioctlInfo("NVD1B7_VIDEO_ENCODER", nvgpu.NV_MSENC_ALLOCATION_PARAMETERS{})
+				info.AllocationInfos[nvgpu.NVCEB0_VIDEO_DECODER] = ioctlInfo("NVCEB0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{})
+				info.AllocationInfos[nvgpu.NVD1B0_VIDEO_DECODER] = ioctlInfo("NVD1B0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{})
+				info.AllocationInfos[nvgpu.NVCEFA_VIDEO_OFA] = ioctlInfoWithStructName("NVCEFA_VIDEO_OFA", nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545{}, "NV_OFA_ALLOCATION_PARAMETERS")
+				info.AllocationInfos[nvgpu.NVD1FA_VIDEO_OFA] = ioctlInfoWithStructName("NVD1FA_VIDEO_OFA", nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545{}, "NV_OFA_ALLOCATION_PARAMETERS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_GPU_GET_SKYLINE_INFO] = simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_SKYLINE_INFO", "NV2080_CTRL_GPU_GET_SKYLINE_INFO_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_ECC_GET_REPAIR_STATUS] = simpleIoctlInfo("NV2080_CTRL_CMD_ECC_GET_REPAIR_STATUS", "NV2080_CTRL_ECC_GET_REPAIR_STATUS_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_GR_GET_SM_ISSUE_THROTTLE_CTRL] = simpleIoctlInfo("NV2080_CTRL_CMD_GR_GET_SM_ISSUE_THROTTLE_CTRL", "NV2080_CTRL_GR_GET_SM_ISSUE_THROTTLE_CTRL_PARAMS")
 				return info
 			}
 			return abi
 		})
 
-		v580_105_08 := addDriverABI(580, 105, 8, "d9c6e8188672f3eb74dd04cfa69dd58479fa1d0162c8c28c8d17625763293475", ChecksumNoDriver, v580_65_06)
+		v580_95_05 := addUnsupportedDriverABI(580, 95, 05, v580_65_06)
+		v580_105_08 := addDriverABI(580, 105, 8, "d9c6e8188672f3eb74dd04cfa69dd58479fa1d0162c8c28c8d17625763293475", ChecksumNoDriver, v580_95_05)
 
 		// The following versions exist on the "580" branch, which was branched
 		// from the main branch at 580.105.08.
 		v580_126_09 := addDriverABI(580, 126, 9, "4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26", "7393c42b112fd6f0a498e1d2a33127b821be58b7570dc9f8d5589a51688da4ad", v580_105_08)
 		v580_126_20 := addDriverABI(580, 126, 20, "a055dbeae72438f20335b41929a060148c82c69d2147c0d922660e8c5a265eb1", ChecksumNoDriver, v580_126_09)
 		v580_159_03 := addDriverABI(580, 159, 03, "32c85d99b0f640c9501f61b39ddad208fd0288d015c4fbc5fd0435c07783fa77", "545445863f84183f4d4769bd35cc00dde269d97f7923d6dff2031b7b52a907d8", v580_126_20)
-		_ = addDriverABI(580, 159, 04, "c1e66761b088d17b3adf6cb6979de9af38be2684d102b001a176dcfafabdca1e", "8912f2623bc7c839765f36fcee3db4a3531834a2caff3aa5d49c1259b2372aeb", v580_159_03)
+		v580_159_04 := addDriverABI(580, 159, 04, "c1e66761b088d17b3adf6cb6979de9af38be2684d102b001a176dcfafabdca1e", "8912f2623bc7c839765f36fcee3db4a3531834a2caff3aa5d49c1259b2372aeb", v580_159_03)
+		v580_167_08 := addDriverABI(580, 167, 8, "eeaf59b4939aa7283e7883e208fb874a3f71f5a3479df324d500d1abf1bc9cef", ChecksumNoDriver, v580_159_04)
+		v580_173_02 := addDriverABI(580, 173, 02, "8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b", "d65bd56087ef4d78f04a808da7883c35a5901c5fd37e95d150a7602eba97aa80", v580_167_08)
+		v580_173_10 := addDriverABIWithChecksums(580, 173, 10, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "01756a4a5a239e07be1a042ef423829fc0dd66f3688e72060f97ae527f353000",
+			NoPublicARM64Installer: true,
+		}, v580_173_02)
+		// Drivers only handle the application-provided flags and attributes of
+		// NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR safely starting with 580.178.04 in
+		// the 580 branch and 610.57.04 in the 610 branch.
+		_ = addDriverABI(580, 178, 04, "5975a86ee45bffcb626f51ae33d1169b108186a2ea47ad651e72f13fa4b6d6f9", "ef59ec5d24850e12d6f7550ec1f7cf84db53a84ce9c63eb3ba55ef5ed0c4f049", func() *driverABI {
+			abi := v580_173_10()
+			abi.frontendIoctl[nvgpu.NV_ESC_RM_VID_HEAP_CONTROL] = feHandler(rmVidHeapControlWithOSDescriptor, compUtil)
+			return abi
+		})
 
 		v590_44_01 := addUnsupportedDriverABI(590, 44, 01, func() *driverABI {
 			abi := v580_105_08()
@@ -1094,6 +1269,7 @@ func Init() {
 			abi.uvmIoctl[nvgpu.UVM_FREE] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_FREE_PARAMS_V590], compUtil)
 			abi.allocationClass[nvgpu.NV50_P2P] = allocHandler(rmAllocSimple[nvgpu.NV503B_ALLOC_PARAMETERS_V590], compUtil)
 			abi.allocationClass[nvgpu.NV_MEMORY_MULTICAST_FABRIC] = allocHandler(rmAllocMulticastFabric[nvgpu.NV00FD_ALLOCATION_PARAMETERS_V590], compUtil)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_GET_UGPU_MEMORY_INFO] = ctrlHandler(rmControlSimple, compUtil)
 
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
@@ -1102,6 +1278,7 @@ func Init() {
 				info.UvmInfos[nvgpu.UVM_FREE] = ioctlInfoWithStructName("UVM_FREE", nvgpu.UVM_FREE_PARAMS_V590{}, "UVM_FREE_PARAMS")
 				info.AllocationInfos[nvgpu.NV50_P2P] = ioctlInfoWithStructName("NV50_P2P", nvgpu.NV503B_ALLOC_PARAMETERS_V590{}, "NV503B_ALLOC_PARAMETERS")
 				info.AllocationInfos[nvgpu.NV_MEMORY_MULTICAST_FABRIC] = ioctlInfoWithStructName("NV_MEMORY_MULTICAST_FABRIC", nvgpu.NV00FD_ALLOCATION_PARAMETERS_V590{}, "NV00FD_ALLOCATION_PARAMETERS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_GET_UGPU_MEMORY_INFO] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_GET_UGPU_MEMORY_INFO", "NV2080_CTRL_FB_GET_UGPU_MEMORY_INFO_PARAMS")
 				return info
 			}
 			return abi
@@ -1123,6 +1300,10 @@ func Init() {
 			abi.allocationClass[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV610, compUtil)
 			abi.allocationClass[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV610, compUtil)
 			abi.allocationClass[nvgpu.BLACKWELL_CHANNEL_GPFIFO_B] = allocHandler(rmAllocChannelV610, compUtil)
+			abi.allocationClass[nvgpu.NVD2B0_VIDEO_DECODER] = allocHandler(rmAllocSimple[nvgpu.NV_BSP_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVD2D1_VIDEO_NVJPG] = allocHandler(rmAllocSimple[nvgpu.NV_NVJPG_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NVD2FA_VIDEO_OFA] = allocHandler(rmAllocSimple[nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545], nvconf.CapVideo)
+			abi.controlCmd[nvgpu.NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS] = ctrlHandler(ctrlOsUnixMemacctGetLimits, compUtil)
 
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
@@ -1137,6 +1318,9 @@ func Init() {
 				info.AllocationInfos[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = ioctlInfoWithStructName("HOPPER_CHANNEL_GPFIFO_A", nvgpu.NV_CHANNEL_ALLOC_PARAMS_V610{}, "NV_CHANNEL_ALLOC_PARAMS")
 				info.AllocationInfos[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = ioctlInfoWithStructName("BLACKWELL_CHANNEL_GPFIFO_A", nvgpu.NV_CHANNEL_ALLOC_PARAMS_V610{}, "NV_CHANNEL_ALLOC_PARAMS")
 				info.AllocationInfos[nvgpu.BLACKWELL_CHANNEL_GPFIFO_B] = ioctlInfoWithStructName("BLACKWELL_CHANNEL_GPFIFO_B", nvgpu.NV_CHANNEL_ALLOC_PARAMS_V610{}, "NV_CHANNEL_ALLOC_PARAMS")
+				info.AllocationInfos[nvgpu.NVD2D1_VIDEO_NVJPG] = ioctlInfo("NVD2D1_VIDEO_NVJPG", nvgpu.NV_NVJPG_ALLOCATION_PARAMETERS{})
+				info.AllocationInfos[nvgpu.NVD2FA_VIDEO_OFA] = ioctlInfoWithStructName("NVD2FA_VIDEO_OFA", nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545{}, "NV_OFA_ALLOCATION_PARAMETERS")
+				info.ControlInfos[nvgpu.NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS] = ioctlInfo("NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS", nvgpu.NV0000_CTRL_OS_UNIX_MEMACCT_GET_LIMITS_PARAMS{})
 
 				// BSP/MSENC structs were renamed to NVDEC/NVENC in 610.43.02.
 
@@ -1156,13 +1340,119 @@ func Init() {
 				info.AllocationInfos[nvgpu.NVC7B0_VIDEO_DECODER] = ioctlInfoWithStructName("NVC7B0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{}, "NV_NVDEC_ALLOCATION_PARAMETERS")
 				info.AllocationInfos[nvgpu.NVC9B0_VIDEO_DECODER] = ioctlInfoWithStructName("NVC9B0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{}, "NV_NVDEC_ALLOCATION_PARAMETERS")
 				info.AllocationInfos[nvgpu.NVCDB0_VIDEO_DECODER] = ioctlInfoWithStructName("NVCDB0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{}, "NV_NVDEC_ALLOCATION_PARAMETERS")
+				info.AllocationInfos[nvgpu.NVCEB0_VIDEO_DECODER] = ioctlInfoWithStructName("NVCEB0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{}, "NV_NVDEC_ALLOCATION_PARAMETERS")
+				info.AllocationInfos[nvgpu.NVCFB0_VIDEO_DECODER] = ioctlInfoWithStructName("NVCFB0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{}, "NV_NVDEC_ALLOCATION_PARAMETERS")
+				info.AllocationInfos[nvgpu.NVD1B0_VIDEO_DECODER] = ioctlInfoWithStructName("NVD1B0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{}, "NV_NVDEC_ALLOCATION_PARAMETERS")
+				info.AllocationInfos[nvgpu.NVD2B0_VIDEO_DECODER] = ioctlInfoWithStructName("NVD2B0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{}, "NV_NVDEC_ALLOCATION_PARAMETERS")
+				return info
+			}
+			return abi
+		})
+		v610_57_04 := addDriverABI(610, 57, 04, "b2e935c66b83bb00c0c857bc8e0ee0fd52de9286b40c9cc1eec29a7ce7eb116d", "40279facc0429a93b0b8ec97bf59391a3d2207609894f8271b7253a14c3f8f9e", func() *driverABI {
+			abi := v610_43_02()
+			abi.frontendIoctl[nvgpu.NV_ESC_RM_VID_HEAP_CONTROL] = feHandler(rmVidHeapControlWithOSDescriptor, compUtil)
+			return abi
+		})
 
+		// 615.15.00 and 615.62.00 are pre-release builds without public source.
+		// 615.71.09's ABI changes likely apply to them too, but are only
+		// introduced at 615.71.09 until that can be verified.
+		v615_15_00 := addDriverABIWithChecksums(615, 15, 00, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "d5a40daa72e011395721f2a3de8598b77c3271eec057948de9b3d1755d8d02bc",
+			NoPublicARM64Installer: true,
+		}, v610_57_04)
+		v615_62_00 := addDriverABIWithChecksums(615, 62, 00, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "2f59d8a7b8901269e8df57e9ab968d4749959bf0a90a8637f248b1df8c4a2fdc",
+			NoPublicARM64Installer: true,
+		}, v615_15_00)
+		v615_71_09 := addDriverABI(615, 71, 9, "cdceed22bbeb61248d1a6deabc2596673e3a6501698ee71ac8d2fdc28f3b70fe", "21b7a442113b7057e69cf65a2d8f4d0d8705ec2a0d67ed906fbb1177810e8163", func() *driverABI {
+			abi := v615_62_00()
+			abi.allocationClass[nvgpu.KEPLER_CHANNEL_GROUP_A] = allocHandler(rmAllocChannelGroupV615, compUtil)
+			abi.controlCmd[nvgpu.NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_IMPL] = ctrlHandler(rmControlSimple, compUtil)
+
+			prevGetInfo := abi.getInfo
+			abi.getInfo = func() *DriverABIInfo {
+				info := prevGetInfo()
+				info.AllocationInfos[nvgpu.KEPLER_CHANNEL_GROUP_A] = ioctlInfoWithStructName("KEPLER_CHANNEL_GROUP_A", nvgpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V615{}, "NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS")
+				info.ControlInfos[nvgpu.NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_IMPL] = simpleIoctlInfo("NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_IMPL", "NV0000_CTRL_OS_UNIX_MEMACCT_GET_IMPL_PARAMS")
 				return info
 			}
 			return abi
 		})
 
-		_ = addDriverABI(615, 15, 00, ChecksumNoDriver, "d5a40daa72e011395721f2a3de8598b77c3271eec057948de9b3d1755d8d02bc", v610_43_02)
+		v620_06_00 := addDriverABIWithChecksums(620, 6, 0, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "95b94e43fd0cb0fb409fd523be491ac7248fec6d1cf82543fa4119cdcbad05b3",
+			NoPublicARM64Installer: true,
+		}, func() *driverABI {
+			abi := v615_71_09()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V3] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+
+			prevGetInfo := abi.getInfo
+			abi.getInfo = func() *DriverABIInfo {
+				info := prevGetInfo()
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE", "NV2080_CTRL_NVLINK_LOCK_REMAP_TABLE_AND_MSE_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY", "NV2080_CTRL_NVLINK_SETUP_NVLE_ENCRYPTION_KEY_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2] = ioctlInfo("NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2", nvgpu.NV2080_CTRL_NVLINK_GET_REMAP_TABLE_INFO_V2_PARAMS{})
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2", "NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS_V2_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V3] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V3", "NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS_V3_PARAMS")
+				return info
+			}
+			return abi
+		})
+		v620_30_00 := addDriverABIWithChecksums(620, 30, 0, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "d7f6cad7861c3b4faea8b539af72da98a5a72c60665f4779ca0c6f1e1660856d",
+			NoPublicARM64Installer: true,
+		}, func() *driverABI {
+			abi := v620_06_00()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+
+			prevGetInfo := abi.getInfo
+			abi.getInfo = func() *DriverABIInfo {
+				info := prevGetInfo()
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY", "NV2080_CTRL_NVLINK_SET_NVLE_READY_PARAMS")
+				return info
+			}
+			return abi
+		})
+		v620_32_00 := addDriverABIWithChecksums(620, 32, 00, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "48b576150f3d25219162912a4a1e457c678ab13761350ef770f6ef6e8c44483b",
+			NoPublicARM64Installer: true,
+		}, v620_30_00)
+		v620_47_00 := addDriverABIWithChecksums(620, 47, 00, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "866b5775ee3bb95c07b90252fa238b538aeabda038a0566590c16b13e16193cc",
+			NoPublicARM64Installer: true,
+		}, v620_32_00)
+		v620_51_00 := addDriverABIWithChecksums(620, 51, 0, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "cf761f39bffc561f6529171e342b5ecfdb4fabcc8dff4159f9400432bf7dc2e8",
+			NoPublicARM64Installer: true,
+		}, func() *driverABI {
+			abi := v620_47_00()
+			abi.allocationClass[nvgpu.NV_MNCC_SESSION] = allocHandler(rmAllocMNCCSession, nvconf.CapFabricIMEXManagement)
+
+			prevGetInfo := abi.getInfo
+			abi.getInfo = func() *DriverABIInfo {
+				info := prevGetInfo()
+				info.AllocationInfos[nvgpu.NV_MNCC_SESSION] = ioctlInfo("NV_MNCC_SESSION", nvgpu.NV77CC_ALLOC_PARAMETERS{})
+				return info
+			}
+			return abi
+		})
+		_ = addDriverABIWithChecksums(620, 51, 03, Checksums{
+			X86_64:                 ChecksumNoDriver,
+			ARM64:                  "7c7f4e71ec27a6c050ed3d074eda4bd3c10a0c2d3f330cd1bf9485e5265a569e",
+			NoPublicARM64Installer: true,
+		}, v620_51_00)
 	})
 }
 

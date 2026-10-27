@@ -61,8 +61,13 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.EqualTo(unix.F_GETFD),
 		},
 	},
-	unix.SYS_FSTAT:     seccomp.MatchAll{},
+	unix.SYS_FSTAT: seccomp.MatchAll{},
+	unix.SYS_FSTATFS: seccomp.PerArg{
+		seccomp.NonNegativeFD{},
+		seccomp.AnyValue{},
+	},
 	unix.SYS_FSYNC:     seccomp.MatchAll{},
+	unix.SYS_FDATASYNC: seccomp.MatchAll{},
 	unix.SYS_FTRUNCATE: seccomp.MatchAll{},
 	unix.SYS_FUTEX: seccomp.PerArg{
 		seccomp.AnyValue{},
@@ -262,6 +267,7 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_PWRITEV:  seccomp.MatchAll{},
 	unix.SYS_PWRITEV2: seccomp.MatchAll{},
 	unix.SYS_READ:     seccomp.MatchAll{},
+	unix.SYS_READV:    seccomp.MatchAll{}, // Used by TAP/TUN fdbased links.
 	unix.SYS_RECVMSG: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.AnyValue{},
@@ -429,15 +435,16 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
 		},
-		unix.SYS_FSTATFS: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.AnyValue{},
-		},
 		unix.SYS_READLINKAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
+		},
+		unix.SYS_STATX: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.AT_SYMLINK_NOFOLLOW | unix.AT_NO_AUTOMOUNT),
 		},
 		unix.SYS_UTIMENSAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},

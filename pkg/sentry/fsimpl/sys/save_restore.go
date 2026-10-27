@@ -23,10 +23,15 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
+var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
+
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
-func (fs *filesystem) PrepareSave(ctx context.Context) error {
+func (fs *filesystem) PrepareSave(ctx context.Context, _ vfs.PrepareSaveOptions) error {
 	return nil
 }
+
+// BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
+func (fs *filesystem) BeforeResume(ctx context.Context) {}
 
 // CompleteRestore implements
 // vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
@@ -40,16 +45,16 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	}
 	creds := auth.CredentialsFromContext(ctx)
 
-	if err := removeSysDir(ctx, fs.root, "class"); err != nil {
+	if err := fs.removeSysDir(ctx, "class"); err != nil {
 		return err
 	}
-	if err := removeSysDir(ctx, fs.root, "devices"); err != nil {
+	if err := fs.removeSysDir(ctx, "devices"); err != nil {
 		return err
 	}
-	if err := removeSysDir(ctx, fs.root, "bus"); err != nil {
+	if err := fs.removeSysDir(ctx, "bus"); err != nil {
 		return err
 	}
-	if err := removeSysDir(ctx, fs.root, "kernel"); err != nil {
+	if err := fs.removeSysDir(ctx, "kernel"); err != nil {
 		return err
 	}
 
@@ -63,6 +68,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	}
 	busSub := make(map[string]kernfs.Inode)
 	kernelSub := kernelDir(ctx, fs, creds)
+	fs.addDMIDirs(ctx, creds, classSub, devicesSub)
 
 	sysDevicesPath := path.Join(fs.testSysfsPathPrefix, sysDevicesMainPath)
 	iommuGroupsPath := path.Join(fs.testSysfsPathPrefix, iommuGroupSysPath)
@@ -110,10 +116,9 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	return nil
 }
 
-func removeSysDir(ctx context.Context, root *dir, name string) error {
-	dir, err := root.OrderedChildren.Lookup(ctx, name)
-	if err != nil {
-		return err
+func (fs *filesystem) removeSysDir(ctx context.Context, name string) error {
+	if rootD := fs.RootDentry(); rootD != nil {
+		rootD.InvalidateChild(ctx, name)
 	}
-	return root.OrderedChildren.RmDir(ctx, name, dir)
+	return fs.root.OrderedChildren.RemoveStatic(ctx, name)
 }

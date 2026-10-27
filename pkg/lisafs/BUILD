@@ -110,6 +110,7 @@ go_library(
         "//pkg/fdchannel",
         "//pkg/flipcall",
         "//pkg/fspath",
+        "//pkg/gomaxprocs",
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/marshal/primitive",
@@ -125,7 +126,7 @@ go_test(
     name = "sock_test",
     size = "small",
     srcs = ["sock_test.go"],
-    library = ":lisafs",
+    embed = [":lisafs"],
     deps = [
         "//pkg/marshal",
         "//pkg/rand",
@@ -152,5 +153,5 @@ go_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.go"],
-    library = ":lisafs",
+    embed = [":lisafs"],
 )

@@ -28,6 +28,7 @@ go_test(
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/loopback",
         "//pkg/tcpip/link/sniffer",
+        "//pkg/tcpip/network/arp",
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/seqnum",
@@ -150,6 +151,22 @@ go_test(
 )
 
 go_test(
+    name = "tcp_acktiming_test",
+    size = "small",
+    srcs = ["tcp_acktiming_test.go"],
+    deps = [
+        ":e2e",
+        "//pkg/refs",
+        "//pkg/tcpip",
+        "//pkg/tcpip/faketime",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/seqnum",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/tcp/testing/context",
+    ],
+)
+
+go_test(
     name = "tcp_sack_test",
     size = "small",
     srcs = ["tcp_sack_test.go"],
@@ -175,7 +192,6 @@ go_test(
     # so exclude them from gotsan runs.
     tags = ["nogotsan"],
     deps = [
-        ":e2e",
         "//pkg/refs",
         "//pkg/tcpip",
         "//pkg/tcpip/header",

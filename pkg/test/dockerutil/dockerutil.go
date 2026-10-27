@@ -91,21 +91,20 @@ func PrintDockerConfig() {
 }
 
 func getDockerVersion() (int, int) {
-	cmd := exec.Command(dockerCLIPath(), "version")
+	cmd := exec.Command(dockerCLIPath(), "version", "--format", "{{.Server.Version}}")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("error running %q: %s: %s", cmd, err, stderr.String())
 	}
-	re := regexp.MustCompile(`Version:\s+(\d+)\.(\d+)\.\d.*`)
-	stdoutStr := stdout.String()
-	matches := re.FindStringSubmatch(stdoutStr)
-	if len(matches) != 3 {
-		log.Fatalf("invalid %q output: %s", cmd, stdoutStr)
+	version := strings.TrimSpace(stdout.String())
+	parts := strings.Split(version, ".")
+	if len(parts) < 3 {
+		log.Fatalf("invalid %q output: %s", cmd, version)
 	}
-	major, _ := strconv.Atoi(matches[1])
-	minor, _ := strconv.Atoi(matches[2])
+	major, _ := strconv.Atoi(parts[0])
+	minor, _ := strconv.Atoi(parts[1])
 	return major, minor
 }
 
@@ -185,8 +184,15 @@ func RuntimeArgs() ([]string, error) {
 
 // IsGVisorRuntime returns whether the default container runtime used by
 // `dockerutil` is gVisor-based or not.
-func IsGVisorRuntime(ctx context.Context, t *testing.T) (bool, error) {
-	output, err := MakeContainer(ctx, t).Run(ctx, RunOpts{Image: "basic/alpine"}, "dmesg")
+func IsGVisorRuntime(ctx context.Context) (bool, error) {
+	if *runtime == "runc" {
+		return false, nil
+	}
+	if strings.Contains(*runtime, "runsc") {
+		return true, nil
+	}
+	logger := testutil.DefaultLogger("is-gvisor-runtime")
+	output, err := MakeContainer(ctx, logger).Run(ctx, RunOpts{Image: "basic/alpine"}, "dmesg")
 	if err != nil {
 		if strings.Contains(output, "dmesg: klogctl: Operation not permitted") {
 			return false, nil
@@ -241,6 +247,28 @@ func UsingSystemdCgroup() (bool, error) {
 	return false, nil
 }
 
+// CgroupfsParent returns the configured absolute parent for containers using the
+// cgroupfs driver, or Docker's default when no parent is configured.
+func CgroupfsParent() (string, error) {
+	data, err := os.ReadFile(*config)
+	if err != nil {
+		return "", err
+	}
+	var cfg struct {
+		Parent string `json:"cgroup-parent"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", err
+	}
+	if cfg.Parent == "" {
+		return "/docker", nil
+	}
+	if !strings.HasPrefix(cfg.Parent, "/") {
+		return "", fmt.Errorf("relative Docker cgroup parent %q requires the daemon's cgroup path", cfg.Parent)
+	}
+	return cfg.Parent, nil
+}
+
 func runtimeMap() (map[string]any, error) {
 	// Read the configuration data; the file must exist.
 	configBytes, err := os.ReadFile(*config)
@@ -293,4 +321,9 @@ func Save(logger testutil.Logger, image string, w io.Writer) error {
 // Runtime returns the value of the flag runtime.
 func Runtime() string {
 	return *runtime
+}
+
+// SetRuntime sets the value of the flag runtime.
+func SetRuntime(r string) {
+	*runtime = r
 }

@@ -50,6 +50,19 @@ func (a Arch) String() string {
 	}
 }
 
+// Platform returns the platform identifier exposed to userspace via
+// AT_PLATFORM, matching the Linux ELF_PLATFORM for the architecture.
+func (a Arch) Platform() string {
+	switch a {
+	case AMD64:
+		return "x86_64"
+	case ARM64:
+		return "aarch64"
+	default:
+		return "unknown"
+	}
+}
+
 // contextInterface provides architecture-dependent information for a thread.
 // This is currently not referenced, because there exists only one concrete
 // implementation of this interface (*Context64), which we reference directly
@@ -130,6 +143,12 @@ type contextInterface interface {
 
 	// SetTLS sets the current TLS pointer. Returns false if value is invalid.
 	SetTLS(value uintptr) bool
+
+	// GS returns the current GS pointer.
+	GS() uintptr
+
+	// SetGS sets the current GS pointer. Returns false if value is invalid.
+	SetGS(value uintptr) bool
 
 	// SetOldRSeqInterruptedIP sets the register that contains the old IP
 	// when an "old rseq" restartable sequence is interrupted.

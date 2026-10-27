@@ -22,7 +22,8 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -42,6 +43,7 @@ type Checkpoint struct {
 	cudaCheckpointSequential  bool
 	saveRestoreExecArgv       string
 	saveRestoreExecTimeout    time.Duration
+	splitFSCheckpointPaths    pathVar
 
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
@@ -71,12 +73,15 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.imagePath, "image-path", "", "directory path to saved container image")
 	f.BoolVar(&c.leaveRunning, "leave-running", false, "restart the container after checkpointing")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
-	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
+	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", true, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
-	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
+	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", controlapi.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
+	// Must match the default prefix applied by sandbox.Sandbox.Checkpoint.
+	c.splitFSCheckpointPaths.defaultPrefix = checkpointfiles.FSCheckpointDir
+	f.Var(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", `[<prefix>=][<container>:]<path> target to include in the filesystem checkpoint (can be repeated). <prefix> defaults to "fs". The files are written to --image-path as <prefix>_*, or into a <prefix>/ subdirectory if <prefix> ends with "/". Paths containing "=" require an explicit prefix. For capturing all of tmpfs, the path should be "all-tmpfs".`)
 
 	// Unimplemented flags necessary for compatibility with docker.
 	var wp string
@@ -85,7 +90,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (c *Checkpoint) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
+	cont, err := c.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -101,7 +106,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 
 	conf := args[0].(*config.Config)
 
-	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
+	cont, err := c.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
@@ -124,6 +129,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,
+		SplitFSCheckpointPaths:     c.splitFSCheckpointPaths.targets,
 	}
 
 	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {

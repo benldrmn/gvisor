@@ -70,11 +70,14 @@ func NewSCMCredentials(t *kernel.Task, cred linux.ControlMessageCredentials) (SC
 	if err != nil {
 		return nil, err
 	}
-	tg := t.ThreadGroup()
-	if kernel.ThreadID(cred.PID) != tg.ID() && !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.PIDNamespace().UserNamespace()) {
+	if kernel.ThreadID(cred.PID) != t.ThreadGroup().ID() && !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.PIDNamespace().UserNamespace()) {
 		return nil, linuxerr.EPERM
 	}
-	return &scmCredentials{tg.PIDNamespacedIDs(), kuid, kgid}, nil
+	namespacedIDs := t.PIDNamespace().PIDNamespacedIDs(kernel.ThreadID(cred.PID))
+	if namespacedIDs == nil {
+		return nil, linuxerr.ESRCH
+	}
+	return &scmCredentials{namespacedIDs, kuid, kgid}, nil
 }
 
 // Equals implements transport.CredentialsControlMessage.Equals.
@@ -644,7 +647,7 @@ func MakeCreds(t *kernel.Task) SCMCredentials {
 		return nil
 	}
 	tcred := t.Credentials()
-	return &scmCredentials{t.ThreadGroup().PIDNamespacedIDs(), tcred.EffectiveKUID, tcred.EffectiveKGID}
+	return &scmCredentials{t.PIDNamespacedIDs(), tcred.EffectiveKUID, tcred.EffectiveKGID}
 }
 
 // New creates default control messages if needed.
@@ -709,6 +712,13 @@ func (fs *RightsFiles) Clone() transport.RightsControlMessage {
 	for _, nf := range nfs {
 		nf.IncRef()
 	}
+	return &nfs
+}
+
+// TransferRights implements transport.RightsControlMessage.TransferRights.
+func (fs *RightsFiles) TransferRights() transport.RightsControlMessage {
+	nfs := *fs
+	*fs = nil
 	return &nfs
 }
 

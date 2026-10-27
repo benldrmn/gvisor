@@ -18,7 +18,7 @@ go_library(
         "//runsc/cli",
         "//runsc/cmd",
         "//runsc/cmd/alias",
-        "//runsc/cmd/nvproxy",
+        "//runsc/cmd/profile",
         "//runsc/cmd/trace",
         "//runsc/cmd/util",
         "@com_github_google_subcommands//:go_default_library",
@@ -28,9 +28,10 @@ go_library(
 go_test(
     name = "maincli_test",
     srcs = ["maincli_test.go"],
-    library = ":maincli",
+    embed = [":maincli"],
     deps = [
         "//runsc/cmd",
+        "//runsc/cmd/sentry/sentrycmd",
         "//runsc/flag",
         "@com_github_google_subcommands//:go_default_library",
     ],

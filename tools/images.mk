@@ -39,14 +39,38 @@ endif
 
 DOCKER_BUILD_ARGS ?=
 
+# Prepared image contexts invoke this file directly after Bazel has built them.
+SHELL = /bin/bash
+header ?= echo --- $(1) >&2
+
 # Note that the image prefixes used here must match the image mangling in
 # runsc/testutil.MangleImage. Names are mangled in this way to ensure that all
 # tests are using locally-defined images (that are consistent and idempotent).
 REMOTE_IMAGE_PREFIX ?= us-central1-docker.pkg.dev/gvisor-presubmit/gvisor-presubmit-images
 LOCAL_IMAGE_PREFIX  ?= gvisor.dev/images
-ALL_IMAGES          := $(subst /,_,$(subst images/,,$(shell find images/ -name Dockerfile -o -name Dockerfile.$(ARCH) | xargs -n 1 dirname | uniq)))
+BAZEL_IMAGE_CONTEXTS := \
+  basic_alpine=//images/basic:alpine_context \
+  basic_busybox=//images/basic:busybox_context \
+  basic_fsstress=//images/basic:fsstress_context \
+  basic_tmpfile=//images/basic:tmpfile_context
+ifeq ($(ARCH),x86_64)
+BAZEL_IMAGE_CONTEXTS += benchmarks_syscallbench=//images/benchmarks/syscallbench:syscallbench_context
+endif
+BAZEL_IMAGES        := $(foreach entry,$(BAZEL_IMAGE_CONTEXTS),$(word 1,$(subst =, ,$(entry))))
+ALL_IMAGES          := $(BAZEL_IMAGES) $(subst /,_,$(subst images/,,$(shell find images/ -name Dockerfile -o -name Dockerfile.$(ARCH) | sed 's,/[^/]*$$,,' | sort -u)))
 NON_TEST_IMAGES     := gpu/ollama/bench\|gpu/vllm\|gpu/triton\|tpu/vllm
-TEST_IMAGES         := $(subst /,_,$(subst images/,,$(shell find images/ -name Dockerfile -o -name Dockerfile.$(ARCH) | xargs -n 1 dirname | uniq | grep -v "$(NON_TEST_IMAGES)")))
+TEST_IMAGES         := $(BAZEL_IMAGES) $(subst /,_,$(subst images/,,$(shell find images/ -name Dockerfile -o -name Dockerfile.$(ARCH) | sed 's,/[^/]*$$,,' | sort -u | grep -v "$(NON_TEST_IMAGES)")))
+GPU_TEST_IMAGES     := $(filter gpu_% tpu_%,$(TEST_IMAGES))
+CPU_TEST_IMAGES     := $(filter-out gpu_% tpu_%,$(TEST_IMAGES))
+
+# Partitioning defaults (1-indexed; populated in CI via .buildkite/hooks/pre-command).
+PARTITION           ?= 1
+TOTAL_PARTITIONS    ?= 1
+
+# Shard image lists across available partitions (using round-robin 1-based indexing).
+SHARDED_CPU_IMAGES  := $(shell echo "$(CPU_TEST_IMAGES)" | tr ' ' '\n' | sort | awk 'NR % $(TOTAL_PARTITIONS) == ($(PARTITION) % $(TOTAL_PARTITIONS))' | tr '\n' ' ')
+SHARDED_GPU_IMAGES  := $(shell echo "$(GPU_TEST_IMAGES)" | tr ' ' '\n' | sort | awk 'NR % $(TOTAL_PARTITIONS) == ($(PARTITION) % $(TOTAL_PARTITIONS))' | tr '\n' ' ')
+SHARDED_ALL_IMAGES  := $(shell echo "$(TEST_IMAGES)" | tr ' ' '\n' | sort | awk 'NR % $(TOTAL_PARTITIONS) == ($(PARTITION) % $(TOTAL_PARTITIONS))' | tr '\n' ' ')
 SUB_IMAGES          := $(foreach image,$(ALL_IMAGES),$(if $(findstring _,$(image)),$(image),))
 IMAGE_GROUPS        := $(sort $(foreach image,$(SUB_IMAGES),$(firstword $(subst _, ,$(image)))))
 
@@ -72,6 +96,14 @@ list-all-test-images: ## List all test images.
 	@for image in $(TEST_IMAGES); do echo $${image}; done
 .PHONY: list-all-test-images
 
+list-cpu-images: ## List CPU test images.
+	@for image in $(SHARDED_CPU_IMAGES); do echo $${image}; done
+.PHONY: list-cpu-images
+
+list-gpu-images: ## List GPU test images.
+	@for image in $(SHARDED_GPU_IMAGES); do echo $${image}; done
+.PHONY: list-gpu-images
+
 load-all-images: ## Load all images.
 load-all-images: $(patsubst %,load-%,$(ALL_IMAGES))
 .PHONY: load-all-images
@@ -80,8 +112,16 @@ load-all-test-images: ## Load all test images.
 load-all-test-images: $(patsubst %,load-%,$(TEST_IMAGES))
 .PHONY: load-all-test-images
 
+test-cpu-images: ## Test CPU test images.
+test-cpu-images: $(patsubst %,test-%,$(SHARDED_CPU_IMAGES))
+.PHONY: test-cpu-images
+
+test-gpu-images: ## Test GPU/ML test images.
+test-gpu-images: $(patsubst %,test-%,$(SHARDED_GPU_IMAGES))
+.PHONY: test-gpu-images
+
 test-all-test-images: ## Test all test images.
-test-all-test-images: $(patsubst %,test-%,$(TEST_IMAGES))
+test-all-test-images: $(patsubst %,test-%,$(SHARDED_ALL_IMAGES))
 .PHONY: test-all-test-images
 
 push-all-images: ## Push all images.
@@ -96,6 +136,7 @@ push-all-test-images: $(patsubst %,push-%,$(TEST_IMAGES))
 # (depending on what's available for the given architecture).
 path = images/$(subst _,/,$(1))
 dockerfile = $$(if [ -f "$(call path,$(1))/Dockerfile.$(ARCH)" ]; then echo Dockerfile.$(ARCH); else echo Dockerfile; fi)
+image_inputs = $(wildcard $(call path,$(1))/image.tar $(call path,$(1))/Dockerfile $(call path,$(1))/Dockerfile.$(ARCH))
 
 # The tag construct is used to memoize the image generated (see README.md).
 # This scheme is used to enable aggressive caching in a central repository, but
@@ -103,30 +144,6 @@ dockerfile = $$(if [ -f "$(call path,$(1))/Dockerfile.$(ARCH)" ]; then echo Dock
 tag = $(shell cd images && find $(subst _,/,$(1)) -type f | sort -f -d | xargs -n 1 sha256sum | sha256sum - | cut -c 1-16)
 remote_image = $(REMOTE_IMAGE_PREFIX)/$(subst _,/,$(1))_$(ARCH)
 local_image = $(LOCAL_IMAGE_PREFIX)/$(subst _,/,$(1))
-
-# Include all existing images as targets here.
-#
-# Note that we use a _ for the tag separator, instead of :, as the latter is
-# interpreted by Make, unfortunately. tag_expand expands the generic rules to
-# tag-specific targets. These is needed to provide sensible targets for load
-# below, with caching. Basically, if there is a rule generated here, then the
-# load will be skipped. If there is no load generated here, then the default
-# rule for load will kick in.
-#
-# Note that if this rule does not successfully rule, we will simply have
-# additional Docker pull commands that run for all images that are already
-# pulled. No real harm done.
-EXISTING_IMAGES = $(shell docker images --format '{{.Repository}}_{{.Tag}}' | grep -v '<none>')
-define existing_image_rule =
-loaded0_$(1)=load-$$(1): tag-$$(1) # Already available.
-loaded1_$(1)=.PHONY: load-$$(1)
-endef
-$(foreach image, $(EXISTING_IMAGES), $(eval $(call existing_image_rule,$(image))))
-define tag_expand_rule =
-$(eval $(loaded0_$(call remote_image,$(1))_$(call tag,$(1))))
-$(eval $(loaded1_$(call remote_image,$(1))_$(call tag,$(1))))
-endef
-$(foreach image, $(ALL_IMAGES), $(eval $(call tag_expand_rule,$(image))))
 
 # tag tags a local image. This applies both the hash-based tag from above to
 # ensure that caching works as expected, as well as the "latest" tag that is
@@ -137,6 +154,8 @@ latest_tag = \
   docker tag $(call local_image,$(1)):$(call tag,$(1)) $(call local_image,$(1)):latest >&2
 tag_exists = \
   docker image inspect $(call local_image,$(1)):$(call tag,$(1)) &>/dev/null
+cached_image = $(if $(call image_inputs,$(1)),$(shell \
+  docker image inspect $(call remote_image,$(1)):$(call tag,$(1)) >/dev/null 2>&1 && echo cached))
 tag-%: ## Tag a local image.
 	@$(call header,TAG $*)
 	@$(call local_tag,$*) && $(call latest_tag,$*)
@@ -159,25 +178,36 @@ pull-%: register-cross ## Force a repull of the image.
 # conflicting with the bazel "build" terminology, which is used elsewhere.
 rebuild = \
   $(call header,REBUILD $(1)) && \
+  (if [ -f "$(call path,$(1))/image.tar" ]; then \
+    docker load --input "$(call path,$(1))/image.tar" >&2 && \
+    docker tag "gvisor.dev/images/$(subst _,/,$(1)):latest" "$(call remote_image,$(1)):$(call tag,$(1))" >&2 && \
+    docker tag "$(call remote_image,$(1)):$(call tag,$(1))" "$(call remote_image,$(1)):latest" >&2; \
+  else \
   (T=$$(mktemp -d) && cp -a $(call path,$(1))/* $$T && \
   set -x && docker build $(DOCKER_PLATFORM_ARGS) $(DOCKER_BUILD_ARGS) \
     -f "$$T/$(call dockerfile,$(1))" \
     -t "$(call remote_image,$(1)):$(call tag,$(1))" \
     -t "$(call remote_image,$(1))":latest \
     $$T >&2 && \
-  rm -rf $$T) && \
+  rm -rf $$T); \
+  fi) && \
   $(call local_tag,$(1)) && \
   $(call latest_tag,$(1))
 rebuild-%: register-cross ## Force rebuild an image locally.
 	@$(call rebuild,$*)
 
-# load will either pull the "remote" or build it locally. This is the preferred
-# entrypoint, as it should never fail. The local tag should always be set after
-# this returns (either by the pull or the build).
+# load reuses a cached remote image or pulls/builds one, applying local hash and
+# latest tags. On a cache miss, SKIP_IMAGE_LOAD only checks the local hash tag.
 # If the image is not available for the current architecture, it is not loaded.
-load-%: register-cross ## Pull or build an image locally.
-	@if [ -f "$(call path,$*)/$(call dockerfile,$*)" ]; then \
-	  if [ "$(SKIP_IMAGE_LOAD)" == true ]; then \
+# Defer cache inspection and image hashing until an image is requested.
+# Secondary expansion selects a prerequisite only when this image is requested:
+# cached images only need tagging; cache misses share cross-emulation setup.
+.SECONDEXPANSION:
+load-%: $$(if $$(call cached_image,$$*),tag-$$*,register-cross) ## Pull or build an image locally.
+	@if [ "$<" = register-cross ]; then \
+	  if [ -z "$(call image_inputs,$*)" ]; then \
+	    echo "Image $* is not available on $$(uname -m), ignoring it." >&2; \
+	  elif [ "$(SKIP_IMAGE_LOAD)" == true ]; then \
 	    if ! $(call tag_exists,$*); then \
 	      echo "Image $* does not exist locally and SKIP_IMAGE_LOAD is set so cannot pull it. Failing." >&2; \
 	      exit 1; \
@@ -185,8 +215,6 @@ load-%: register-cross ## Pull or build an image locally.
 	  else \
 	    ($(call pull,$*)) || ($(call rebuild,$*)); \
 	  fi; \
-	else \
-	  echo "Image $* is not available on $$(uname -m), ignoring it." >&2; \
 	fi
 
 test-%: register-cross ## Build an image locally if the remote doesn't exist.
@@ -222,4 +250,39 @@ else
 endif
 else
 	@
+endif
+# Hash and cache the built archive, including its transitive inputs, rather
+# than only the BUILD file. The recursive Make operates on the prepared
+# context and never invokes Bazel again.
+ifneq ($(_IMAGE_CONTEXT_PREPARED),1)
+_image_makefile := $(abspath $(lastword $(MAKEFILE_LIST)))
+_image_root_makefile := $(abspath $(dir $(_image_makefile))/../Makefile)
+_image_context_options = $(if $(filter x86_64 aarch64,$(ARCH)),--config=$(ARCH),$(error Unsupported image architecture $(ARCH)))
+_image_context_operations := tag pull rebuild load test local-image push
+_image_context_targets := $(foreach op,$(_image_context_operations),$(addprefix $(op)-,$(BAZEL_IMAGES)))
+define native_image_context =
+$(foreach op,$(_image_context_operations),$(op)-$(1)): _image_context_target := $(2)
+endef
+$(foreach entry,$(BAZEL_IMAGE_CONTEXTS),$(eval $(call native_image_context,$(word 1,$(subst =, ,$(entry))),$(word 2,$(subst =, ,$(entry))))))
+$(_image_context_targets):
+	@set -eu; image_context_dir=$$(mktemp -d); trap 'rm -rf "$$image_context_dir"' EXIT; \
+	$(MAKE) --no-print-directory -C "$(dir $(_image_root_makefile))" -f "$(_image_root_makefile)" copy \
+	  TARGETS="$(_image_context_target)" DESTINATION="$$image_context_dir/contexts.tar" \
+	  OPTIONS="$(OPTIONS) $(_image_context_options)" && \
+	tar --extract --file "$$image_context_dir/contexts.tar" --directory "$$image_context_dir" --same-permissions --no-same-owner && \
+	cd "$$image_context_dir" && \
+	$(MAKE) --no-print-directory -f "$(_image_makefile)" _IMAGE_CONTEXT_PREPARED=1 ARCH="$(ARCH)" "$@"
+.PHONY: $(_image_context_targets)
+
+_cuda_context_options = $(_image_context_options) --@io_bazel_rules_go//go/config:race=false
+_cuda_context_targets := $(foreach op,$(_image_context_operations),$(addprefix $(op)-,gpu_cuda-tests gpu_cuda-tests-12-8 gpu_ollama_client))
+$(_cuda_context_targets):
+	@set -eu; image_context_dir=$$(mktemp -d); trap 'rm -rf "$$image_context_dir"' EXIT; \
+	$(MAKE) --no-print-directory -C "$(dir $(_image_root_makefile))" -f "$(_image_root_makefile)" copy \
+	  TARGETS=//images:source_contexts DESTINATION="$$image_context_dir/contexts.tar" \
+	  OPTIONS="$(OPTIONS) $(_cuda_context_options)" && \
+	tar --extract --file "$$image_context_dir/contexts.tar" --directory "$$image_context_dir" --same-permissions --no-same-owner && \
+	cd "$$image_context_dir" && \
+	$(MAKE) --no-print-directory -f "$(_image_makefile)" _IMAGE_CONTEXT_PREPARED=1 ARCH="$(ARCH)" "$@"
+.PHONY: $(_cuda_context_targets)
 endif

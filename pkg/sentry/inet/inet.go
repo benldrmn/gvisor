@@ -46,14 +46,14 @@ type Stack interface {
 
 	// AddInterfaceAddr adds an address to the network interface identified by
 	// idx.
-	AddInterfaceAddr(idx int32, addr InterfaceAddr) error
+	AddInterfaceAddr(ctx context.Context, idx int32, addr InterfaceAddr) error
 
 	// SetInterface modifies or adds a new interface.
 	SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Error
 
 	// RemoveInterfaceAddr removes an address from the network interface
 	// identified by idx.
-	RemoveInterfaceAddr(idx int32, addr InterfaceAddr) error
+	RemoveInterfaceAddr(ctx context.Context, idx int32, addr InterfaceAddr) error
 
 	// SupportsIPv6 returns true if the stack supports IPv6 connectivity.
 	SupportsIPv6() bool
@@ -125,6 +125,15 @@ type Stack interface {
 	// SetForwarding enables or disables packet forwarding between NICs.
 	SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error
 
+	// GetAllowExternalLoopbackTraffic returns whether acceptance of martian
+	// loopback packets (Linux net.ipv4.conf.*.route_localnet) is enabled for the
+	// protocol.
+	GetAllowExternalLoopbackTraffic(protocol tcpip.NetworkProtocolNumber) (bool, error)
+
+	// SetAllowExternalLoopbackTraffic enables or disables acceptance of martian
+	// loopback packets (Linux net.ipv4.conf.*.route_localnet) for the protocol.
+	SetAllowExternalLoopbackTraffic(protocol tcpip.NetworkProtocolNumber, enable bool) error
+
 	// PortRange returns the UDP and TCP inclusive range of ephemeral ports
 	// used in both IPv4 and IPv6.
 	PortRange() (uint16, uint16)
@@ -167,6 +176,9 @@ type Interface struct {
 
 	// Master is the index of the main controlling interface in a bonded setup.
 	Master uint32
+
+	// Kind is the link kind (e.g. "veth", "bridge").
+	Kind string
 }
 
 // InterfaceAddr contains information about a network interface address.

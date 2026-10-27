@@ -15,7 +15,8 @@ go_library(
         "php.go",
         "python.go",
     ],
-    visibility = ["//test/runtimes/proctor:__pkg__"],
+    importpath = "gvisor.dev/gvisor/test/runtimes/proctor/lib",
+    visibility = ["//test:__subpackages__"],
     deps = ["@org_golang_x_sys//unix:go_default_library"],
 )
 
@@ -23,6 +24,6 @@ go_test(
     name = "lib_test",
     size = "small",
     srcs = ["lib_test.go"],
-    library = ":lib",
+    embed = [":lib"],
     deps = ["//pkg/test/testutil"],
 )

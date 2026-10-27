@@ -86,9 +86,11 @@ type listenContext struct {
 	// this context. Can be nil if the context is created by the forwarder.
 	listenEP *Endpoint
 
-	// hasherMu protects hasher.
 	hasherMu hasherMutex
+
 	// hasher is the hash function used to generate a SYN cookie.
+	//
+	// +checklocks:hasherMu
 	hasher hash.Hash
 
 	// v6Only is true if listenEP is a dual stack socket and has the
@@ -126,15 +128,17 @@ func newListenContext(stk *stack.Stack, protocol *protocol, listenEP *Endpoint, 
 	return l
 }
 
-// cookieHash calculates the cookieHash for the given id, timestamp and nonce
-// index. The hash is used to create and validate cookies.
-func (l *listenContext) cookieHash(id stack.TransportEndpointID, ts uint32, nonceIndex int) uint32 {
+// cookieHash hashes the endpoint ID and value with the selected nonce.
+// The value is the client's initial sequence number or the cookie timestamp.
+//
+// +checklocksexclude:l.hasherMu
+func (l *listenContext) cookieHash(id stack.TransportEndpointID, value uint32, nonceIndex int) uint32 {
 
-	// Initialize block with fixed-size data: local ports and v.
+	// Initialize the block with the ports and value.
 	var payload [8]byte
 	binary.BigEndian.PutUint16(payload[0:], id.LocalPort)
 	binary.BigEndian.PutUint16(payload[2:], id.RemotePort)
-	binary.BigEndian.PutUint32(payload[4:], ts)
+	binary.BigEndian.PutUint32(payload[4:], value)
 
 	// Feed everything to the hasher.
 	l.hasherMu.Lock()
@@ -157,9 +161,11 @@ func (l *listenContext) cookieHash(id stack.TransportEndpointID, ts uint32, nonc
 
 // createCookie creates a SYN cookie for the given id and incoming sequence
 // number.
+//
+// +checklocksexclude:l.hasherMu
 func (l *listenContext) createCookie(id stack.TransportEndpointID, seq seqnum.Value, data uint32) seqnum.Value {
 	ts := timeStamp(l.stack.Clock())
-	v := l.cookieHash(id, 0, 0) + uint32(seq) + (ts << tsOffset)
+	v := l.cookieHash(id, uint32(seq), 0) + (ts << tsOffset)
 	v += (l.cookieHash(id, ts, 1) + data) & hashMask
 	return seqnum.Value(v)
 }
@@ -167,9 +173,11 @@ func (l *listenContext) createCookie(id stack.TransportEndpointID, seq seqnum.Va
 // isCookieValid checks if the supplied cookie is valid for the given id and
 // sequence number. If it is, it also returns the data originally encoded in the
 // cookie when createCookie was called.
+//
+// +checklocksexclude:l.hasherMu
 func (l *listenContext) isCookieValid(id stack.TransportEndpointID, cookie seqnum.Value, seq seqnum.Value) (uint32, bool) {
 	ts := timeStamp(l.stack.Clock())
-	v := uint32(cookie) - l.cookieHash(id, 0, 0) - uint32(seq)
+	v := uint32(cookie) - l.cookieHash(id, uint32(seq), 0)
 	cookieTS := v >> tsOffset
 	if ((ts - cookieTS) & tsMask) > maxTSDiff {
 		return 0, false
@@ -357,12 +365,19 @@ func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, 
 // +checklocks:e.mu
 // +checklocks:n.mu
 func (e *Endpoint) propagateInheritableOptionsLocked(n *Endpoint) {
+	if e.ccSetBySockOpt {
+		n.cc = e.cc
+		n.ccSetBySockOpt = true
+	}
 	n.userTimeout = e.userTimeout
 	n.portFlags = e.portFlags
 	n.boundBindToDevice = e.boundBindToDevice
 	n.boundPortFlags = e.boundPortFlags
 	n.userMSS = e.userMSS
 	n.ops.SetMark(e.ops.GetMark())
+	// n is not yet connected, so there is no delayed data for the handler to
+	// flush. The handler also acquires n.mu, which is already held.
+	n.ops.SetDelayOptionNoNotify(e.ops.GetDelayOption())
 }
 
 // reserveTupleLocked reserves an accepted endpoint's tuple.
@@ -434,7 +449,35 @@ func (a *acceptQueue) isFull() bool {
 // and needs to handle it.
 //
 // +checklocks:e.mu
+// +checklocksexclude:ctx.hasherMu
 func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Error {
+	// A child may have been registered after this segment was queued on the
+	// listener. Forward it before treating a retransmitted SYN as a new
+	// connection, or a queued ACK/RST as a segment for the listening socket.
+	netProtos := []tcpip.NetworkProtocolNumber{s.pkt.NetworkProtocolNumber}
+	// If the local address is an IPv4 Address then also look for IPv6
+	// dual stack endpoints.
+	if s.id.LocalAddress.To4() != (tcpip.Address{}) {
+		netProtos = []tcpip.NetworkProtocolNumber{header.IPv4ProtocolNumber, header.IPv6ProtocolNumber}
+	}
+	for _, netProto := range netProtos {
+		if newEP := e.stack.FindTransportEndpoint(netProto, ProtocolNumber, s.id, s.pkt.NICID); newEP != nil && newEP != e {
+			tcpEP := newEP.(*Endpoint)
+			if state := tcpEP.EndpointState(); !state.connecting() && !state.connected() {
+				continue
+			}
+			if !tcpEP.enqueueSegment(s) {
+				// Just silently drop the segment as we failed
+				// to queue, we don't want to generate a RST
+				// further below or try and create a new
+				// endpoint etc.
+				return nil
+			}
+			tcpEP.notifyProcessor()
+			return nil
+		}
+	}
+
 	e.rcvQueueMu.Lock()
 	rcvClosed := e.RcvClosed
 	e.rcvQueueMu.Unlock()
@@ -545,39 +588,6 @@ func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 	case s.flags.Contains(header.TCPFlagAck):
 		iss := s.ackNumber - 1
 		irs := s.sequenceNumber - 1
-
-		// As an edge case when SYN-COOKIES are in use and we receive a
-		// segment that has data and is valid we should check if it
-		// already matches a created endpoint and redirect the segment
-		// rather than try and create a new endpoint. This can happen
-		// where the final ACK for the handshake and other data packets
-		// arrive at the same time and are queued to the listening
-		// endpoint before the listening endpoint has had time to
-		// process the first ACK and create the endpoint that matches
-		// the incoming packet's full 5 tuple.
-		netProtos := []tcpip.NetworkProtocolNumber{s.pkt.NetworkProtocolNumber}
-		// If the local address is an IPv4 Address then also look for IPv6
-		// dual stack endpoints.
-		if s.id.LocalAddress.To4() != (tcpip.Address{}) {
-			netProtos = []tcpip.NetworkProtocolNumber{header.IPv4ProtocolNumber, header.IPv6ProtocolNumber}
-		}
-		for _, netProto := range netProtos {
-			if newEP := e.stack.FindTransportEndpoint(netProto, ProtocolNumber, s.id, s.pkt.NICID); newEP != nil && newEP != e {
-				tcpEP := newEP.(*Endpoint)
-				if !tcpEP.EndpointState().connected() {
-					continue
-				}
-				if !tcpEP.enqueueSegment(s) {
-					// Just silently drop the segment as we failed
-					// to queue, we don't want to generate a RST
-					// further below or try and create a new
-					// endpoint etc.
-					return nil
-				}
-				tcpEP.notifyProcessor()
-				return nil
-			}
-		}
 
 		// Since SYN cookies are in use this is potentially an ACK to a
 		// SYN-ACK we sent but don't have a half open connection state
@@ -703,7 +713,6 @@ func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			mss:                 rcvdSynOptions.MSS,
 			sampleRTTWithTSOnly: true,
 		}
-		h.ep.AssertLockHeld(n)
 		h.transitionToStateEstablishedLocked(s)
 		n.mu.Unlock()
 

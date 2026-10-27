@@ -15,8 +15,11 @@
 package time
 
 import (
+	"math"
 	"testing"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // newTestCalibratedClock returns a CalibratedClock that collects samples from
@@ -43,7 +46,7 @@ func TestConstantFrequency(t *testing.T) {
 
 	// Update from all samples.
 	for range samples {
-		c.Update()
+		c.Update(false)
 	}
 
 	c.mu.RLock()
@@ -65,6 +68,71 @@ func TestConstantFrequency(t *testing.T) {
 	// next sample.
 	if now < 700 || now > 800 {
 		t.Errorf("now got %v want > 700 && < 800", now)
+	}
+}
+
+func TestGetTimeOverflow(t *testing.T) {
+	c := newTestCalibratedClock([]sample{{ref: 123}}, []TSCValue{math.MaxInt64})
+	c.mu.Lock()
+	c.ready = true
+	c.params = Parameters{Frequency: 1}
+	c.mu.Unlock()
+
+	// Shared reader locks do not order the old reset's write with this read.
+	// An exclusive reset instead waits for this reader to unlock.
+	c.mu.RLock()
+	var got int64
+	var err error
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		got, err = c.GetTime()
+	})
+	readyWhileReadLocked := c.ready
+	c.mu.RUnlock()
+	wg.Wait()
+	if !readyWhileReadLocked {
+		t.Error("clock reset while a reader held the mutex")
+	}
+	if err != nil {
+		t.Fatalf("GetTime: %v", err)
+	}
+	if got != 123 {
+		t.Errorf("GetTime = %d, want 123 from reference clock", got)
+	}
+	c.mu.RLock()
+	ready := c.ready
+	c.mu.RUnlock()
+	if ready {
+		t.Error("clock remains ready after time computation overflow")
+	}
+}
+
+func TestUpdateReportsCalibrationReset(t *testing.T) {
+	c := newTestCalibratedClock([]sample{
+		{before: 0, after: 1, ref: 0},
+		{before: 1_000_000_000, after: 1_000_000_001, ref: 1_000_000_000},
+		// This reference jump cannot be corrected within one update interval.
+		// updateParams must discard the calibration instead.
+		{before: 2_000_000_000, after: 2_000_000_001, ref: 4_000_000_000},
+	}, nil)
+
+	_, ready := c.Update(false)
+	if got, want := ready, false; got != want {
+		t.Fatalf("first Update ready = %t, want %t", got, want)
+	}
+	_, ready = c.Update(false)
+	if got, want := ready, true; got != want {
+		t.Fatalf("second Update ready = %t, want %t", got, want)
+	}
+	_, ready = c.Update(false)
+	c.mu.RLock()
+	clockReady := c.ready
+	c.mu.RUnlock()
+	if got, want := clockReady, false; got != want {
+		t.Fatalf("clock ready after rejected calibration = %t, want %t", got, want)
+	}
+	if got, want := ready, false; got != want {
+		t.Errorf("Update ready after rejected calibration = %t, want %t", got, want)
 	}
 }
 
@@ -109,12 +177,12 @@ func TestErrorCorrection(t *testing.T) {
 			c := newTestCalibratedClock(tc.samples[:], nil)
 
 			// Initial calibration takes two updates.
-			_, ok := c.Update()
+			_, ok := c.Update(false)
 			if ok {
 				t.Fatalf("Update ready too early")
 			}
 
-			params, ok := c.Update()
+			params, ok := c.Update(false)
 			if !ok {
 				t.Fatalf("Update not ready")
 			}
@@ -139,7 +207,7 @@ func TestErrorCorrection(t *testing.T) {
 			}
 
 			// Update again to see the changed reference clock.
-			params, ok = c.Update()
+			params, ok = c.Update(false)
 			if !ok {
 				t.Fatalf("Update not ready")
 			}
@@ -162,26 +230,34 @@ func TestErrorCorrection(t *testing.T) {
 
 			// As the reference clock stabilizes, ensure that the clock error
 			// decreases.
+			c.mu.RLock()
 			initialErr := c.errorNS
+			c.mu.RUnlock()
 			t.Logf("initial error: %v ns", initialErr)
 
-			_, ok = c.Update()
+			_, ok = c.Update(false)
 			if !ok {
 				t.Fatalf("Update not ready")
 			}
-			if c.errorNS.Magnitude() > initialErr.Magnitude() {
-				t.Errorf("errorNS increased, got %v want |%v| <= |%v|", c.errorNS, c.errorNS, initialErr)
+			c.mu.RLock()
+			currentErr := c.errorNS
+			c.mu.RUnlock()
+			if currentErr.Magnitude() > initialErr.Magnitude() {
+				t.Errorf("errorNS increased, got %v want |%v| <= |%v|", currentErr, currentErr, initialErr)
 			}
 
-			_, ok = c.Update()
+			_, ok = c.Update(false)
 			if !ok {
 				t.Fatalf("Update not ready")
 			}
-			if c.errorNS.Magnitude() > initialErr.Magnitude() {
-				t.Errorf("errorNS increased, got %v want |%v| <= |%v|", c.errorNS, c.errorNS, initialErr)
+			c.mu.RLock()
+			currentErr = c.errorNS
+			c.mu.RUnlock()
+			if currentErr.Magnitude() > initialErr.Magnitude() {
+				t.Errorf("errorNS increased, got %v want |%v| <= |%v|", currentErr, currentErr, initialErr)
 			}
 
-			t.Logf("final error: %v ns", c.errorNS)
+			t.Logf("final error: %v ns", currentErr)
 		})
 	}
 }

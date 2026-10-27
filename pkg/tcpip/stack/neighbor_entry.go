@@ -90,18 +90,29 @@ type timer struct {
 type neighborEntryMu struct {
 	neighborEntryRWMutex `state:"nosave"`
 
+	// +checklocks:neighborEntryRWMutex
 	neigh NeighborEntry
 
 	// done is closed when address resolution is complete. It is nil iff s is
 	// incomplete and resolution is not yet in progress.
+	// +checklocks:neighborEntryRWMutex
 	done chan struct{} `state:"nosave"`
 
 	// onResolve is called with the result of address resolution.
+	// +checklocks:neighborEntryRWMutex
 	onResolve []func(LinkResolutionResult) `state:"nosave"`
 
+	// +checklocks:neighborEntryRWMutex
 	isRouter bool
 
+	// +checklocks:neighborEntryRWMutex
 	timer timer
+
+	// +checklocks:neighborEntryRWMutex
+	localAddr tcpip.Address
+
+	// +checklocks:neighborEntryRWMutex
+	pendingPackets []pendingPacket
 }
 
 // neighborEntry implements a neighbor entry's individual node behavior, as per
@@ -163,7 +174,7 @@ func newStaticNeighborEntry(cache *neighborCache, addr tcpip.Address, linkAddr t
 // notifyCompletionLocked notifies those waiting for address resolution, with
 // the link address if resolution completed successfully.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) notifyCompletionLocked(err tcpip.Error) {
 	res := LinkResolutionResult{LinkAddress: e.mu.neigh.LinkAddr, Err: err}
 	for _, callback := range e.mu.onResolve {
@@ -185,7 +196,7 @@ func (e *neighborEntry) notifyCompletionLocked(err tcpip.Error) {
 		// keyword but allows tests that use manual clocks to deterministically
 		// wait for this work to complete.
 		e.cache.nic.stack.clock.AfterFunc(0, func() {
-			e.cache.nic.linkResQueue.dequeue(ch, e.mu.neigh.LinkAddr, err)
+			e.cache.nic.linkResQueue.dequeue(ch, res.LinkAddress, err)
 		})
 	}
 }
@@ -193,7 +204,7 @@ func (e *neighborEntry) notifyCompletionLocked(err tcpip.Error) {
 // dispatchAddEventLocked signals to stack's NUD Dispatcher that the entry has
 // been added.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) dispatchAddEventLocked() {
 	if nudDisp := e.cache.nic.stack.nudDisp; nudDisp != nil {
 		nudDisp.OnNeighborAdded(e.cache.nic.id, e.mu.neigh)
@@ -203,7 +214,7 @@ func (e *neighborEntry) dispatchAddEventLocked() {
 // dispatchChangeEventLocked signals to stack's NUD Dispatcher that the entry
 // has changed state or link-layer address.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) dispatchChangeEventLocked() {
 	if nudDisp := e.cache.nic.stack.nudDisp; nudDisp != nil {
 		nudDisp.OnNeighborChanged(e.cache.nic.id, e.mu.neigh)
@@ -213,7 +224,7 @@ func (e *neighborEntry) dispatchChangeEventLocked() {
 // dispatchRemoveEventLocked signals to stack's NUD Dispatcher that the entry
 // has been removed.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) dispatchRemoveEventLocked() {
 	if nudDisp := e.cache.nic.stack.nudDisp; nudDisp != nil {
 		nudDisp.OnNeighborRemoved(e.cache.nic.id, e.mu.neigh)
@@ -223,7 +234,7 @@ func (e *neighborEntry) dispatchRemoveEventLocked() {
 // cancelTimerLocked cancels the currently scheduled action, if there is one.
 // Entries in Unknown, Stale, or Static state do not have a scheduled action.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) cancelTimerLocked() {
 	if e.mu.timer.timer != nil {
 		e.mu.timer.timer.Stop()
@@ -235,7 +246,7 @@ func (e *neighborEntry) cancelTimerLocked() {
 
 // removeLocked prepares the entry for removal.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) removeLocked() {
 	e.mu.neigh.UpdatedAt = e.cache.nic.stack.clock.NowMonotonic()
 	e.dispatchRemoveEventLocked()
@@ -255,7 +266,7 @@ func (e *neighborEntry) removeLocked() {
 //
 // Follows the logic defined in RFC 4861 section 7.3.3.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) setStateLocked(next NeighborState) {
 	e.cancelTimerLocked()
 
@@ -363,12 +374,13 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 //
 // Follows the logic defined in RFC 4861 section 7.3.3.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 	switch e.mu.neigh.State {
 	case Unknown, Unreachable:
 		prev := e.mu.neigh.State
 		e.mu.neigh.State = Incomplete
+		e.mu.localAddr = localAddr
 		e.mu.neigh.UpdatedAt = e.cache.nic.stack.clock.NowMonotonic()
 
 		switch prev {
@@ -379,52 +391,7 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 			e.cache.nic.stats.neighbor.unreachableEntryLookups.Increment()
 		}
 
-		config := e.nudState.Config()
-
-		// Protected by e.mu.
-		done := false
-
-		remaining := config.MaxMulticastProbes
-		addr := e.mu.neigh.Addr
-
-		// Send a probe in another gorountine to free this thread of execution
-		// for finishing the state transition. This is necessary to escape the
-		// currently held lock so we can send the probe message without holding
-		// a shared lock.
-		e.mu.timer = timer{
-			done: &done,
-			timer: e.cache.nic.stack.Clock().AfterFunc(immediateDuration, func() {
-				var err tcpip.Error = &tcpip.ErrTimeout{}
-				if remaining != 0 {
-					// As per RFC 4861 section 7.2.2:
-					//
-					//  If the source address of the packet prompting the solicitation is
-					//  the same as one of the addresses assigned to the outgoing interface,
-					//  that address SHOULD be placed in the IP Source Address of the
-					//  outgoing solicitation.
-					//
-					err = e.cache.linkRes.LinkAddressRequest(addr, localAddr, "" /* linkAddr */)
-				}
-
-				e.mu.Lock()
-				defer e.mu.Unlock()
-
-				if done {
-					// The timer was stopped because the entry changed state.
-					return
-				}
-
-				if err != nil {
-					e.setStateLocked(Unreachable)
-					e.notifyCompletionLocked(err)
-					e.dispatchChangeEventLocked()
-					return
-				}
-
-				remaining--
-				e.mu.timer.timer.Reset(config.RetransmitTimer)
-			}),
-		}
+		e.scheduleMulticastProbeLocked()
 
 	case Stale:
 		e.setStateLocked(Delay)
@@ -437,12 +404,63 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 	}
 }
 
+// +checklocks:e.mu.neighborEntryRWMutex
+func (e *neighborEntry) scheduleMulticastProbeLocked() {
+	config := e.nudState.Config()
+
+	// Protected by e.mu.
+	done := false
+
+	remaining := config.MaxMulticastProbes
+	addr := e.mu.neigh.Addr
+	localAddr := e.mu.localAddr
+
+	// Send a probe in another gorountine to free this thread of execution
+	// for finishing the state transition. This is necessary to escape the
+	// currently held lock so we can send the probe message without holding
+	// a shared lock.
+	e.mu.timer = timer{
+		done: &done,
+		timer: e.cache.nic.stack.Clock().AfterFunc(immediateDuration, func() {
+			var err tcpip.Error = &tcpip.ErrTimeout{}
+			if remaining != 0 {
+				// As per RFC 4861 section 7.2.2:
+				//
+				//  If the source address of the packet prompting the solicitation is
+				//  the same as one of the addresses assigned to the outgoing interface,
+				//  that address SHOULD be placed in the IP Source Address of the
+				//  outgoing solicitation.
+				//
+				err = e.cache.linkRes.LinkAddressRequest(addr, localAddr, "" /* linkAddr */)
+			}
+
+			e.mu.Lock()
+			defer e.mu.Unlock()
+
+			if done {
+				// The timer was stopped because the entry changed state.
+				return
+			}
+
+			if err != nil {
+				e.setStateLocked(Unreachable)
+				e.notifyCompletionLocked(err)
+				e.dispatchChangeEventLocked()
+				return
+			}
+
+			remaining--
+			e.mu.timer.timer.Reset(config.RetransmitTimer)
+		}),
+	}
+}
+
 // handleProbeLocked processes an incoming neighbor probe (e.g. ARP request or
 // Neighbor Solicitation for ARP or NDP, respectively).
 //
 // Follows the logic defined in RFC 4861 section 7.2.3.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) handleProbeLocked(remoteLinkAddr tcpip.LinkAddress) {
 	// Probes MUST be silently discarded if the target address is tentative, does
 	// not exist, or not bound to the NIC as per RFC 4861 section 7.2.3. These
@@ -505,7 +523,7 @@ func (e *neighborEntry) handleProbeLocked(remoteLinkAddr tcpip.LinkAddress) {
 // Generated Addresses (CGA), as defined in RFC 3972. This ensures that the
 // claimed source of an NDP message is the owner of the claimed address.
 //
-// Precondition: e.mu MUST be locked.
+// +checklocks:e.mu.neighborEntryRWMutex
 func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, flags ReachabilityConfirmationFlags) {
 	switch e.mu.neigh.State {
 	case Incomplete:

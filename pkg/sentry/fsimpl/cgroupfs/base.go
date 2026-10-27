@@ -17,6 +17,7 @@ package cgroupfs
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -442,6 +443,9 @@ func (d *cgroupProcsData) Write(ctx context.Context, fd *vfs.FileDescription, sr
 	if err != nil {
 		return n, err
 	}
+	if tgid < 0 || tgid > math.MaxInt32 {
+		return 0, linuxerr.EINVAL
+	}
 
 	t := kernel.TaskFromContext(ctx)
 	currPidns := t.ThreadGroup().PIDNamespace()
@@ -490,6 +494,9 @@ func (d *tasksData) Write(ctx context.Context, fd *vfs.FileDescription, src user
 	if err != nil {
 		return n, err
 	}
+	if tid < 0 || tid > math.MaxInt32 {
+		return 0, linuxerr.EINVAL
+	}
 
 	t := kernel.TaskFromContext(ctx)
 	currPidns := t.ThreadGroup().PIDNamespace()
@@ -534,7 +541,7 @@ func parseInt64FromString(ctx context.Context, src usermem.IOSequence) (val, len
 func copyScratchBufferFromContext(ctx context.Context, size int) []byte {
 	t := kernel.TaskFromContext(ctx)
 	if t != nil {
-		return t.CopyScratchBuffer(hostarch.PageSize)
+		return t.CopyScratchBuffer(int(hostarch.PageSize))
 	}
 	// Not on task context.
 	return make([]byte, hostarch.PageSize)

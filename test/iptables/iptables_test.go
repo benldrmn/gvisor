@@ -17,17 +17,112 @@ package iptables
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
-	"net"
 	"slices"
 	"sync"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
-	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/test/netutils"
+	"gvisor.dev/gvisor/test/netutils/container"
 )
+
+var iptablesNFT = flag.Bool("iptables-nft", false, "run tests using iptables-nft instead of iptables-legacy")
+
+func isNFTMode() bool {
+	return *iptablesNFT
+}
+
+// TODO: b/542649081 - Fix and remove skipIfNFTMode.
+func skipIfNFTMode(test TestCase, ipv6 bool) (reason string, skip bool) {
+	switch test.Name() {
+	case
+		// REJECT tests
+		"FilterInputRejectDefault",
+		"FilterInputRejectDefaultUnmatched",
+		"FilterInputRejectTCPReset",
+		"FilterInputRejectTCPResetUnmatched":
+
+		return "REJECT target is not supported in nftables compat yet", true
+
+	case
+		// Conntrack state tests
+		"FilterInputConntrackRelated",
+		"FilterOutputConntrackDNAT":
+
+		return "conntrack RELATED and SNAT/DNAT states are not supported in nftables compat yet", true
+
+	case
+		// REDIRECT tests
+		"NATPreRedirectUDPPort",
+		"NATPreRedirectTCPPort",
+		"NATPreRedirectTCPOutgoing",
+		"NATOutRedirectTCPIncoming",
+		"NATOutRedirectUDPPort",
+		"NATOutRedirectTCPPort",
+		"NATDropUDP",
+		"NATPreRedirectIP",
+		"NATPreDontRedirectIP",
+		"NATPreRedirectInvert",
+		"NATOutRedirectIP",
+		"NATOutDontRedirectIP",
+		"NATOutRedirectInvert",
+		"NATRedirectRequiresProtocol",
+		"NATLoopbackSkipsPrerouting",
+		"NATPreOriginalDst",
+		"NATOutOriginalDst",
+		"NATPreRECVORIGDSTADDR",
+		"NATOutRECVORIGDSTADDR":
+
+		return "REDIRECT target is not supported in nftables compat yet", true
+
+	case
+		// Range Operation tests
+		"FilterInputDropTCPSrcPort",
+		"FilterInputDropTCPDestPort",
+		"FilterOutputDropTCPDestPort":
+
+		return "Range Operation not supported in nftables yet", true
+
+	case
+		// Multiport Match tests
+		"FilterInputDropAllSrcPorts",
+		"FilterInputDropAllExceptOneDstPort",
+		"FilterOutputAcceptInvertSrcPorts",
+		"FilterOutputDropSrcPorts",
+		"FilterOutputAcceptInvertPorts":
+
+		return "multiport match is not supported in nftables compat yet", true
+
+	case
+		// Owner Match tests
+		"FilterOutputAcceptTCPOwner",
+		"FilterOutputDropTCPOwner",
+		"FilterOutputAcceptUDPOwner",
+		"FilterOutputDropUDPOwner",
+		"FilterOutputOwnerFail",
+		"FilterOutputAcceptGIDOwner",
+		"FilterOutputDropGIDOwner",
+		"FilterOutputInvertGIDOwner",
+		"FilterOutputInvertUIDOwner",
+		"FilterOutputInvertUIDAndGIDOwner",
+		"FilterOutputOwnerNilAccept":
+
+		return "owner match is not supported in nftables compat yet", true
+
+	case
+		// MARK target tests
+		"ManglePreroutingMarkContinue",
+		"MangleOutputMark":
+
+		return "MARK target is not supported in nftables compat yet", true
+
+	default:
+		return "", false
+	}
+}
 
 // singleTest runs a TestCase. Each test follows a pattern:
 //   - Create a container.
@@ -45,6 +140,12 @@ func singleTest(t *testing.T, test TestCase) {
 			subtest = "IPv6"
 		}
 		t.Run(subtest, func(t *testing.T) {
+			if isNFTMode() {
+				reason, skip := skipIfNFTMode(test, tc)
+				if skip {
+					t.Skip(reason)
+				}
+			}
 			iptablesTest(t, test, tc)
 		})
 	}
@@ -60,53 +161,24 @@ func iptablesTest(t *testing.T, test TestCase, ipv6 bool) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	ctx, cancel := context.WithTimeout(context.Background(), TestTimeout)
-	defer cancel()
-
-	d := dockerutil.MakeContainer(ctx, t)
-	defer func() {
-		if logs, err := d.Logs(context.Background()); err != nil {
-			log.Infof("Failed to retrieve container logs.")
-		} else {
-			log.Infof("=== Container logs: ===\n%s", logs)
-		}
-		// Use a new context, as cleanup should run even when we
-		// timeout.
-		d.CleanUp(context.Background())
-	}()
-
 	// Create and start the container.
 	opts := dockerutil.RunOpts{
 		Image:  "iptables",
 		CapAdd: []string{"NET_ADMIN"},
 	}
-	d.CopyFiles(&opts, "/runner", "test/iptables/runner/runner")
 	args := []string{"/runner/runner", "-name", test.Name()}
 	if ipv6 {
 		args = append(args, "-ipv6")
 	}
-	if err := d.Spawn(ctx, opts, args...); err != nil {
-		log.Infof("docker run failed: %v", err)
-		t.FailNow()
+	if isNFTMode() {
+		args = append(args, "-nft")
 	}
+	d, ip := container.Setup(t, TestTimeout, opts, "test/iptables/runner/runner", ipv6, IPExchangePort, args...)
 
-	// Get the container IP.
-	ip, err := d.FindIP(ctx, ipv6)
-	if err != nil {
-		// If ipv6 is not configured, don't fail.
-		if ipv6 && err == dockerutil.ErrNoIP {
-			log.Infof("No ipv6 address is available.")
-			t.Skip()
-		}
-		log.Infof("failed to get container IP: %v", err)
-		t.FailNow()
-	}
-
-	// Give the container our IP.
-	if err := sendIP(ip); err != nil {
-		log.Infof("failed to send IP to container: %v", err)
-		t.FailNow()
-	}
+	// Negative tests need their full observation interval; container startup
+	// must not consume it.
+	ctx, cancel := context.WithTimeout(t.Context(), TestTimeout)
+	defer cancel()
 
 	// Run our side of the test.
 	errCh := make(chan error, 2)
@@ -127,10 +199,9 @@ func iptablesTest(t *testing.T, test TestCase, ipv6 bool) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// Wait for the final statement. This structure has the side
-		// effect that all container logs will appear within the
-		// individual test context.
-		if _, err := d.WaitForOutput(ctx, TerminalStatement, TestTimeout); err != nil && !errors.Is(err, context.Canceled) {
+		// The runner exits successfully only after ContainerAction succeeds.
+		// Cleanup retrieves its logs independently of the traffic context.
+		if err := d.Wait(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- fmt.Errorf("ContainerAction failed: %v", err)
 		} else {
 			errCh <- nil
@@ -145,28 +216,6 @@ func iptablesTest(t *testing.T, test TestCase, ipv6 bool) {
 			t.Fatal(err)
 		}
 	}
-}
-
-func sendIP(ip net.IP) error {
-	contAddr := net.TCPAddr{
-		IP:   ip,
-		Port: IPExchangePort,
-	}
-	var conn *net.TCPConn
-	// The container may not be listening when we first connect, so retry
-	// upon error.
-	cb := func() error {
-		c, err := net.DialTCP("tcp", nil, &contAddr)
-		conn = c
-		return err
-	}
-	if err := testutil.Poll(cb, TestTimeout); err != nil {
-		return fmt.Errorf("timed out waiting to send IP, most recent error: %v", err)
-	}
-	if _, err := conn.Write([]byte{0}); err != nil {
-		return fmt.Errorf("error writing to container: %v", err)
-	}
-	return nil
 }
 
 func TestFilterInputDropUDP(t *testing.T) {
@@ -534,4 +583,80 @@ func TestFilterInputRejectTCPReset(t *testing.T) {
 
 func TestFilterInputRejectTCPResetUnmatched(t *testing.T) {
 	singleTest(t, &FilterInputRejectTCPResetUnmatched{})
+}
+
+func TestFilterInputCommentMatch(t *testing.T) {
+	singleTest(t, &FilterInputCommentMatch{})
+}
+
+func TestNATPostMasqueradeUDP(t *testing.T) {
+	singleTest(t, &NATPostMasqueradeUDP{})
+}
+
+func TestNATPostMasqueradeTCP(t *testing.T) {
+	singleTest(t, &NATPostMasqueradeTCP{})
+}
+
+func TestNATPostMasqueradeToPortsUDP(t *testing.T) {
+	singleTest(t, &NATPostMasqueradeToPortsUDP{})
+}
+
+func TestNATMasqueradeInvalidHookReject(t *testing.T) {
+	singleTest(t, &NATMasqueradeInvalidHookReject{})
+}
+
+func TestMangleInputDrop(t *testing.T) {
+	singleTest(t, &MangleInputDrop{})
+}
+
+func TestManglePreroutingMarkContinue(t *testing.T) {
+	singleTest(t, &ManglePreroutingMarkContinue{})
+}
+
+func TestMangleOutputMark(t *testing.T) {
+	singleTest(t, &MangleOutputMark{})
+}
+
+func TestManglePostroutingDrop(t *testing.T) {
+	singleTest(t, &ManglePostroutingDrop{})
+}
+
+func TestFilterInputConntrackNewDrop(t *testing.T) {
+	singleTest(t, &FilterInputConntrackNewDrop{})
+}
+
+func TestFilterInputConntrackEstablishedAccept(t *testing.T) {
+	singleTest(t, &FilterInputConntrackEstablishedAccept{})
+}
+
+func TestFilterInputConntrackInvertNewDrop(t *testing.T) {
+	singleTest(t, &FilterInputConntrackInvertNewDrop{})
+}
+
+func TestFilterInputConntrackUDPNewDrop(t *testing.T) {
+	singleTest(t, &FilterInputConntrackUDPNewDrop{})
+}
+
+func TestFilterInputConntrackUDPEstablishedAccept(t *testing.T) {
+	singleTest(t, &FilterInputConntrackUDPEstablishedAccept{})
+}
+
+func TestFilterInputConntrackICMPEcho(t *testing.T) {
+	singleTest(t, &FilterInputConntrackICMPEcho{})
+}
+
+func TestFilterInputConntrackRelated(t *testing.T) {
+	singleTest(t, &FilterInputConntrackRelated{})
+}
+
+func TestFilterOutputConntrackDNAT(t *testing.T) {
+	singleTest(t, &FilterOutputConntrackDNAT{})
+}
+
+func TestFilterOutputConntrackNoDNAT(t *testing.T) {
+	singleTest(t, &FilterOutputConntrackNoDNAT{})
+}
+
+func TestFilterInputConntrackNoSNAT(t *testing.T) {
+	singleTest(t, &FilterInputConntrackNoSNAT{})
 }

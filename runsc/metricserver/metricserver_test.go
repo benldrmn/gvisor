@@ -15,12 +15,188 @@
 package metricserver
 
 import (
+	"context"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
+	"gvisor.dev/gvisor/runsc/container"
+	"gvisor.dev/gvisor/runsc/sandbox"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+func TestShutdownWithActivePIDRequest(t *testing.T) {
+	// Channels control the interleaving. Real HTTP I/O and mutex waits are
+	// not synctest-durable, so this deadline only bounds failure and cleanup.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	m := &metricServer{shutdownDone: make(chan struct{})}
+	handlerStarted := make(chan struct{})
+	allowHandler := make(chan struct{})
+	handlerDone := make(chan struct{})
+	allowReturn := make(chan struct{})
+	shutdownStarted := make(chan struct{})
+	m.srv.RegisterOnShutdown(func() { close(shutdownStarted) })
+	m.srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		close(handlerStarted)
+		select {
+		case <-allowHandler:
+		case <-ctx.Done():
+			return
+		}
+		logRequest(m.servePID)(w, req)
+		close(handlerDone)
+		select {
+		case <-allowReturn:
+		case <-ctx.Done():
+		}
+	})
+	ts := httptest.NewUnstartedServer(nil)
+	ts.Config = &m.srv
+	ts.Start()
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+		ts.Close()
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/runsc-metrics/pid", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg.Go(func() {
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Errorf("PID request: %v", err)
+			return
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("PID status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+		}
+		_ = resp.Body.Close()
+	})
+	wait := func(what string, ch <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			t.Fatalf("waiting for %s: %v", what, ctx.Err())
+		}
+	}
+	wait("request handler", handlerStarted)
+	wg.Go(func() { m.shutdown(ctx) })
+	wait("HTTP shutdown", shutdownStarted)
+	close(allowHandler)
+	wait("PID handler", handlerDone)
+	select {
+	case <-m.shutdownDone:
+		t.Fatal("shutdown returned while the request handler was still active")
+	default:
+	}
+	close(allowReturn)
+	wait("shutdown completion", m.shutdownDone)
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("shutdown required deadline cancellation: %v", err)
+	}
+}
+
+// TestRefreshSandboxesReadsLockedState checks that sandbox state files can
+// be refreshed by the metric server even while they are being locked for
+// writing.
+func TestRefreshSandboxesReadsLockedState(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		registered bool
+	}{
+		{name: "new"},
+		{name: "registered", registered: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootID := container.FullID{SandboxID: "root", ContainerID: "root"}
+			m := &metricServer{
+				rootDir:           t.TempDir(),
+				address:           "metric-server",
+				sandboxes:         make(map[container.FullID]*servedSandbox),
+				lastStateFileStat: make(map[container.FullID]os.FileInfo),
+			}
+			t.Cleanup(func() {
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				for _, served := range m.sandboxes {
+					served.cleanup()
+				}
+			})
+
+			writeState := func(id, containerType string) {
+				t.Helper()
+				cont := &container.Container{
+					ID:     id,
+					Status: container.Created,
+					Spec: &specs.Spec{
+						Process: &specs.Process{Capabilities: &specs.LinuxCapabilities{}},
+						Annotations: map[string]string{
+							specutils.ContainerdContainerTypeAnnotation: containerType,
+						},
+					},
+					Sandbox: &sandbox.Sandbox{
+						ID:                  rootID.SandboxID,
+						MetricServerAddress: m.address,
+						RegisteredMetrics:   &metricpb.MetricRegistration{},
+					},
+				}
+				// IsRunning probes this live process; no sandbox is started.
+				cont.Sandbox.Pid.Store(os.Getpid())
+				state := &container.StateFile{
+					RootDir: m.rootDir,
+					ID:      container.FullID{SandboxID: rootID.SandboxID, ContainerID: id},
+				}
+				if err := state.LockForNew(); err != nil {
+					t.Fatalf("LockForNew(%s): %v", id, err)
+				}
+				t.Cleanup(state.UnlockOrDie)
+				if err := state.SaveLocked(cont); err != nil {
+					t.Fatalf("SaveLocked(%s): %v", id, err)
+				}
+			}
+			writeState("root", specutils.ContainerdContainerTypeSandbox)
+			writeState("child", specutils.ContainerdContainerTypeContainer)
+
+			var pending *servedSandbox
+			m.mu.Lock()
+			if test.registered {
+				pending = &servedSandbox{rootContainerID: rootID, server: m}
+				m.sandboxes[rootID] = pending
+				m.numSandboxes = 1
+			}
+			m.refreshSandboxesLocked()
+			served := m.sandboxes[rootID]
+			_, rejected := m.lastStateFileStat[rootID]
+			count := m.numSandboxes
+			m.mu.Unlock()
+
+			if served == nil || rejected {
+				t.Fatalf("sandbox = %v, rejected = %t, expected it served", served, rejected)
+			}
+			if pending != nil && served != pending {
+				t.Error("refresh replaced the registered sandbox")
+			}
+			if count != 1 {
+				t.Errorf("numSandboxes = %d, expected 1", count)
+			}
+			if sand, verifier, err := served.load(); err != nil || sand == nil || verifier == nil {
+				t.Errorf("load = (%v, %v, %v), expected sandbox and verifier", sand, verifier, err)
+			}
+		})
+	}
+}
 
 type fakeFileInfo struct {
 	fs.FileInfo

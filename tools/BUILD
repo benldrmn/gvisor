@@ -1,3 +1,4 @@
+load("@rules_python//python:py_test.bzl", "py_test")
 load("//tools:defs.bzl", "bzl_library", "gotsan_flag_values", "gotsan_values")
 
 package(
@@ -17,6 +18,14 @@ config_setting(
     name = "gotsan",
     flag_values = gotsan_flag_values,
     values = gotsan_values,
+    visibility = [
+        "//:sandbox",
+    ],
+)
+
+config_setting(
+    name = "lockdep",
+    values = {"define": "lockdep=true"},
     visibility = [
         "//:sandbox",
     ],
@@ -46,7 +55,34 @@ bzl_library(
     ],
 )
 
+bzl_library(
+    name = "gazelle_bzl",
+    srcs = ["gazelle.bzl"],
+    visibility = [
+        "//:sandbox",
+    ],
+)
+
+bzl_library(
+    name = "release_bzl",
+    srcs = ["release.bzl"],
+    visibility = [
+        "//:sandbox",
+    ],
+)
+
 exports_files([
+    "benchmark-umbrella-exports.patch",
     "build_cover.sh",
     "go-allow-internal.patch",
 ])
+
+py_test(
+    name = "lint_test",
+    srcs = ["lint_test.py"],
+    args = ["$(rootpath :lint.sh)"],
+    data = [
+        "lint.sh",
+        "//:.clang-format",
+    ],
+)

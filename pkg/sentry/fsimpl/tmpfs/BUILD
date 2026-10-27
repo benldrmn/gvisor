@@ -101,6 +101,7 @@ go_library(
     ],
     imports = [
         "gvisor.dev/gvisor/pkg/sentry/checkpoint",
+        "gvisor.dev/gvisor/pkg/sentry/vfs",
     ],
     marshal = True,
     visibility = ["//pkg/sentry:internal"],
@@ -165,13 +166,14 @@ go_test(
         "tar_test.go",
         "tmpfs_test.go",
     ],
-    library = ":tmpfs",
+    embed = [":tmpfs"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/fspath",
+        "//pkg/hostarch",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/kernel/auth",

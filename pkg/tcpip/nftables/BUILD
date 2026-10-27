@@ -1,16 +1,8 @@
-load("//pkg/sync/locking:locking.bzl", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
     licenses = ["notice"],
-)
-
-declare_rwmutex(
-    name = "nftables_mutex",
-    out = "nftables_mutex.go",
-    package = "nftables",
-    prefix = "nfTables",
 )
 
 go_library(
@@ -20,9 +12,12 @@ go_library(
         "nft_byteorder.go",
         "nft_comparison.go",
         "nft_counter.go",
+        "nft_ct.go",
+        "nft_fib.go",
         "nft_immediate.go",
         "nft_last.go",
         "nft_lookup.go",
+        "nft_masq.go",
         "nft_meta.go",
         "nft_metaload.go",
         "nft_metaset.go",
@@ -32,13 +27,20 @@ go_library(
         "nft_payload_set.go",
         "nft_ranged.go",
         "nft_route.go",
+        "nft_xt_addrtype.go",
+        "nft_xt_conntrack.go",
+        "nft_xt_masq.go",
+        "nft_xt_match.go",
+        "nft_xt_nat.go",
+        "nft_xt_target.go",
         "nftables.go",
         "nftables_attrs.go",
-        "nftables_mutex.go",
+        "nftables_compat.go",
         "nftables_set.go",
         "nftables_types.go",
         "nftinterp.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/tcpip/nftables",
     visibility = [
         "//:sandbox",
     ],
@@ -46,11 +48,10 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/log",
+        "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/rand",
         "//pkg/sentry/socket/netlink/nlmsg",
-        "//pkg/sync",
-        "//pkg/sync/locking",
         "//pkg/syserr",
         "//pkg/tcpip",
         "//pkg/tcpip/checksum",
@@ -65,9 +66,10 @@ go_test(
         "nftables_test.go",
         "nftinterp_test.go",
     ],
-    library = ":nftables",
+    embed = [":nftables"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/atomicbitops",
         "//pkg/buffer",
         "//pkg/marshal/primitive",
         "//pkg/rand",
@@ -77,6 +79,7 @@ go_test(
         "//pkg/tcpip",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
+        "//pkg/tcpip/link/loopback",
         "//pkg/tcpip/stack",
         "@com_github_google_go_cmp//cmp:go_default_library",
     ],

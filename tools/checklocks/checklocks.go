@@ -51,15 +51,17 @@ var Analyzer = &analysis.Analyzer{
 }
 
 var (
-	enableInferred = true
-	enableAtomic   = true
-	enableWrappers = true
+	enableInferred    = true
+	enableAtomic      = true
+	enableWrappers    = true
+	inferredThreshold = 0.9
 )
 
 func init() {
 	Analyzer.Flags.BoolVar(&enableInferred, "inferred", true, "enable inferred locks")
 	Analyzer.Flags.BoolVar(&enableAtomic, "atomic", true, "enable atomic checks")
 	Analyzer.Flags.BoolVar(&enableWrappers, "wrappers", true, "enable analysis of wrappers")
+	Analyzer.Flags.Float64Var(&inferredThreshold, "inferred-threshold", 0.9, "inferred annotation suggestion threshold (0.0-1.0)")
 }
 
 // objectObservations tracks lock correlations.
@@ -70,12 +72,13 @@ type objectObservations struct {
 
 // passContext is a pass with additional expected failures.
 type passContext struct {
-	pass         *analysis.Pass
-	failures     map[positionKey]*failData
-	exemptions   map[positionKey]struct{}
-	forced       map[positionKey]struct{}
-	functions    map[*ssa.Function]struct{}
-	observations map[types.Object]*objectObservations
+	pass             *analysis.Pass
+	failures         map[positionKey]*failData
+	exemptions       map[positionKey]struct{}
+	forced           map[positionKey]struct{}
+	functions        map[*ssa.Function]struct{}
+	escapedFunctions map[*ssa.Function]struct{}
+	observations     map[types.Object]*objectObservations
 }
 
 // observationsFor retrieves observations for the given object.
@@ -95,7 +98,7 @@ func (pc *passContext) observationsFor(obj types.Object) *objectObservations {
 }
 
 // forAllGlobals applies the given function to all globals.
-func (pc *passContext) forAllGlobals(fn func(ts *ast.ValueSpec)) {
+func (pc *passContext) forAllGlobals(fn func(vs *ast.ValueSpec, decl *ast.GenDecl)) {
 	for _, f := range pc.pass.Files {
 		for _, decl := range f.Decls {
 			d, ok := decl.(*ast.GenDecl)
@@ -103,7 +106,7 @@ func (pc *passContext) forAllGlobals(fn func(ts *ast.ValueSpec)) {
 				continue
 			}
 			for _, gs := range d.Specs {
-				fn(gs.(*ast.ValueSpec))
+				fn(gs.(*ast.ValueSpec), d)
 			}
 		}
 	}
@@ -140,31 +143,30 @@ func (pc *passContext) forAllFunctions(fn func(fn *ast.FuncDecl)) {
 // run is the main entrypoint.
 func run(pass *analysis.Pass) (any, error) {
 	pc := &passContext{
-		pass:       pass,
-		failures:   make(map[positionKey]*failData),
-		exemptions: make(map[positionKey]struct{}),
-		forced:     make(map[positionKey]struct{}),
-		functions:  make(map[*ssa.Function]struct{}),
+		pass:             pass,
+		failures:         make(map[positionKey]*failData),
+		exemptions:       make(map[positionKey]struct{}),
+		forced:           make(map[positionKey]struct{}),
+		functions:        make(map[*ssa.Function]struct{}),
+		escapedFunctions: make(map[*ssa.Function]struct{}),
 	}
 
 	// Find all line failure annotations.
 	pc.extractLineFailures()
 
-	// Find all struct declarations and export relevant facts.
-	pc.forAllGlobals(func(vs *ast.ValueSpec) {
-		if ss, ok := vs.Type.(*ast.StructType); ok {
-			structType := pc.pass.TypesInfo.TypeOf(vs.Type).Underlying().(*types.Struct)
-			pc.structLockGuardFacts(structType, ss)
-		}
-		pc.globalLockGuardFacts(vs)
-	})
-	pc.forAllTypes(func(ts *ast.TypeSpec, decl *ast.GenDecl) {
-		if ss, ok := ts.Type.(*ast.StructType); ok {
-			structType := pc.pass.TypesInfo.TypeOf(ts.Name).Underlying().(*types.Struct)
-			pc.structLockGuardFacts(structType, ss)
-		}
-		pc.typeAliasFacts(ts, decl)
-	})
+	// Find every struct type, including anonymous types in expressions,
+	// signatures, and local declarations, and export its field facts.
+	for _, f := range pc.pass.Files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if ss, ok := n.(*ast.StructType); ok {
+				structType := pc.pass.TypesInfo.TypeOf(ss).Underlying().(*types.Struct)
+				pc.structLockGuardFacts(structType, ss)
+			}
+			return true
+		})
+	}
+	pc.forAllGlobals(pc.globalLockGuardFacts)
+	pc.forAllTypes(pc.typeAliasFacts)
 
 	// Check all alignments.
 	pc.forAllTypes(func(ts *ast.TypeSpec, _ *ast.GenDecl) {

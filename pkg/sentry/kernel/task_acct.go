@@ -31,6 +31,9 @@ import (
 // Getitimer implements getitimer(2).
 //
 // Preconditions: The caller must be running on the task goroutine.
+//
+// +checklocksexclude:t.tg.pidns.owner.mu
+// +checklocksexclude:t.tg.signalHandlers.mu
 func (t *Task) Getitimer(id int32) (linux.ItimerVal, error) {
 	var timer ktime.Timer
 	switch id {
@@ -54,6 +57,9 @@ func (t *Task) Getitimer(id int32) (linux.ItimerVal, error) {
 // Setitimer implements setitimer(2).
 //
 // Preconditions: The caller must be running on the task goroutine.
+//
+// +checklocksexclude:t.tg.pidns.owner.mu
+// +checklocksexclude:t.tg.signalHandlers.mu
 func (t *Task) Setitimer(id int32, newitv linux.ItimerVal) (linux.ItimerVal, error) {
 	var (
 		timer ktime.Timer
@@ -117,6 +123,9 @@ type itimerRealListener struct {
 }
 
 // NotifyTimer implements ktime.Listener.NotifyTimer.
+//
+// +checklocksexclude:l.tg.pidns.owner.mu
+// +checklocksexclude:l.tg.signalHandlers.mu
 func (l *itimerRealListener) NotifyTimer(exp uint64) {
 	l.tg.SendSignal(SignalInfoPriv(linux.SIGALRM))
 }
@@ -158,7 +167,7 @@ type rlimitCPUHardListener struct {
 
 // NotifyTimer implements ktime.Listener.NotifyTimer.
 func (l *rlimitCPUHardListener) NotifyTimer(exp uint64) {
-	l.tg.appSysCPUClockLast.Load().SendGroupSignal(SignalInfoPriv(linux.SIGKILL))
+	l.tg.appSysCPUClockLast.Load().sendSignal(SignalInfoPriv(linux.SIGKILL), true /* group */, true /* forced */)
 }
 
 // IOUsage returns the io usage of the thread.

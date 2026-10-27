@@ -26,14 +26,13 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/eventchannel"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	pb "gvisor.dev/gvisor/pkg/sentry/strace/strace_go_proto"
 	slinux "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
-
-	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
 // DefaultLogMaximumSize is the default LogMaximumSize.
@@ -436,6 +435,8 @@ func (i *SyscallInfo) pre(t *kernel.Task, args arch.SyscallArguments, maximumBlo
 			output = append(output, CloneFlagSet.Parse(uint64(args[arg].Uint())))
 		case OpenFlags:
 			output = append(output, open(uint64(args[arg].Uint())))
+		case OpenHow:
+			output = append(output, openHow(t, args[arg].Pointer(), args[arg+1].SizeT()))
 		case Mode:
 			output = append(output, linux.FileMode(args[arg].ModeT()).String())
 		case FutexOp:
@@ -623,6 +624,7 @@ func (i *SyscallInfo) sendEnter(t *kernel.Task, args arch.SyscallArguments) []st
 	event := pb.Strace{
 		Process:  t.Name(),
 		Function: i.name,
+		Tid:      int32(t.ThreadID()),
 		Info: &pb.Strace_Enter{
 			Enter: &pb.StraceEnter{},
 		},
@@ -651,6 +653,7 @@ func (i *SyscallInfo) sendExit(t *kernel.Task, elapsed time.Duration, output []s
 	event := pb.Strace{
 		Process:  t.Name(),
 		Function: i.name,
+		Tid:      int32(t.ThreadID()),
 		Info:     &pb.Strace_Exit{Exit: exit},
 	}
 	event.Args = append(event.Args, output...)

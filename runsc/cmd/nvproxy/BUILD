@@ -11,11 +11,12 @@ go_library(
         "list_supported_drivers.go",
         "nvproxy.go",
     ],
+    importpath = "gvisor.dev/gvisor/runsc/cmd/nvproxy",
     visibility = [
         "//runsc:__subpackages__",
     ],
     deps = [
-        "//pkg/sentry/devices/nvproxy",
+        "//pkg/sentry/devices/nvproxy/nvconf",
         "//runsc/config",
         "//runsc/flag",
         "@com_github_google_subcommands//:go_default_library",

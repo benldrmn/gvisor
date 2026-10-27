@@ -84,10 +84,8 @@ func (d *Delete) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 func (d *Delete) execute(f *flag.FlagSet, conf *config.Config) error {
 	ids := f.Args()
 	for i, id := range ids {
-		var (
-			c   *container.Container
-			err error
-		)
+		var c *container.Container
+		var err error
 		if i == 0 {
 			// The first container is cached via the FetchSpec() mechanism.
 			c, err = d.loadContainer(conf, f, container.LoadOpts{})
@@ -97,15 +95,44 @@ func (d *Delete) execute(f *flag.FlagSet, conf *config.Config) error {
 		if err != nil {
 			if os.IsNotExist(err) && d.force {
 				log.Warningf("couldn't find container %q: %v", id, err)
-				return nil
+				continue
 			}
 			return fmt.Errorf("loading container %q: %v", id, err)
 		}
 		if !d.force && c.Status != container.Created && c.Status != container.Stopped {
-			return fmt.Errorf("cannot delete container that is not stopped without --force flag")
+			if err := requireForce(conf, c); err != nil {
+				return err
+			}
 		}
 		if err := c.Destroy(); err != nil {
 			return fmt.Errorf("destroying container: %v", err)
+		}
+	}
+	return nil
+}
+
+// requireForce returns an error unless the target is a sandbox with no root
+// container and no containers running.
+func requireForce(conf *config.Config, c *container.Container) error {
+	if c.Sandbox == nil || !c.Sandbox.NoRootContainer || !c.Sandbox.IsRootContainer(c.ID) {
+		return fmt.Errorf("cannot delete container that is not stopped without --force flag")
+	}
+	containers, err := container.LoadSandbox(conf.RootDir, c.Sandbox.ID, container.LoadOpts{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("loading containers of sandbox %q: %w", c.Sandbox.ID, err)
+	}
+	for _, sc := range containers {
+		if sc.ID == c.ID {
+			continue
+		}
+		// LoadSandbox does not refresh the status.
+		if sc.Status == container.Running {
+			if err := sc.CheckStopped(); err != nil {
+				return fmt.Errorf("checking status of container %q: %w", sc.ID, err)
+			}
+		}
+		if sc.Status == container.Running || sc.Status == container.Paused {
+			return fmt.Errorf("cannot delete sandbox %q while container %q is running without --force flag", c.Sandbox.ID, sc.ID)
 		}
 	}
 	return nil

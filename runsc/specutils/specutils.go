@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -40,7 +41,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
-	"gvisor.dev/gvisor/runsc/specutils/seccomp"
 )
 
 // LINT.IfChange(features_annotations)
@@ -124,6 +124,9 @@ func LogSpecCustomLogger(orig *specs.Spec, logSeccomp bool, logf func(format str
 			spec.Linux.Resources.Devices = nil
 		}
 	}
+	if spec.Process != nil {
+		spec.Process.Env = nil
+	}
 
 	out, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
@@ -134,19 +137,30 @@ func LogSpecCustomLogger(orig *specs.Spec, logSeccomp bool, logf func(format str
 }
 
 // ValidateSpec validates that the spec is compatible with runsc.
-func ValidateSpec(spec *specs.Spec, conf *config.Config) error {
+//
+// noRootContainer requires the spec to have no Process and no Root.
+func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) error {
 	// Mandatory fields.
-	if spec.Process == nil {
-		return fmt.Errorf("Spec.Process must be defined: %+v", spec)
-	}
-	if len(spec.Process.Args) == 0 {
-		return fmt.Errorf("Spec.Process.Arg must be defined: %+v", spec.Process)
-	}
-	if spec.Root == nil {
-		return fmt.Errorf("Spec.Root must be defined: %+v", spec)
-	}
-	if len(spec.Root.Path) == 0 {
-		return fmt.Errorf("Spec.Root.Path must be defined: %+v", spec.Root)
+	if noRootContainer {
+		if spec.Process != nil {
+			return fmt.Errorf("Spec.Process must not be defined with --no-root-container: %+v", spec.Process)
+		}
+		if spec.Root != nil {
+			return fmt.Errorf("Spec.Root must not be defined with --no-root-container: %+v", spec.Root)
+		}
+	} else {
+		if spec.Process == nil {
+			return fmt.Errorf("Spec.Process must be defined: %+v", spec)
+		}
+		if len(spec.Process.Args) == 0 {
+			return fmt.Errorf("Spec.Process.Arg must be defined: %+v", spec.Process)
+		}
+		if spec.Root == nil {
+			return fmt.Errorf("Spec.Root must be defined: %+v", spec)
+		}
+		if len(spec.Root.Path) == 0 {
+			return fmt.Errorf("Spec.Root.Path must be defined: %+v", spec.Root)
+		}
 	}
 
 	// Unsupported fields.
@@ -156,18 +170,25 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config) error {
 	if spec.Windows != nil {
 		return fmt.Errorf("Spec.Windows is not supported: %+v", spec)
 	}
-	if len(spec.Process.SelinuxLabel) != 0 {
-		return fmt.Errorf("SELinux is not supported: %s", spec.Process.SelinuxLabel)
-	}
+	if spec.Process != nil {
+		if len(spec.Process.SelinuxLabel) != 0 {
+			return fmt.Errorf("SELinux is not supported: %s", spec.Process.SelinuxLabel)
+		}
 
-	// Docker uses AppArmor by default, so just log that it's being ignored.
-	if spec.Process.ApparmorProfile != "" {
-		log.Warningf("AppArmor profile %q is being ignored", spec.Process.ApparmorProfile)
+		// Docker uses AppArmor by default, so just log that it's being ignored.
+		if spec.Process.ApparmorProfile != "" {
+			log.Warningf("AppArmor profile %q is being ignored", spec.Process.ApparmorProfile)
+		}
 	}
 
 	if spec.Linux != nil && spec.Linux.RootfsPropagation != "" {
 		if err := validateRootfsPropagation(spec.Linux.RootfsPropagation); err != nil {
 			return err
+		}
+	}
+	if IsRootContainer(spec) {
+		if utsns, ok := GetNS(specs.UTSNamespace, spec); ok && utsns.Path != "" {
+			return fmt.Errorf("joining UTS namespace %q is not supported", utsns.Path)
 		}
 	}
 	for _, m := range spec.Mounts {
@@ -180,6 +201,9 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config) error {
 	if path := RootfsTarUpperPath(spec); path != "" {
 		if !conf.AllowRootfsTarAnnotation {
 			return fmt.Errorf("rootfs tar annotation is disabled, use --allow-rootfs-tar-annotation to enable it")
+		}
+		if spec.Root == nil {
+			return fmt.Errorf("rootfs tar upper path is set but Spec.Root is not defined")
 		}
 		if spec.Root.Readonly {
 			return fmt.Errorf("rootfs tar upper path is set but rootfs is readonly")
@@ -212,35 +236,59 @@ func absPath(base, rel string) string {
 	return filepath.Join(base, rel)
 }
 
-// OpenSpec opens an OCI runtime spec from the given bundle directory.
-func OpenSpec(bundleDir string) (*os.File, error) {
-	// The spec file must be named "config.json" inside the bundle directory.
-	return os.Open(filepath.Join(bundleDir, "config.json"))
+// CopySpec returns a sealed (read-only) copy of the given OCI runtime spec,
+// encoded as JSON. It can be passed around between processes to ensure they
+// all see the same spec as the caller.
+func CopySpec(spec *specs.Spec) (*os.File, error) {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return nil, fmt.Errorf("cannot encode spec: %w", err)
+	}
+	fd, err := unix.MemfdCreate("config.json", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create memfd: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "config.json")
+	if _, err := f.WriteAt(data, 0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot write spec copy: %w", err)
+	}
+	if _, err := unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_SEAL|unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_WRITE); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot seal spec copy: %w", err)
+	}
+	return f, nil
+}
+
+// SpecOpts says how to read a spec.
+type SpecOpts struct {
+	Conf *config.Config
+
+	// NoRootContainer requires the spec to have no Process and no Root.
+	NoRootContainer bool
 }
 
 // ReadSpec reads an OCI runtime spec from the given bundle directory.
 // ReadSpec also normalizes all potential relative paths into absolute
 // path, e.g. spec.Root.Path, mount.Source.
-func ReadSpec(bundleDir string, conf *config.Config) (*specs.Spec, error) {
-	specFile, err := OpenSpec(bundleDir)
+func ReadSpec(bundleDir string, opts SpecOpts) (*specs.Spec, error) {
+	specFile, err := os.Open(filepath.Join(bundleDir, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("error opening spec file %q: %v", filepath.Join(bundleDir, "config.json"), err)
 	}
 	defer specFile.Close()
-	return ReadSpecFromFile(bundleDir, specFile, conf)
+	return ReadSpecFromFile(bundleDir, specFile, opts)
 }
 
-// ReadSpecFromFile reads an OCI runtime spec from the given file. It also fixes
-// up the spec so that the rest of the code doesn't need to worry about it.
+// ReadSpecFromFile reads an OCI runtime spec from the given file, from its
+// beginning and without moving its offset. It also fixes up the spec so that
+// the rest of the code doesn't need to worry about it.
 //  1. Normalizes all relative paths into absolute by prepending the bundle
 //     dir to them.
 //  2. Looks for flag overrides and applies them if any.
 //  3. Removes seccomp rules if `RuntimeDefault` was used.
-func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) (*specs.Spec, error) {
-	if _, err := specFile.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
-	}
-	specBytes, err := io.ReadAll(specFile)
+func ReadSpecFromFile(bundleDir string, specFile *os.File, opts SpecOpts) (*specs.Spec, error) {
+	specBytes, err := io.ReadAll(io.NewSectionReader(specFile, 0, math.MaxInt64))
 	if err != nil {
 		return nil, fmt.Errorf("error reading spec from file %q: %v", specFile.Name(), err)
 	}
@@ -254,10 +302,10 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 			log.Warningf("OCI spec file %q contains fields unknown to `runsc`: %v. Ignoring these fields and continuing anyway.", specFile.Name(), errStrictDecode)
 		}
 	}
-	if err := ValidateSpec(&spec, conf); err != nil {
+	if err := ValidateSpec(&spec, opts.Conf, opts.NoRootContainer); err != nil {
 		return nil, err
 	}
-	if err := fixSpec(&spec, bundleDir, conf); err != nil {
+	if err := fixSpec(&spec, bundleDir, opts.Conf); err != nil {
 		return nil, err
 	}
 	return &spec, nil
@@ -265,7 +313,9 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 
 func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 	// Turn any relative paths in the spec to absolute by prepending the bundleDir.
-	spec.Root.Path = absPath(bundleDir, spec.Root.Path)
+	if spec.Root != nil {
+		spec.Root.Path = absPath(bundleDir, spec.Root.Path)
+	}
 	for i := range spec.Mounts {
 		m := &spec.Mounts[i]
 		if m.Source != "" {
@@ -609,6 +659,142 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 	return backoff.Retry(op, b)
 }
 
+// IsProcessRunning returns true if the process with the given PID and
+// ProcessIdentity is running, rather than a zombie. Nonpositive PIDs and
+// processes that no longer exist return false.
+func IsProcessRunning(pid int, identity uint64) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	pidfd, err := OpenProcess(pid, identity)
+	if err != nil {
+		if err == unix.ESRCH {
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+
+	pfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(pfds, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("polling pidfd for process %d: %w", pid, err)
+		}
+		// A pidfd becomes readable (POLLIN) when the process exits (including when it is a zombie).
+		return n == 0, nil
+	}
+}
+
+const PIDFS_MAGIC = 0x50494446
+
+// ProcessIdentity returns an identifier of the process with the given PID
+// that is stable and unique. Returns 0 on hosts without `pidfs`.
+func ProcessIdentity(pid int) (uint64, error) {
+	pidfd, err := OpenProcess(pid, 0)
+	if err != nil {
+		return 0, fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+	return pidfdIdentity(pidfd)
+}
+
+func pidfdIdentity(pidfd int) (uint64, error) {
+	var fs unix.Statfs_t
+	if err := unix.Fstatfs(pidfd, &fs); err != nil {
+		return 0, fmt.Errorf("cannot statfs pidfd: %w", err)
+	}
+	if fs.Type != PIDFS_MAGIC {
+		return 0, nil
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(pidfd, &st); err != nil {
+		return 0, fmt.Errorf("cannot stat pidfd: %w", err)
+	}
+	return st.Ino, nil
+}
+
+// OpenProcess returns a pidfd for the process with the given PID and
+// identity, or `unix.ESRCH` if there is no such process.
+// If `identity` is 0, is matches any process with the given PID.
+func OpenProcess(pid int, identity uint64) (int, error) {
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err == unix.EINVAL {
+		return -1, unix.ESRCH // pid is a thread, not a process.
+	}
+	if err != nil || identity == 0 {
+		return pidfd, err
+	}
+	got, err := pidfdIdentity(pidfd)
+	if err == nil && got != identity {
+		err = unix.ESRCH
+	}
+	if err != nil {
+		unix.Close(pidfd)
+		return -1, err
+	}
+	return pidfd, nil
+}
+
+// KillProcess sends SIGKILL to the process with the given PID and
+// ProcessIdentity, if it exists.
+// If `identity` is zero, the process with PID `pid` is killed regardless
+// of its identity.
+func KillProcess(pid int, identity uint64) error {
+	pidfd, err := OpenProcess(pid, identity)
+	if err == unix.ESRCH {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0); err != nil && err != unix.ESRCH {
+		return fmt.Errorf("cannot kill process %d: %w", pid, err)
+	}
+	return nil
+}
+
+// WaitForNonChildExit waits for the process with the given PID and
+// `identity` to exit, up to `timeout`
+// If `identity` is zero, match processes on `pid` alone.
+// `pid` must not be a child of the current process.
+// Returns immediately if the process does not exist.
+func WaitForNonChildExit(pid int, identity uint64, timeout time.Duration) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid pid: %d", pid)
+	}
+	pidfd, err := OpenProcess(pid, identity)
+	if err == unix.ESRCH {
+		return nil // Already gone.
+	}
+	if err != nil {
+		return fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+	deadline := time.Now().Add(timeout)
+	for {
+		timeoutMS := int(time.Until(deadline).Milliseconds())
+		if timeoutMS <= 0 {
+			return fmt.Errorf("process %d is still running after %v", pid, timeout)
+		}
+		pfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+		n, err := unix.Poll(pfds, timeoutMS)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("polling pidfd for process %d: %v", pid, err)
+		}
+		if n > 0 {
+			return nil // The pidfd becomes "readable" when the process exits.
+		}
+	}
+}
+
 // OpenDebugLogFile opens a log file using 'logPattern' as location. If 'logPattern'
 // ends with '/', it's used as a directory with default file name. See OpenLogFile
 // for more details about variable substitutions.
@@ -906,6 +1092,18 @@ func RootfsTarUpperPath(spec *specs.Spec) string {
 	return spec.Annotations[AnnotationRootfsUpperTar]
 }
 
+// IsProcFDPath returns true if the path is a numeric procfs/devfd magic link
+// (e.g. /proc/self/fd/3, /proc/thread-self/fd/4, /dev/fd/5).
+func IsProcFDPath(path string) bool {
+	for _, prefix := range []string{"/proc/self/fd/", "/proc/thread-self/fd/", "/dev/fd/"} {
+		if suffix, ok := strings.CutPrefix(path, prefix); ok {
+			_, err := strconv.ParseUint(suffix, 10, 31)
+			return err == nil
+		}
+	}
+	return false
+}
+
 // AnnotationToBool parses the annotation value as a bool. On failure, it logs a warning and
 // returns false.
 func AnnotationToBool(spec *specs.Spec, annotation string) bool {
@@ -952,11 +1150,11 @@ func Features() *features.Features {
 				},
 				Seccomp: &features.Seccomp{
 					Enabled:        boolPtr(true),
-					Actions:        seccomp.KnownActions(),
-					Operators:      seccomp.KnownOperators(),
-					Archs:          seccomp.KnownArchs(),
-					KnownFlags:     seccomp.KnownFlags(),
-					SupportedFlags: seccomp.SupportedFlags(),
+					Actions:        knownSeccompActions(),
+					Operators:      knownSeccompOperators(),
+					Archs:          knownSeccompArchs(),
+					KnownFlags:     knownSeccompFlags(),
+					SupportedFlags: supportedSeccompFlags(),
 				},
 				Apparmor: &features.Apparmor{
 					Enabled: boolPtr(false),

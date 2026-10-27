@@ -13,15 +13,22 @@
 // limitations under the License.
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -1213,7 +1220,7 @@ TEST_P(SocketInetLoopbackTest, TCPResetAfterClose) {
   // have timed out and closed the socket.
   EXPECT_THAT(RetryEINTR(send)(accepted.get(), &data, sizeof(data), 0),
               SyscallSucceeds());
-  // Sleep for a shortwhile to get a RST back.
+  // Sleep for a short while to get a RST back.
   absl::SleepFor(absl::Seconds(1));
 
   // Try writing again and we should get an EPIPE back.
@@ -1281,6 +1288,60 @@ TEST_P(SocketInetLoopbackTest, AcceptedInheritsTCPUserTimeout) {
       SyscallSucceeds());
   EXPECT_EQ(get_len, sizeof(get));
   EXPECT_EQ(get, kUserTimeout);
+}
+
+TEST_P(SocketInetLoopbackTest, AcceptedInheritsTCPNoDelay) {
+  SocketInetTestParam const& param = GetParam();
+  TestAddress const& listener = param.listener;
+  TestAddress const& connector = param.connector;
+
+  // Create the listening socket.
+  const FileDescriptor listen_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(listener.family(), SOCK_STREAM, IPPROTO_TCP));
+  sockaddr_storage listen_addr = listener.addr;
+  ASSERT_THAT(
+      bind(listen_fd.get(), AsSockAddr(&listen_addr), listener.addr_len),
+      SyscallSucceeds());
+  ASSERT_THAT(listen(listen_fd.get(), SOMAXCONN), SyscallSucceeds());
+
+  // Get the port bound by the listening socket.
+  socklen_t addrlen = listener.addr_len;
+  ASSERT_THAT(getsockname(listen_fd.get(), AsSockAddr(&listen_addr), &addrlen),
+              SyscallSucceeds());
+
+  const uint16_t port =
+      ASSERT_NO_ERRNO_AND_VALUE(AddrPort(listener.family(), listen_addr));
+
+  for (int nodelay : {1, 0}) {
+    SCOPED_TRACE(absl::StrCat("TCP_NODELAY=", nodelay));
+
+    ASSERT_THAT(setsockopt(listen_fd.get(), IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                           sizeof(nodelay)),
+                SyscallSucceeds());
+
+    // Connect to the listening socket.
+    FileDescriptor conn_fd = ASSERT_NO_ERRNO_AND_VALUE(
+        Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+
+    sockaddr_storage conn_addr = connector.addr;
+    ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+    ASSERT_THAT(RetryEINTR(connect)(conn_fd.get(), AsSockAddr(&conn_addr),
+                                    connector.addr_len),
+                SyscallSucceeds());
+
+    // Accept the connection.
+    auto accepted =
+        ASSERT_NO_ERRNO_AND_VALUE(Accept(listen_fd.get(), nullptr, nullptr));
+    // Verify that the accepted socket inherited TCP_NODELAY from the
+    // listening socket.
+    int get = -1;
+    socklen_t get_len = sizeof(get);
+    ASSERT_THAT(
+        getsockopt(accepted.get(), IPPROTO_TCP, TCP_NODELAY, &get, &get_len),
+        SyscallSucceeds());
+    EXPECT_EQ(get_len, sizeof(get));
+    EXPECT_EQ(get, nodelay);
+  }
 }
 
 TEST_P(SocketInetLoopbackTest, TCPAcceptAfterReset) {

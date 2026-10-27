@@ -32,13 +32,28 @@ func (mm *MemoryManager) AddressSpace() platform.AddressSpace {
 	return mm.as
 }
 
+// UserModifiedGS notifies the address space that the user has modified the GS
+// register.
+func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
+	as := mm.AddressSpace()
+	if err := as.UserModifiedGS(ctx, mm); err != nil {
+		return err
+	}
+
+	mm.activeMu.Lock()
+	mm.gsInUse = true
+	mm.activeMu.Unlock()
+	return nil
+}
+
 // mapASLocked maps addresses in ar into mm.as.
 //
 // Preconditions:
-//   - mm.activeMu must be locked.
 //   - ar.Length() != 0.
 //   - ar must be page-aligned.
 //   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
+//
+// +checklocksread:mm.activeMu
 func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
 	if platformEffect == memmap.PlatformEffectCommit && ar.Length() > (1<<30) {
 		// FIXME(b/445932215, b/445939339): Don't precommit very large ranges
@@ -121,7 +136,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 
 // unmapASLocked removes all AddressSpace mappings for addresses in ar.
 //
-// Preconditions: mm.activeMu must be locked.
+// +checklocksread:mm.activeMu
 func (mm *MemoryManager) unmapASLocked(ar hostarch.AddrRange) {
 	if ar.Length() == 0 {
 		return

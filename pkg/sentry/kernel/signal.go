@@ -15,8 +15,6 @@
 package kernel
 
 import (
-	"fmt"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -27,6 +25,10 @@ import (
 // runtime (in order to catch possible races).
 const SignalPanic = linux.SIGUSR2
 
+// SignalDumpGoroutines is used to trigger a non-fatal stack dump of all
+// running goroutines.
+const SignalDumpGoroutines = linux.SIGUSR1
+
 // sendExternalSignal is called when an asynchronous signal is sent to the
 // sentry ("in sentry context"). On some platforms, it may also be called when
 // an asynchronous signal is sent to sandboxed application threads ("in
@@ -34,7 +36,10 @@ const SignalPanic = linux.SIGUSR2
 //
 // context is used only for debugging to differentiate these cases.
 //
-// Preconditions: Kernel must have an init process.
+// If the kernel has no init process, the signal is dropped.
+//
+// +checklocksexclude:k.tasks.mu
+// +checklocksexclude:k.globalInit.signalHandlers.mu
 func (k *Kernel) sendExternalSignal(info *linux.SignalInfo, context string) {
 	switch linux.Signal(info.Signo) {
 	case linux.SIGURG:
@@ -50,11 +55,17 @@ func (k *Kernel) sendExternalSignal(info *linux.SignalInfo, context string) {
 		panic("Signal-induced panic")
 
 	default:
+		if k.dumpGoroutinesSignal > 0 && linux.Signal(info.Signo) == k.dumpGoroutinesSignal {
+			log.TracebackAll("Received external dump signal %d in %s context", info.Signo, context)
+			return
+		}
+
 		log.Infof("Received external signal %d in %s context", info.Signo, context)
 		if k.globalInit == nil {
-			panic(fmt.Sprintf("Received external signal %d before init created", info.Signo))
+			log.Warningf("Dropping external signal %d: sandbox has no init process", info.Signo)
+			return
 		}
-		k.globalInit.SendSignal(info)
+		k.globalInit.SendForcedSignal(info)
 	}
 }
 

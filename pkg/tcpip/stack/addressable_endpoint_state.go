@@ -41,12 +41,10 @@ type AddressableEndpointState struct {
 	// AddressableEndpointState.mu
 	//   addressState.mu
 	mu addressableEndpointStateRWMutex `state:"nosave"`
-	// TODO(b/361075310): Enable s/r for the below fields.
-	//
 	// +checklocks:mu
-	endpoints map[tcpip.Address]*addressState `state:"nosave"`
+	endpoints map[tcpip.Address]*addressState `state:"wait"`
 	// +checklocks:mu
-	primary []*addressState `state:"nosave"`
+	primary []*addressState
 }
 
 // AddressableEndpointStateOptions contains options used to configure an
@@ -600,6 +598,11 @@ func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tc
 		return ep
 	}
 
+	// Do not create temporary addresses while the network endpoint is disabled.
+	if !a.networkEndpoint.Enabled() {
+		return nil
+	}
+
 	// Proceed to add a new temporary endpoint.
 	addr := localAddr.WithPrefix()
 	ep, err := a.addAndAcquireAddressLocked(addr, AddressProperties{PEB: tempPEB, Temporary: true}, Temporary)
@@ -738,6 +741,8 @@ func (a *AddressableEndpointState) Cleanup() {
 var _ AddressEndpoint = (*addressState)(nil)
 
 // addressState holds state for an address.
+//
+// +stateify savable
 type addressState struct {
 	addressableEndpointState *AddressableEndpointState
 	addr                     tcpip.AddressWithPrefix
@@ -748,11 +753,11 @@ type addressState struct {
 	//
 	// AddressableEndpointState.mu
 	//   addressState.mu
-	mu   addressStateRWMutex
+	mu   addressStateRWMutex `state:"nosave"`
 	refs addressStateRefs
-	// checklocks:mu
+	// +checklocks:mu
 	kind AddressKind
-	// checklocks:mu
+	// +checklocks:mu
 	configType AddressConfigType
 	// lifetimes holds this address' lifetimes.
 	//
@@ -760,13 +765,13 @@ type addressState struct {
 	// must be the zero value. Note that the converse does not need to be
 	// upheld!
 	//
-	// checklocks:mu
+	// +checklocks:mu
 	lifetimes AddressLifetimes
 	// The enclosing mutex must be write-locked before calling methods on the
 	// dispatcher.
 	//
-	// checklocks:mu
-	disp AddressDispatcher
+	// +checklocks:mu
+	disp AddressDispatcher `state:"nosave"`
 }
 
 // AddressWithPrefix implements AddressEndpoint.
@@ -820,6 +825,9 @@ func (a *addressState) remove(reason AddressRemovalReason) {
 
 // IsAssigned implements AddressEndpoint.
 func (a *addressState) IsAssigned(allowExpired bool) bool {
+	if a.addressableEndpointState.options.HiddenWhileDisabled && !a.addressableEndpointState.networkEndpoint.Enabled() {
+		return false
+	}
 	switch kind := a.GetKind(); kind {
 	case PermanentTentative:
 		return false

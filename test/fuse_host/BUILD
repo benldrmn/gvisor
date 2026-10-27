@@ -18,10 +18,10 @@ go_test(
     name = "fusehost_test",
     srcs = ["fuse_host_test.go"],
     data = [
-        "//runsc",
+        "//:release",
         "//test/fuse_host/workload",
     ],
-    library = ":fusehost",
+    embed = [":fusehost"],
     deps = [
         "//pkg/test/testutil",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",

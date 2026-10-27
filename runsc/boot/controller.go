@@ -20,20 +20,20 @@ import (
 	"io"
 	"path"
 	"strconv"
-	"sync"
 	gtime "time"
 
-	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/cleanup"
-	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -46,154 +46,10 @@ import (
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
-	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
-)
-
-const (
-	// ContMgrCheckpoint checkpoints a container.
-	ContMgrCheckpoint = "containerManager.Checkpoint"
-
-	// ContMgrCreateSubcontainer creates a sub-container.
-	ContMgrCreateSubcontainer = "containerManager.CreateSubcontainer"
-
-	// ContMgrDestroySubcontainer is used to stop a sub-container and free all
-	// associated resources in the sandbox.
-	ContMgrDestroySubcontainer = "containerManager.DestroySubcontainer"
-
-	// ContMgrEvent gets stats about the container used by "runsc events".
-	ContMgrEvent = "containerManager.Event"
-
-	// ContMgrExecuteAsync executes a command in a container.
-	ContMgrExecuteAsync = "containerManager.ExecuteAsync"
-
-	// ContMgrFSSave saves a filesystem checkpoint.
-	ContMgrFSSave = "containerManager.FSSave"
-
-	// ContMgrGetSavings gets the savings for restored sandboxes.
-	ContMgrGetSavings = "containerManager.GetSavings"
-
-	// ContMgrPortForward starts port forwarding with the sandbox.
-	ContMgrPortForward = "containerManager.PortForward"
-
-	// ContMgrProcesses lists processes running in a container.
-	ContMgrProcesses = "containerManager.Processes"
-
-	// ContMgrRestore restores a container from a statefile.
-	ContMgrRestore = "containerManager.Restore"
-
-	// ContMgrRestoreSubcontainer restores a container from a statefile.
-	ContMgrRestoreSubcontainer = "containerManager.RestoreSubcontainer"
-
-	// ContMgrPause pauses all tasks, blocking until they are stopped.
-	ContMgrPause = "containerManager.Pause"
-
-	// ContMgrResume resumes all tasks.
-	ContMgrResume = "containerManager.Resume"
-
-	// ContMgrSignal sends a signal to a container.
-	ContMgrSignal = "containerManager.Signal"
-
-	// ContMgrStartSubcontainer starts a sub-container inside a running sandbox.
-	ContMgrStartSubcontainer = "containerManager.StartSubcontainer"
-
-	// ContMgrWait waits on the init process of the container and returns its
-	// ExitStatus.
-	ContMgrWait = "containerManager.Wait"
-
-	// ContMgrWaitPID waits on a process with a certain PID in the sandbox and
-	// return its ExitStatus.
-	ContMgrWaitPID = "containerManager.WaitPID"
-
-	// ContMgrWaitCheckpoint waits for the next Kernel checkpoint to complete.
-	ContMgrWaitCheckpoint = "containerManager.WaitCheckpoint"
-
-	// ContMgrWaitRestore waits for the Kernel restore to complete.
-	ContMgrWaitRestore = "containerManager.WaitRestore"
-
-	// ContMgrWaitFSCheckpoint waits for the next filesystem checkpoint save to
-	// complete.
-	ContMgrWaitFSCheckpoint = "containerManager.WaitFSCheckpoint"
-
-	// ContMgrWaitFSRestore waits for filesystem checkpoint restore to complete
-	// for all current containers.
-	ContMgrWaitFSRestore = "containerManager.WaitFSRestore"
-
-	// ContMgrRootContainerStart starts a new sandbox with a root container.
-	ContMgrRootContainerStart = "containerManager.StartRoot"
-
-	// ContMgrCreateTraceSession starts a trace session.
-	ContMgrCreateTraceSession = "containerManager.CreateTraceSession"
-
-	// ContMgrDeleteTraceSession deletes a trace session.
-	ContMgrDeleteTraceSession = "containerManager.DeleteTraceSession"
-
-	// ContMgrListTraceSessions lists a trace session.
-	ContMgrListTraceSessions = "containerManager.ListTraceSessions"
-
-	// ContMgrProcfsDump dumps sandbox procfs state.
-	ContMgrProcfsDump = "containerManager.ProcfsDump"
-
-	// ContMgrMount mounts a filesystem in a container.
-	ContMgrMount = "containerManager.Mount"
-
-	// ContMgrContainerRuntimeState returns the runtime state of a container.
-	ContMgrContainerRuntimeState = "containerManager.ContainerRuntimeState"
-
-	// ContMgrSetNetworkArgs sets network args in loader without creating links.
-	ContMgrSetNetworkArgs = "containerManager.SetNetworkArgs"
-
-	// ContMgrGetNetworkConfig returns the network interfaces and routes applied
-	// during the creation of root container.
-	ContMgrGetNetworkConfig = "containerManager.GetNetworkConfig"
-)
-
-const (
-	// NetworkInitPluginStack initializes third-party network stack.
-	NetworkInitPluginStack = "Network.InitPluginStack"
-
-	// DebugStacks collects sandbox stacks for debugging.
-	DebugStacks = "debug.Stacks"
-)
-
-// Profiling related commands (see pprof.go for more details).
-const (
-	ProfileCPU   = "Profile.CPU"
-	ProfileHeap  = "Profile.Heap"
-	ProfileBlock = "Profile.Block"
-	ProfileMutex = "Profile.Mutex"
-	ProfileTrace = "Profile.Trace"
-)
-
-// Logging related commands (see logging.go for more details).
-const (
-	LoggingChange = "Logging.Change"
-)
-
-// Usage related commands (see usage.go for more details).
-const (
-	UsageCollect = "Usage.Collect"
-	UsageUsageFD = "Usage.UsageFD"
-)
-
-// Metrics related commands (see metrics.go).
-const (
-	MetricsGetRegistered = "Metrics.GetRegisteredMetrics"
-	MetricsExport        = "Metrics.Export"
-)
-
-// Commands for interacting with cgroupfs within the sandbox.
-const (
-	CgroupsReadControlFiles  = "Cgroups.ReadControlFiles"
-	CgroupsWriteControlFiles = "Cgroups.WriteControlFiles"
-)
-
-// FS-related commands (see fs.go for more details).
-const (
-	FsTarRootfsUpperLayer = "Fs.TarRootfsUpperLayer"
-	FsRead                = "Fs.Read"
 )
 
 // controller holds the control server, and is used for communication into the
@@ -300,6 +156,7 @@ func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 	if state != created {
 		return fmt.Errorf("sandbox is not in created state, cannot start root container: state=%s", state)
 	}
+	defer cm.l.lifecycleCPUs.releaseForRestore()
 	// Tell the root container to start and wait for the result.
 	return cm.onStart()
 }
@@ -314,22 +171,13 @@ func (cm *containerManager) onStart() error {
 }
 
 // Processes retrieves information about processes running in the sandbox.
-func (cm *containerManager) Processes(cid *string, out *[]*control.Process) error {
+func (cm *containerManager) Processes(cid *string, out *[]*controlapi.Process) error {
 	log.Debugf("containerManager.Processes, cid: %s", *cid)
 	return control.Processes(cm.l.k, *cid, out)
 }
 
-// CreateArgs contains arguments to the Create method.
-type CreateArgs struct {
-	// CID is the ID of the container to start.
-	CID string
-
-	// FilePayload may contain a TTY file for the terminal, if enabled.
-	urpc.FilePayload
-}
-
 // CreateSubcontainer creates a container within a sandbox.
-func (cm *containerManager) CreateSubcontainer(args *CreateArgs, _ *struct{}) error {
+func (cm *containerManager) CreateSubcontainer(args *sentryapi.CreateArgs, _ *struct{}) error {
 	log.Debugf("containerManager.CreateSubcontainer: %s", args.CID)
 
 	if len(args.Files) > 1 {
@@ -346,42 +194,8 @@ func (cm *containerManager) CreateSubcontainer(args *CreateArgs, _ *struct{}) er
 	return cm.l.createSubcontainer(args.CID, tty)
 }
 
-// StartArgs contains arguments to the Start method.
-type StartArgs struct {
-	// Spec is the spec of the container to start.
-	Spec *specs.Spec
-
-	// Config is the runsc-specific configuration for the sandbox.
-	Conf *config.Config
-
-	// CID is the ID of the container to start.
-	CID string
-
-	// NumGoferFilestoreFDs is the number of gofer filestore FDs donated.
-	NumGoferFilestoreFDs int
-
-	// IsDevIoFilePresent indicates whether the dev gofer FD is present.
-	IsDevIoFilePresent bool
-
-	// GoferMountConfs contains information about how the gofer mounts have been
-	// configured. The first entry is for rootfs and the following entries are
-	// for bind mounts in Spec.Mounts (in the same order).
-	GoferMountConfs []specutils.GoferMountConf
-
-	// IsRootfsUpperTarFilePresent indicates whether the rootfs upper tar file is present.
-	IsRootfsUpperTarFilePresent bool
-
-	// FilePayload contains, in order:
-	//   * stdin, stdout, and stderr (optional: if terminal is disabled).
-	//   * file descriptors to gofer-backing host files (optional).
-	//   * file descriptor for /dev gofer connection (optional)
-	//   * file descriptor for rootfs upper tar file (optional)
-	//   * file descriptors to connect to gofer to serve the root filesystem.
-	urpc.FilePayload
-}
-
 // StartSubcontainer runs a created container within a sandbox.
-func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) error {
+func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *struct{}) error {
 	// Validate arguments.
 	if args == nil {
 		return errors.New("start missing arguments")
@@ -523,26 +337,16 @@ func (cm *containerManager) ExecuteAsync(args *control.ExecArgs, pid *int32) err
 }
 
 // Checkpoint pauses a sandbox and saves its state.
-func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
+func (cm *containerManager) Checkpoint(o *controlapi.SaveOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Checkpoint")
+	o.RunscVersion = version.Version()
+	cm.l.lifecycleCPUs.hold()
+	defer cm.l.lifecycleCPUs.release()
 	return cm.l.save(o)
 }
 
-// PortForwardOpts contains options for port forwarding to a port in a
-// container.
-type PortForwardOpts struct {
-	// FilePayload contains one fd for a UDS (or local port) used for port
-	// forwarding.
-	urpc.FilePayload
-
-	// ContainerID is the container for the process being executed.
-	ContainerID string
-	// Port is the port to to forward.
-	Port uint16
-}
-
 // PortForward initiates a port forward to the container.
-func (cm *containerManager) PortForward(opts *PortForwardOpts, _ *struct{}) error {
+func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *struct{}) error {
 	log.Debugf("containerManager.PortForward, cid: %s, port: %d", opts.ContainerID, opts.Port)
 	if err := cm.l.portForward(opts); err != nil {
 		log.Debugf("containerManager.PortForward failed, opts: %+v, err: %v", opts, err)
@@ -551,31 +355,11 @@ func (cm *containerManager) PortForward(opts *PortForwardOpts, _ *struct{}) erro
 	return nil
 }
 
-// RestoreOpts contains options related to restoring a container's file system.
-type RestoreOpts struct {
-	// FilePayload contains, in order:
-	// 1. checkpoint state file.
-	// 2. optional checkpoint pages metadata file.
-	// 3. optional checkpoint pages file.
-	// 4. optional platform device file.
-	urpc.FilePayload
-	HavePagesFile  bool
-	HaveDeviceFile bool
-	Background     bool
-
-	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
-	// domain socket connected to a URPC server implementing
-	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
-	// RestoreOpts.HavePagesFile is unknown and must be determined by
-	// containerManager.Restore.
-	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
-}
-
 // Restore loads a container from a statefile.
 // The container's current kernel is destroyed, a restore environment is
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
-func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) {
+func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.RestoreReply) (retErr error) {
 	timer := starttime.Timer("Restore")
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
@@ -593,14 +377,29 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 			cm.onRestoreFailed(fmt.Errorf("Restore failed: %w", retErr))
 		}
 	}()
-	if cm.l.fsRestore != nil {
-		return fmt.Errorf("cannot restore sandbox when filesystem restore is enabled")
+	cm.l.lifecycleCPUs.holdForRestore()
+
+	// If filesystem restore files were donated to the loader during sandbox
+	// creation, we must perform a split filesystem restore. Restoring a split
+	// checkpoint without split-fsrestore enabled is not supported.
+	if (cm.l.fsRestore != nil) != o.SplitFSRestore {
+		if o.SplitFSRestore {
+			return fmt.Errorf("split filesystem restore requested, but sandbox was created without filesystem restore files")
+		}
+		return fmt.Errorf("filesystem restore files were donated during sandbox creation, but split filesystem restore was not requested")
 	}
+
 	if len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")
 	}
 
-	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)
+	readerCPUs := cm.l.lifecycleCPUs.num
+	if o.Background {
+		// Most page reads run after the application starts, under its CPU
+		// limit.
+		readerCPUs = cm.l.root.applicationCores
+	}
+	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o, readerCPUs)
 	if err != nil {
 		return err
 	}
@@ -632,7 +431,9 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		// For background restore, throttle page loading until the kernel is
+		// restored, so that restore does not wait behind page reads.
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")
@@ -645,7 +446,6 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	stateFile = nil
 	timer.Reached("created statefile reader")
 
-	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
 	cm.l.state = restoringUnstarted
 
 	// Release `cm.l.mu`.
@@ -690,18 +490,24 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	if checkpointVersion != currentVersion {
 		return fmt.Errorf("runsc version does not match across checkpoint restore, checkpoint: %v current: %v", checkpointVersion, currentVersion)
 	}
+	if saved := cm.restorer.metadata[noRootContainerKey] == "true"; saved != cm.l.noRootContainer.enabled {
+		return fmt.Errorf("checkpoint taken with no-root-container=%t cannot be restored with no-root-container=%t", saved, cm.l.noRootContainer.enabled)
+	}
 	timer.Reached("restorer initialized")
-	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	reply.KernelStarted, err = cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	return err
 }
 
-func getRestoreReaders(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+// getRestoreReaders returns readers for the checkpoint files
+// (appropriate for `cpus` CPUs).
+func getRestoreReaders(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
 	if o.UseCheckpointGofer {
 		return getRestoreReadersForCheckpointGofer(o)
 	}
-	return getRestoreReadersForLocalCheckpointFiles(o)
+	return getRestoreReadersForLocalCheckpointFiles(o, cpus)
 }
 
-func getRestoreReadersForLocalCheckpointFiles(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
 	stateFile, err := o.ReleaseFD(0)
 	if err != nil {
 		return nil, nil, nil, err
@@ -736,11 +542,11 @@ func getRestoreReadersForLocalCheckpointFiles(o *RestoreOpts) (io.ReadCloser, io
 	// compressio.Reader or compressio.NewSimpleReader().
 	return stateFile,
 		stateio.NewBufioReadCloser(pagesMetadataFile),
-		stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release())),
+		stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release()), cpus),
 		nil
 }
 
-func getRestoreReadersForCheckpointGofer(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
 	clientFD, err := unix.Dup(int(o.Files[0].Fd()))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to dup checkpoint gofer client FD: %w", err)
@@ -790,6 +596,7 @@ func getRestoreReadersForCheckpointGofer(o *RestoreOpts) (io.ReadCloser, io.Read
 }
 
 func (cm *containerManager) onRestoreFailed(err error) {
+	cm.l.lifecycleCPUs.releaseForRestore()
 	cm.l.mu.Lock()
 	cm.l.state = restoreFailed
 	cm.l.restoreErr = err
@@ -798,7 +605,7 @@ func (cm *containerManager) onRestoreFailed(err error) {
 	cm.restorer = nil
 }
 
-func (cm *containerManager) onRestoreDone(s Savings) {
+func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
 	cm.l.mu.Lock()
 	cm.l.state = restored
 	cm.l.savings = s
@@ -807,7 +614,7 @@ func (cm *containerManager) onRestoreDone(s Savings) {
 	cm.restorer = nil
 }
 
-func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (retErr error) {
+func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply *sentryapi.RestoreReply) (retErr error) {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 	cm.l.mu.Lock()
 	state := cm.l.state
@@ -887,7 +694,7 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (r
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
 	}
 
-	err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
+	reply.KernelStarted, err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
 	if err != nil {
 		log.Debugf("containerManager.RestoreSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
@@ -916,17 +723,8 @@ func (cm *containerManager) Wait(cid *string, waitStatus *uint32) error {
 	return err
 }
 
-// WaitPIDArgs are arguments to the WaitPID method.
-type WaitPIDArgs struct {
-	// PID is the PID in the container's PID namespace.
-	PID int32
-
-	// CID is the container ID.
-	CID string
-}
-
 // WaitPID waits for the process with PID 'pid' in the sandbox.
-func (cm *containerManager) WaitPID(args *WaitPIDArgs, waitStatus *uint32) error {
+func (cm *containerManager) WaitPID(args *sentryapi.WaitPIDArgs, waitStatus *uint32) error {
 	log.Debugf("containerManager.Wait, cid: %s, pid: %d", args.CID, args.PID)
 	err := cm.l.waitPID(kernel.ThreadID(args.PID), args.CID, waitStatus)
 	log.Debugf("containerManager.Wait, cid: %s, pid: %d, waitStatus: %#x, err: %v", args.CID, args.PID, *waitStatus, err)
@@ -948,6 +746,7 @@ func (cm *containerManager) WaitRestore(*struct{}, *struct{}) error {
 	return err
 }
 
+// +checklocksexclude:cm.l.k.fsSaveMu
 func (cm *containerManager) WaitFSCheckpoint(*struct{}, *struct{}) error {
 	log.Debugf("containerManager.WaitFSCheckpoint")
 	err := cm.l.k.WaitForFSSave()
@@ -955,72 +754,11 @@ func (cm *containerManager) WaitFSCheckpoint(*struct{}, *struct{}) error {
 	return err
 }
 
-// WaitFSRestoreArgs holds arguments to containerManager.WaitFSRestore.
-type WaitFSRestoreArgs struct {
-	// CID is the container ID.
-	CID string
-}
-
-func (cm *containerManager) WaitFSRestore(args *WaitFSRestoreArgs, _ *struct{}) error {
+func (cm *containerManager) WaitFSRestore(args *sentryapi.WaitFSRestoreArgs, _ *struct{}) error {
 	log.Debugf("containerManager.WaitFSRestore")
 	err := cm.l.fsRestore.wait(args.CID)
 	log.Debugf("containerManager.WaitFSRestore done, err = %v", err)
 	return err
-}
-
-// SignalDeliveryMode enumerates different signal delivery modes.
-type SignalDeliveryMode int
-
-const (
-	// DeliverToProcess delivers the signal to the container process with
-	// the specified PID. If PID is 0, then the container init process is
-	// signaled.
-	DeliverToProcess SignalDeliveryMode = iota
-
-	// DeliverToAllProcesses delivers the signal to all processes in the
-	// container. PID must be 0.
-	DeliverToAllProcesses
-
-	// DeliverToForegroundProcessGroup delivers the signal to the
-	// foreground process group in the same TTY session as the specified
-	// process. If PID is 0, then the signal is delivered to the foreground
-	// process group for the TTY for the init process.
-	DeliverToForegroundProcessGroup
-
-	// DeliverToProcessGroup delivers the signal to all processes in the
-	// process group identified by a PGID.
-	DeliverToProcessGroup
-)
-
-func (s SignalDeliveryMode) String() string {
-	switch s {
-	case DeliverToProcess:
-		return "Process"
-	case DeliverToAllProcesses:
-		return "All"
-	case DeliverToForegroundProcessGroup:
-		return "Foreground Process Group"
-	case DeliverToProcessGroup:
-		return "Process Group"
-	}
-	return fmt.Sprintf("unknown signal delivery mode: %d", s)
-}
-
-// SignalArgs are arguments to the Signal method.
-type SignalArgs struct {
-	// CID is the container ID.
-	CID string
-
-	// Signo is the signal to send to the process.
-	Signo int32
-
-	// PID is the process ID in the given container that will be signaled,
-	// relative to the root PID namespace, not the container's.
-	// If 0, the root container will be signalled.
-	PID int32
-
-	// Mode is the signal delivery mode.
-	Mode SignalDeliveryMode
 }
 
 // Signal sends a signal to one or more processes in a container. If args.PID
@@ -1028,20 +766,13 @@ type SignalArgs struct {
 // args.SignalDeliveryMode option, the signal may be sent directly to the
 // indicated process, to all processes in the container, or to the foreground
 // process group.
-func (cm *containerManager) Signal(args *SignalArgs, _ *struct{}) error {
+func (cm *containerManager) Signal(args *sentryapi.SignalArgs, _ *struct{}) error {
 	log.Debugf("containerManager.Signal: cid: %s, PID: %d, signal: %d, mode: %v", args.CID, args.PID, args.Signo, args.Mode)
 	return cm.l.signal(args.CID, args.PID, args.Signo, args.Mode)
 }
 
-// CreateTraceSessionArgs are arguments to the CreateTraceSession method.
-type CreateTraceSessionArgs struct {
-	Config seccheck.SessionConfig
-	Force  bool
-	urpc.FilePayload
-}
-
 // CreateTraceSession creates a new trace session.
-func (cm *containerManager) CreateTraceSession(args *CreateTraceSessionArgs, _ *struct{}) error {
+func (cm *containerManager) CreateTraceSession(args *sentryapi.CreateTraceSessionArgs, _ *struct{}) error {
 	log.Debugf("containerManager.CreateTraceSession: config: %+v", args.Config)
 	for i, sinkFile := range args.Files {
 		if sinkFile != nil {
@@ -1069,6 +800,10 @@ func (cm *containerManager) ListTraceSessions(_ *struct{}, out *[]seccheck.Sessi
 }
 
 // ProcfsDump dumps procfs state of the sandbox.
+//
+// Callers must not hold any thread-group leader's Task.mu in the sandbox.
+// checklocks cannot name the leader mutexes in the slice returned by
+// PIDNamespace.ThreadGroups.
 func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsDump) error {
 	log.Debugf("containerManager.ProcfsDump")
 	ts := cm.l.k.TaskSet()
@@ -1077,7 +812,7 @@ func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsD
 	*out = make([]procfs.ProcessProcfsDump, 0, len(tgs))
 	for _, tg := range tgs {
 		pid := pidns.IDOfThreadGroup(tg)
-		procDump, err := procfs.Dump(tg.Leader(), pid, pidns)
+		procDump, err := dumpProcfs(tg.Leader(), pid, pidns)
 		if err != nil {
 			log.Warningf("skipping procfs dump for PID %s: %v", pid, err)
 			continue
@@ -1087,28 +822,10 @@ func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsD
 	return nil
 }
 
-// MountArgs contains arguments to the Mount method.
-type MountArgs struct {
-	// ContainerID is the container in which we will mount the filesystem.
-	ContainerID string
-
-	// Source is the mount source.
-	Source string
-
-	// Destination is the mount target.
-	Destination string
-
-	// FsType is the filesystem type.
-	FsType string
-
-	// FilePayload contains the source image FD, if required by the filesystem.
-	urpc.FilePayload
-}
-
 const initTID kernel.ThreadID = 1
 
 // Mount mounts a filesystem in a container.
-func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
+func (cm *containerManager) Mount(args *sentryapi.MountArgs, _ *struct{}) error {
 	log.Debugf("containerManager.Mount, cid: %s, args: %+v", args.ContainerID, args)
 
 	var cu cleanup.Cleanup
@@ -1163,7 +880,7 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 		return fmt.Errorf("unsupported filesystem type: %v", fstype)
 	}
 
-	ctx := context.Background()
+	ctx := t.Kernel().SupervisorContext()
 	root := t.FSContext().RootDirectory()
 	defer root.DecRef(ctx)
 
@@ -1182,53 +899,28 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 }
 
 // ContainerRuntimeState returns the runtime state of a container.
-func (cm *containerManager) ContainerRuntimeState(cid *string, state *ContainerRuntimeState) error {
+func (cm *containerManager) ContainerRuntimeState(cid *string, state *sentryapi.ContainerRuntimeState) error {
 	log.Debugf("containerManager.ContainerRuntimeState: cid: %s", *cid)
 	*state = cm.l.containerRuntimeState(*cid)
 	return nil
 }
 
-// FSSaveArgs holds arguments to FSSave.
-type FSSaveArgs struct {
-	// FilePayload contains the following fscheckpoint files in order:
-	// 1. manifest file
-	// 2. multi-tar file
-	// 3. pages metadata file
-	// 4. pages file
-	urpc.FilePayload
-
-	// Path is the path inside the container to save.
-	Path string `json:"path"`
-
-	// Equivalent to kernel.FSSaveOpts fields.
-	ExitAfterSaving bool `json:"exit_after_saving"`
-
-	// If UseCheckpointGofer is true, FSSaveArgs.FilePayload should contain
-	// exactly one FD, which is a Unix domain socket connected to a URPC server
-	// implementing stateipc.AsyncFileServer.
-	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
-}
-
 // FSSave collects a filesystem checkpoint.
-func (cm *containerManager) FSSave(args *FSSaveArgs, _ *struct{}) error {
+//
+// +checklocksexclude:cm.l.k.fsSaveMu
+func (cm *containerManager) FSSave(args *sentryapi.FSSaveArgs, _ *struct{}) error {
 	log.Debugf("containerManager.FSSave")
 	kopts, err := convertToKernelFSSaveOpts(args)
 	if err != nil {
+		cm.l.k.SignalAllFSSaveWaiters(err)
 		return err
 	}
+	defer cm.l.stopIfKilled()
 	return cm.l.k.FSSave(cm.l.k.SupervisorContext(), &kopts)
 }
 
-// Savings holds the savings with restore.
-type Savings struct {
-	// CPUTimeSaved is the CPU time saved at restore.
-	CPUTimeSaved gtime.Duration
-	// WallTimeSaved is the wall time saved at restore.
-	WallTimeSaved gtime.Duration
-}
-
 // GetSavings returns the savings for restored sandboxes.
-func (cm *containerManager) GetSavings(_ *struct{}, s *Savings) error {
+func (cm *containerManager) GetSavings(_ *struct{}, s *sentryapi.Savings) error {
 	log.Debugf("containerManager.GetSavings")
 	cm.l.mu.Lock()
 	*s = cm.l.savings
@@ -1239,7 +931,7 @@ func (cm *containerManager) GetSavings(_ *struct{}, s *Savings) error {
 // SetNetworkArgs sets the network arguments. It configures host sockets
 // (packet fanout groups) before seccomp is installed, but does not create
 // the netstack links and routes.
-func (cm *containerManager) SetNetworkArgs(args *CreateLinksAndRoutesArgs, _ *struct{}) error {
+func (cm *containerManager) SetNetworkArgs(args *sentryapi.CreateLinksAndRoutesArgs, _ *struct{}) error {
 	log.Debugf("containerManager.SetNetworkArgs")
 	if args == nil {
 		return fmt.Errorf("cannot set nil networkArgs")
@@ -1281,6 +973,7 @@ func (cm *containerManager) SetNetworkArgs(args *CreateLinksAndRoutesArgs, _ *st
 			}
 			f := dupedFDs[fdIdx]
 			fdIdx++
+			cm.l.pinRing.Add(f.FD())
 
 			isSocket, err := fdbased.IsSocketFD(f.FD())
 			if err != nil {
@@ -1322,7 +1015,7 @@ func (cm *containerManager) SetNetworkArgs(args *CreateLinksAndRoutesArgs, _ *st
 }
 
 // GetNetworkConfig returns the network interfaces and routes.
-func (cm *containerManager) GetNetworkConfig(_ *struct{}, networkArgs *CreateLinksAndRoutesArgs) error {
+func (cm *containerManager) GetNetworkConfig(_ *struct{}, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
 	log.Debugf("containerManager.GetNetworkConfig")
 	cm.l.mu.Lock()
 	if cm.l.networkArgs != nil {

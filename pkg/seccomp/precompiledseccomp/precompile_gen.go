@@ -16,19 +16,18 @@
 // programs.
 package main
 
+// The example import is replaced by the genrule or removed in fastbuild mode.
 import (
 	_ "embed"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
-	"gvisor.dev/gvisor/runsc/flag"
-
-	// This import will be replaced by the one specified in the genrule,
-	// or removed if stubbed out in fastbuild mode.
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp/example" // REPLACED_IMPORT_THIS_IS_A_LOAD_BEARING_COMMENT
+	"gvisor.dev/gvisor/runsc/flag"
 )
 
 //go:embed precompiled_lib.tmpl.go
@@ -39,8 +38,8 @@ const (
 	packageNameStandin            = "precompiled"
 	precompiledseccompPackageName = "precompiledseccomp"
 	registrationComment           = "PROGRAM_REGISTRATION_GOES_HERE_THIS_IS_A_LOAD_BEARING_COMMENT"
+	namesListComment              = "PROGRAM_NAMES_LIST_GOES_HERE_THIS_IS_A_LOAD_BEARING_COMMENT"
 	disabledAtBuildtimeComment    = "PRECOMPILATION_DISABLED_AT_BUILD_TIME_THIS_IS_A_LOAD_BEARING_COMMENT"
-	programsMapVarName            = "programs"
 )
 
 // Flags.
@@ -55,6 +54,9 @@ var loadProgramsFn = example.PrecompiledPrograms // PROGRAMS_FUNC_THIS_IS_A_LOAD
 
 func main() {
 	flag.Parse()
+
+	debug.SetGCPercent(1000)
+	debug.SetMemoryLimit(2 << 30)
 
 	// Get a sorted list of programs.
 	var programs []precompiledseccomp.Program
@@ -105,16 +107,12 @@ func main() {
 			}
 			processedPackageComment = true
 		case strings.Contains(line, registrationComment):
-			var indent string
-			for {
-				var found bool
-				if line, found = strings.CutPrefix(line, "\t"); !found {
-					break
-				}
-				indent += "\t"
-			}
 			for _, program := range programs {
-				fmt.Fprint(outFile, program.Registration(indent, precompiledseccompPackageName, programsMapVarName))
+				fmt.Fprint(outFile, program.SwitchCase(precompiledseccompPackageName))
+			}
+		case strings.Contains(line, namesListComment):
+			for _, program := range programs {
+				fmt.Fprintf(outFile, "\t%q,\n", program.Name)
 			}
 		case strings.Contains(line, disabledAtBuildtimeComment):
 			fmt.Fprintf(outFile, "const PrecompilationDisabledAtBuildTime = %t\n", disabledAtBuildTime)

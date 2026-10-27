@@ -127,7 +127,7 @@ func GetEnvironment(ctx context.Context, t *testing.T, image string) (*TestEnvir
 	} else {
 		testLog(t, "%d GPUs detected", numGPU)
 	}
-	runtimeIsGVisor, err := dockerutil.IsGVisorRuntime(ctx, t)
+	runtimeIsGVisor, err := dockerutil.IsGVisorRuntime(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine if runtime is gVisor or not: %w", err)
 	}
@@ -709,7 +709,7 @@ func RunCudaTests(ctx context.Context, t *testing.T, args *RunCudaTestArgs) {
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeoutCause(context.Background(), maxDuration, errors.New("overall test timed out"))
+	ctx, cancel := context.WithTimeoutCause(ctx, maxDuration, errors.New("overall test timed out"))
 	defer cancel()
 	testDeadline, ok := ctx.Deadline()
 	if !ok {

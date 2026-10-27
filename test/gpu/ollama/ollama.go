@@ -54,9 +54,7 @@ type Ollama struct {
 	// A caller may set this to make forcefully unloading a model quicker.
 	cheapModels []*Model
 
-	// HasGPU is set depending on whether the LLM has GPU access.
-	// ollama supports running both on CPU and GPU, and detects this
-	// by spawning nvidia-smi.
+	// HasGPU reports whether the server detected a CUDA GPU.
 	HasGPU bool
 }
 
@@ -105,7 +103,7 @@ func New(ctx context.Context, server llmutil.Server, logger testutil.Logger) (*O
 	switch {
 	case strings.Contains(logs, "library=cpu"):
 		llm.HasGPU = false
-	case strings.Contains(logs, "library=cuda"):
+	case strings.Contains(logs, "library=CUDA"):
 		llm.HasGPU = true
 	default:
 		return nil, fmt.Errorf("cannot determine whether ollama is using GPU from logs:\n%s", logs)
@@ -683,7 +681,7 @@ func (llm *Ollama) WarmModel(ctx context.Context, model *Model, keepWarmFor time
 		if err != nil {
 			return nil, fmt.Errorf("cannot find a replacement model to load instead of %q to forcefully unload it: %w", model.Name, err)
 		}
-		unloadCtx, unloadCancel := context.WithTimeout(ctx, 3*time.Minute)
+		unloadCtx, unloadCancel := context.WithTimeout(ctx, 5*time.Minute)
 		_, err = llm.Prompt(unloadCtx, &Prompt{Model: replacementModel, KeepModelAlive: 1 * time.Millisecond})
 		unloadCancel()
 		if err != nil {

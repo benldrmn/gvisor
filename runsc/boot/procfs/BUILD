@@ -8,16 +8,10 @@ package(
 go_library(
     name = "procfs",
     srcs = ["dump.go"],
+    importpath = "gvisor.dev/gvisor/runsc/boot/procfs",
     visibility = ["//runsc:__subpackages__"],
     deps = [
-        "//pkg/abi/linux",
-        "//pkg/context",
         "//pkg/hostarch",
-        "//pkg/log",
-        "//pkg/sentry/fsimpl/proc",
-        "//pkg/sentry/kernel",
         "//pkg/sentry/limits",
-        "//pkg/sentry/mm",
-        "//pkg/sentry/vfs",
     ],
 )

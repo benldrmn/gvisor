@@ -22,7 +22,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/config"
@@ -69,7 +69,7 @@ func TestSharedVolume(t *testing.T) {
 	filename := filepath.Join(dir, "file")
 
 	// File does not exist yet. Reading from the sandbox should fail.
-	argsTestFile := &control.ExecArgs{
+	argsTestFile := &controlapi.ExecArgs{
 		Filename: "/usr/bin/test",
 		Argv:     []string{"test", "-f", filename},
 	}
@@ -105,7 +105,7 @@ func TestSharedVolume(t *testing.T) {
 	}
 
 	// We should be able to test the new filename from within the sandbox.
-	argsTestNewFile := &control.ExecArgs{
+	argsTestNewFile := &controlapi.ExecArgs{
 		Filename: "/usr/bin/test",
 		Argv:     []string{"test", "-f", newFilename},
 	}
@@ -128,7 +128,7 @@ func TestSharedVolume(t *testing.T) {
 	}
 
 	// Now create the file from WITHIN the sandbox.
-	argsTouch := &control.ExecArgs{
+	argsTouch := &controlapi.ExecArgs{
 		Filename: "/usr/bin/touch",
 		Argv:     []string{"touch", filename},
 		KUID:     auth.KUID(os.Getuid()),
@@ -146,7 +146,7 @@ func TestSharedVolume(t *testing.T) {
 	}
 
 	// Delete the file from within the sandbox.
-	argsRemove := &control.ExecArgs{
+	argsRemove := &controlapi.ExecArgs{
 		Filename: "/bin/rm",
 		Argv:     []string{"rm", filename},
 	}
@@ -264,8 +264,7 @@ func TestSharedVolumeFile(t *testing.T) {
 // TestSharedVolumeOverlay tests that changes to a shared volume that is
 // wrapped in an overlay are not visible externally.
 func TestSharedVolumeOverlay(t *testing.T) {
-	conf := testutil.TestConfig(t)
-	conf.Overlay2.Set("all:dir=/tmp")
+	conf := overlayTestConfig(t)
 
 	// File that will be used to check consistency inside/outside sandbox.
 	// Note that TmpDir() is set up as a shared volume by NewSpecWithArgs(). So

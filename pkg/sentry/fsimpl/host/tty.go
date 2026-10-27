@@ -37,6 +37,15 @@ type TTYFileDescription struct {
 	fileDescription
 }
 
+// Release implements vfs.FileDescriptionImpl.Release.
+//
+// It drops the inode reference taken in inode.OpenTTY.
+//
+// +checklocksexclude:t.inode.queue.mu
+func (t *TTYFileDescription) Release(ctx context.Context) {
+	t.inode.DecRef(ctx)
+}
+
 // TTY returns the kernel.TTY.
 func (t *TTYFileDescription) TTY() *kernel.TTY {
 	return t.inode.tty
@@ -66,6 +75,9 @@ func (t *TTYFileDescription) PRead(ctx context.Context, dst usermem.IOSequence, 
 //
 // Reading from a TTY is only allowed for foreground process groups. Background
 // process groups will either get EIO or a SIGTTIN.
+//
+// +checklocksexclude:t.fileDescription.offsetMu
+// +checklocksexclude:t.inode.bufMu
 func (t *TTYFileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	// Are we allowed to do the read?
 	// drivers/tty/n_tty.c:n_tty_read()=>job_control()=>tty_check_change().
@@ -78,6 +90,8 @@ func (t *TTYFileDescription) Read(ctx context.Context, dst usermem.IOSequence, o
 }
 
 // PWrite implements vfs.FileDescriptionImpl.PWrite.
+//
+// +checklocksexclude:t.inode.termiosMu
 func (t *TTYFileDescription) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
 	t.inode.termiosMu.Lock()
 	defer t.inode.termiosMu.Unlock()
@@ -92,6 +106,9 @@ func (t *TTYFileDescription) PWrite(ctx context.Context, src usermem.IOSequence,
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
+//
+// +checklocksexclude:t.inode.termiosMu
+// +checklocksexclude:t.fileDescription.offsetMu
 func (t *TTYFileDescription) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	t.inode.termiosMu.Lock()
 	defer t.inode.termiosMu.Unlock()
@@ -106,6 +123,8 @@ func (t *TTYFileDescription) Write(ctx context.Context, src usermem.IOSequence, 
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
+//
+// +checklocksexclude:t.inode.termiosMu
 func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	task := kernel.TaskFromContext(ctx)
 	if task == nil {
@@ -225,6 +244,20 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uin
 
 		return 0, nil
 
+	case linux.TIOCGSID:
+		// Args: pid_t *argp
+		// When successful, equivalent to *argp = tcgetsid(fd).
+		// Get the session ID of this terminal, which must be the calling
+		// process's controlling terminal.
+
+		sid, err := task.ThreadGroup().SessionID(t.TTY(), true /* requireCtty */)
+		if err != nil {
+			return 0, err
+		}
+		sidP := primitive.Int32(sid)
+		_, err = sidP.CopyOut(task, args[2].Pointer())
+		return 0, err
+
 	case linux.TIOCGWINSZ:
 		// Args: struct winsize *argp
 		// Get window size.
@@ -266,7 +299,7 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uin
 
 	case linux.TIOCNOTTY:
 		// Release this process's controlling terminal.
-		return 0, task.ThreadGroup().ReleaseControllingTTY(t.TTY())
+		return 0, task.ThreadGroup().ReleaseControllingTTY(ctx, t.TTY())
 
 	// Unimplemented commands.
 	case linux.TIOCSETD,
@@ -280,7 +313,6 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uin
 		linux.TIOCEXCL,
 		linux.TIOCNXCL,
 		linux.TIOCGEXCL,
-		linux.TIOCGSID,
 		linux.TIOCGETD,
 		linux.TIOCVHANGUP,
 		linux.TIOCGDEV,

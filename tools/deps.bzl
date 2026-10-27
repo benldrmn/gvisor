@@ -11,40 +11,99 @@ DepsInfo = provider(
 def _deps_check_impl(target, ctx):
     # Check the target's dependencies and add any of our own deps.
     deps = []
-    for dep in ctx.rule.attr.deps:
-        deps.append(dep)
+    if hasattr(ctx.rule.attr, "deps"):
+        for dep in ctx.rule.attr.deps:
+            deps.append(dep)
+
     nodes = {}
     if len(deps) != 0:
         nodes[target] = deps
 
     # Keep and propagate each dep's providers.
-    for dep in ctx.rule.attr.deps:
-        nodes.update(dep[DepsInfo].nodes)
+    if hasattr(ctx.rule.attr, "deps"):
+        for dep in ctx.rule.attr.deps:
+            if DepsInfo in dep:
+                nodes.update(dep[DepsInfo].nodes)
+
+    if hasattr(ctx.rule.attr, "actual_binary"):
+        dep = ctx.rule.attr.actual_binary
+        if dep and DepsInfo in dep:
+            nodes.update(dep[DepsInfo].nodes)
+
+            # Map target (the wrapper target) as depending on the wrapped target's deps.
+            if dep in dep[DepsInfo].nodes:
+                nodes[target] = dep[DepsInfo].nodes[dep]
 
     return [DepsInfo(nodes = nodes)]
 
 _deps_check = aspect(
     implementation = _deps_check_impl,
-    attr_aspects = ["deps"],
+    attr_aspects = ["deps", "actual_binary"],
 )
 
-def _is_allowed(target, allowlist, prefixes):
-    # Check for allowed prefixes.
-    for prefix in prefixes:
-        workspace, pfx = prefix.split("//", 1)
-        if len(workspace) > 0 and workspace[0] == "@":
-            workspace = workspace[1:]
-        if target.workspace_name == workspace and target.package.startswith(pfx):
+def _workspace_of(label):
+    # Under bzlmod, external labels have canonical workspace names like
+    # "gazelle++go_deps+org_golang_x_sys".
+    # Strip prefixes so that "@org_golang_x_sys//..." prefixes match.
+    return label.workspace_name.rsplit("+", 1)[-1]
+
+def _parse_prefix(prefix):
+    workspace, pkg = prefix.split("//", 1)
+    if len(workspace) > 0 and workspace[0] == "@":
+        workspace = workspace[1:]
+    return workspace, pkg
+
+def _matches_prefix(label, prefix):
+    workspace, pkg = _parse_prefix(prefix)
+    return _workspace_of(label) == workspace and label.package.startswith(pkg)
+
+def _canonical_go_proto_name(name):
+    if name.startswith("_") and name.endswith("_go_proto"):
+        return name[1:]
+    if name.endswith("_go_stubby"):
+        return name[:-len("_go_stubby")] + "_go_proto"
+    return name
+
+def _is_allowed(target, ctx):
+    canonical_name = _canonical_go_proto_name(target.name)
+
+    # Check the allowlist. It takes precedence over denied prefixes.
+    for allowed in ctx.attr.allowed:
+        if target == allowed.label:
+            return True
+        if canonical_name != target.name and _workspace_of(target) == _workspace_of(allowed.label) and target.package == allowed.label.package and canonical_name == allowed.label.name:
             return True
 
-    # Check the allowlist.
-    for allowed in allowlist:
-        if target == allowed.label:
+    # Check for denied prefixes.
+    for prefix in ctx.attr.denied_prefixes:
+        if _matches_prefix(target, prefix):
+            return False
+
+    # Check for allowed prefixes.
+    for prefix in ctx.attr.allowed_prefixes:
+        if _matches_prefix(target, prefix):
             return True
 
     return False
 
+def _check_definitely_not_allowed(ctx):
+    # `deps_test` already rejects any dependency that is not explicitly
+    # allowed, but this rejects additions to the allowlist itself, to make
+    # it obvious at review time that something that should definitely not
+    # be added is still being added. Defense in depth?
+    for denied in ctx.attr.definitely_not_allowed_prefixes:
+        denied_workspace, denied_pkg = _parse_prefix(denied)
+        for allowed in ctx.attr.allowed:
+            if _matches_prefix(allowed.label, denied):
+                fail("allowed entry %s matches definitely_not_allowed_prefixes entry %s" % (allowed.label, denied))
+        for prefix in ctx.attr.allowed_prefixes:
+            workspace, pkg = _parse_prefix(prefix)
+            if workspace == denied_workspace and (pkg.startswith(denied_pkg) or denied_pkg.startswith(pkg)):
+                fail("allowed_prefixes entry %s matches definitely_not_allowed_prefixes entry %s" % (prefix, denied))
+
 def _deps_test_impl(ctx):
+    _check_definitely_not_allowed(ctx)
+
     nodes = {}
     for target in ctx.attr.targets:
         for (node_target, node_deps) in target[DepsInfo].nodes.items():
@@ -52,11 +111,11 @@ def _deps_test_impl(ctx):
             # messages. Consider the case where A dependes on B and B depends
             # on C, and both B and C are disallowed. Avoid emitting an error
             # that B depends on C, when the real issue is that A depends on B.
-            if not _is_allowed(node_target.label, ctx.attr.allowed, ctx.attr.allowed_prefixes) and node_target.label != target.label:
+            if not _is_allowed(node_target.label, ctx) and node_target.label != target.label:
                 continue
             bad_deps = []
             for dep in node_deps:
-                if not _is_allowed(dep.label, ctx.attr.allowed, ctx.attr.allowed_prefixes):
+                if not _is_allowed(dep.label, ctx):
                     bad_deps.append(dep)
             if len(bad_deps) > 0:
                 nodes[node_target] = bad_deps
@@ -113,6 +172,17 @@ deps_test = rule(
         ),
         "allowed_prefixes": attr.string_list(
             doc = "Any packages beginning with these prefixes are allowed.",
+        ),
+        "denied_prefixes": attr.string_list(
+            doc = "Packages beginning with these prefixes are not allowed, " +
+                  "even if covered by allowed_prefixes. Targets listed in " +
+                  "allowed are still allowed.",
+        ),
+        "definitely_not_allowed_prefixes": attr.string_list(
+            doc = "Packages beginning with these prefixes must not be " +
+                  "covered by allowed or allowed_prefixes. Makes " +
+                  "'never add these' possible to be defined explicitly in " +
+                  "the BUILD file.",
         ),
     },
     test = True,

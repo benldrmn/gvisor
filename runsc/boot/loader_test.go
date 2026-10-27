@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -33,18 +34,24 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
-	"gvisor.dev/gvisor/runsc/fsgofer"
+	fsgofer "gvisor.dev/gvisor/runsc/gofer/fs"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 func init() {
+	// Reserve the initial thread for main so capability tests use threads that
+	// can exit if restoration fails. Locking during init pins main to this thread:
+	// https://pkg.go.dev/runtime#LockOSThread.
+	runtime.LockOSThread()
+
 	log.SetLevel(log.Debug)
 	if err := fsgofer.OpenProcSelfFD("/proc/self/fd"); err != nil {
 		panic(err)
@@ -151,6 +158,7 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		PodInitConfigFD:  -1,
 		ExecFD:           -1,
 		RootfsUpperTarFD: -1,
+		CPUDMALatencyFD:  -1,
 	}
 	l, err := New(args)
 	if err != nil {
@@ -247,9 +255,35 @@ func TestStartSignal(t *testing.T) {
 	}
 }
 
+// TestRestoreFailBeforeStart checks that a restore that fails before it starts
+// restoring reports the failure.
+func TestRestoreFailBeforeStart(t *testing.T) {
+	l, cleanup, err := createLoader(testConfig(), testSpec())
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer l.Destroy()
+	defer cleanup()
+	if err := l.ctrl.manager.Restore(&sentryapi.RestoreOpts{}, nil); err == nil {
+		t.Fatalf("restoring without files succeeded")
+	}
+	if err := l.waitRestore(); err == nil {
+		t.Errorf("waiting for the failed restore succeeded")
+	}
+}
+
 // Test that network=host with raw sockets enabled requires CAP_NET_RAW on the
 // host.
 func TestHostnetWithRawSockets(t *testing.T) {
+	// Capabilities are per-thread. Pin before saving or changing them.
+	runtime.LockOSThread()
+	restoreFailed := false
+	t.Cleanup(func() {
+		if !restoreFailed {
+			runtime.UnlockOSThread()
+		}
+	})
+
 	// Drop CAP_NET_RAW from effective capabilities, if we have it.
 	pid := os.Getpid()
 	caps, err := capability.NewPid2(0)
@@ -261,16 +295,17 @@ func TestHostnetWithRawSockets(t *testing.T) {
 	}
 	if caps.Get(capability.EFFECTIVE, capability.CAP_NET_RAW) {
 		caps.Unset(capability.EFFECTIVE, capability.CAP_NET_RAW)
-		if err := caps.Apply(capability.EFFECTIVE); err != nil {
-			t.Fatalf("error applying capabilities")
+		if err := caps.Apply(capability.CAPS); err != nil {
+			t.Fatalf("error applying capabilities: %v", err)
 		}
-		// Be nice and add it back when we are done.
-		defer func() {
+		t.Cleanup(func() {
 			caps.Set(capability.EFFECTIVE, capability.CAP_NET_RAW)
-			if err := caps.Apply(capability.EFFECTIVE); err != nil {
-				t.Fatalf("error restoring capabilities")
+			if err := caps.Apply(capability.CAPS); err != nil {
+				// Do not return a thread with altered capabilities to the runtime.
+				restoreFailed = true
+				t.Errorf("error restoring capabilities: %v", err)
 			}
-		}()
+		})
 	}
 
 	// Configure host network with raw sockets.
@@ -286,6 +321,7 @@ func TestHostnetWithRawSockets(t *testing.T) {
 		DevGoferFD:      -1,
 		PodInitConfigFD: -1,
 		ExecFD:          -1,
+		CPUDMALatencyFD: -1,
 	})
 	if err == nil {
 		l.Destroy()
@@ -624,7 +660,6 @@ func TestCreateMountPoint(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	cpuid.Initialize()
-	seccheck.Initialize()
 	os.Exit(m.Run())
 }
 
@@ -645,14 +680,14 @@ func TestNetworkConfig(t *testing.T) {
 		l.ctrl.manager.startResultChan <- nil
 	}()
 
-	args := &CreateLinksAndRoutesArgs{
-		LoopbackLinks: []LoopbackLink{
+	args := &sentryapi.CreateLinksAndRoutesArgs{
+		LoopbackLinks: []sentryapi.LoopbackLink{
 			{
 				Name: "lo",
-				Addresses: []IPWithPrefix{
+				Addresses: []sentryapi.IPWithPrefix{
 					{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
 				},
-				Routes: []Route{
+				Routes: []sentryapi.Route{
 					{
 						Destination: net.IPNet{
 							IP:   net.IP{127, 0, 0, 0},
@@ -666,11 +701,26 @@ func TestNetworkConfig(t *testing.T) {
 	if err := l.ctrl.manager.SetNetworkArgs(args, nil); err != nil {
 		t.Errorf("error calling SetNetworkConfig: %v", err)
 	}
-	var networkArgs CreateLinksAndRoutesArgs
+	var networkArgs sentryapi.CreateLinksAndRoutesArgs
 	if err := l.ctrl.manager.GetNetworkConfig(nil, &networkArgs); err != nil {
 		t.Errorf("error calling NetworkConfig: %v", err)
 	}
 	if diff := cmp.Diff(networkArgs.LoopbackLinks, args.LoopbackLinks); diff != "" {
 		t.Errorf("Network config content mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestSignalUnkillablePolicyMapping(t *testing.T) {
+	for _, tc := range []struct {
+		confPolicy   config.SignalUnkillablePolicy
+		kernelPolicy kernel.SignalUnkillablePolicy
+	}{
+		{config.SignalUnkillableNone, kernel.SignalUnkillableNone},
+		{config.SignalUnkillableLinux, kernel.SignalUnkillableLinux},
+		{config.SignalUnkillablePolicy(-1), kernel.SignalUnkillableNone},
+	} {
+		if got := signalUnkillablePolicy(tc.confPolicy); got != tc.kernelPolicy {
+			t.Errorf("signalUnkillablePolicy(%v) = %v, want %v", tc.confPolicy, got, tc.kernelPolicy)
+		}
 	}
 }

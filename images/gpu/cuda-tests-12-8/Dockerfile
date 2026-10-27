@@ -1,8 +1,6 @@
 FROM golang:1.25 AS builder
 
-COPY run_sample.go /run_sample.go
-RUN CGO_ENABLED=0         go build -o /run_sample /run_sample.go && \
-    CGO_ENABLED=0 GOBIN=/ go install github.com/TheZoraiz/ascii-image-converter@d05a757c5e02ab23e97b6f6fca4e1fbeb10ab559
+RUN CGO_ENABLED=0 GOBIN=/ go install github.com/TheZoraiz/ascii-image-converter@d05a757c5e02ab23e97b6f6fca4e1fbeb10ab559
 
 FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
@@ -13,6 +11,7 @@ ARG CUDA_SAMPLES_VERSION=v12.8
 WORKDIR /
 COPY *.cu *.h *.sh *.cc /
 ENV PATH=$PATH:/usr/local/nvidia/bin
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/nvidia/lib64:/usr/local/nvidia/lib
 RUN export DEBIAN_FRONTEND=noninteractive; \
     apt-get update && \
     apt-get install -y \
@@ -45,7 +44,7 @@ RUN git clone --depth=1 --branch="$CUDA_SAMPLES_VERSION" --single-branch \
 RUN chmod 555 /*.sh && \
     gcc -o /unsupported_ioctl /unsupported_ioctl.cc
 
-COPY --from=builder /run_sample /run_sample
+COPY run_sample /run_sample
 COPY --from=builder /ascii-image-converter /usr/bin/
 
 # Override entrypoint to nothing, otherwise all invocations will have

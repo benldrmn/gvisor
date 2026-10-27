@@ -180,6 +180,28 @@ doc(
     permalink = "/blog/2026/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
 )
 
+doc(
+    name = "systemd_in_gvisor",
+    src = "2026-09-17-systemd-in-gvisor.md",
+    authors = [
+        "relkochta",
+        "shailend",
+    ],
+    layout = "post",
+    permalink = "/blog/2026/09/17/systemd-in-gvisor/",
+)
+
+doc(
+    name = "gvisor_cncf",
+    src = "2026-10-02-gvisor-cncf.md",
+    authors = [
+        "eperot",
+        "chjing",
+    ],
+    layout = "post",
+    permalink = "/blog/2026/10/02/gvisor-cncf/",
+)
+
 docs(
     name = "posts",
     deps = [

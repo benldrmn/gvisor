@@ -83,12 +83,15 @@ var metaDataLengths = map[metaKey]int{
 	linux.NFT_META_L4PROTO:   1,
 	linux.NFT_META_SKUID:     4,
 	linux.NFT_META_SKGID:     4,
+	linux.NFT_META_MARK:      4,
 	linux.NFT_META_RTCLASSID: 4,
 	linux.NFT_META_PKTTYPE:   1,
 	linux.NFT_META_PRANDOM:   4,
 	linux.NFT_META_TIME_NS:   8,
 	linux.NFT_META_TIME_DAY:  1,
 	linux.NFT_META_TIME_HOUR: 4,
+	linux.NFT_META_OIFNAME:   linux.IFNAMSIZ,
+	linux.NFT_META_IIFNAME:   linux.IFNAMSIZ,
 }
 
 // validateMetaKey ensures the meta key is valid.
@@ -96,8 +99,10 @@ func validateMetaKey(key metaKey) *syserr.AnnotatedError {
 	switch key {
 	case linux.NFT_META_LEN, linux.NFT_META_PROTOCOL, linux.NFT_META_NFPROTO,
 		linux.NFT_META_L4PROTO, linux.NFT_META_SKUID, linux.NFT_META_SKGID,
+		linux.NFT_META_MARK,
 		linux.NFT_META_RTCLASSID, linux.NFT_META_PKTTYPE, linux.NFT_META_PRANDOM,
-		linux.NFT_META_TIME_NS, linux.NFT_META_TIME_DAY, linux.NFT_META_TIME_HOUR:
+		linux.NFT_META_TIME_NS, linux.NFT_META_TIME_DAY, linux.NFT_META_TIME_HOUR,
+		linux.NFT_META_OIFNAME, linux.NFT_META_IIFNAME:
 
 		return nil
 	default:
@@ -112,11 +117,11 @@ var metaAttrPolicy = []NlaPolicy{
 }
 
 func initMeta(tab *Table, exprInfo ExprInfo) (operation, *syserr.AnnotatedError) {
-	attrs, ok := NfParseWithOpts(exprInfo.ExprData, &NfParseOpts{
+	attrs, err := NfParseWithOpts(exprInfo.ExprData, &NfParseOpts{
 		Policy: metaAttrPolicy,
 	})
-	if !ok {
-		return nil, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Failed to parse meta expression data")
+	if err != nil {
+		return nil, err
 	}
 	if _, ok := attrs[linux.NFTA_META_SREG]; ok {
 		if _, ok := attrs[linux.NFTA_META_DREG]; ok {

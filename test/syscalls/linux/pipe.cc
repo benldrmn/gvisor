@@ -15,23 +15,36 @@
 #include <errno.h>
 #include <fcntl.h> /* Obtain O_* constant definitions */
 #include <linux/futex.h>
+#include <linux/limits.h>
 #include <linux/magic.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <syscall.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <climits>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <string>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/logging.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/signal_util.h"
@@ -623,19 +636,20 @@ TEST_P(PipeTest, SizeChangeMax) {
 TEST_P(PipeTest, SizeChangeFull) {
   SKIP_IF(!CreateBlocking());
 
-  // Ensure that we adjust to a large enough size to avoid rounding when we
-  // perform the size decrease. If rounding occurs, we may not actually
-  // adjust the size and the call below will return success. It was found via
-  // experimentation that this granularity avoids the rounding for Linux.
-  constexpr int kDelta = 64 * 1024;
-  ASSERT_THAT(fcntl(wfd_.get(), F_SETPIPE_SZ, Size() + kDelta),
+  // Resize the pipe to 2 pages, fill it, and try to shrink it to 1 page.
+  // We use explicit sizes instead of relative adjustments from the default
+  // because:
+  // 1. On systems with 64KB pages, the default 16-page pipe is already at the
+  //    1MB maximum size limit, so attempting to grow it first would fail.
+  // 2. The "smallbuffer" test configuration initializes pipes to 1 page (the
+  //    absolute kernel minimum), so we cannot shrink it below its initial size
+  //    to trigger EBUSY.
+  ASSERT_THAT(fcntl(wfd_.get(), F_SETPIPE_SZ, 2 * kPageSize),
               SyscallSucceeds());
-
-  // Fill the buffer and try to change down.
   std::vector<char> buf(Size());
   ASSERT_THAT(write(wfd_.get(), buf.data(), buf.size()),
               SyscallSucceedsWithValue(buf.size()));
-  EXPECT_THAT(fcntl(wfd_.get(), F_SETPIPE_SZ, Size() - kDelta),
+  EXPECT_THAT(fcntl(wfd_.get(), F_SETPIPE_SZ, kPageSize),
               SyscallFailsWithErrno(EBUSY));
 }
 

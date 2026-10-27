@@ -46,6 +46,7 @@ go_library(
         "//pkg/context",
         "//pkg/cpuid",
         "//pkg/fd",
+        "//pkg/gomaxprocs",
         "//pkg/hostarch",
         "//pkg/hostsyscall",
         "//pkg/hosttid",
@@ -55,10 +56,12 @@ go_library(
         "//pkg/seccomp",
         "//pkg/sentry/arch",
         "//pkg/sentry/arch/fpu",
+        "//pkg/sentry/hostmm",
         "//pkg/sentry/memmap",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/interrupt",
         "//pkg/sighandling",
+        "//pkg/timing",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -69,7 +72,7 @@ go_test(
     srcs = [
         "slimvm_test.go",
     ],
-    library = ":slimvm",
+    embed = [":slimvm"],
     # TODO: b/529809802 - Enable nogo.
     nogo = False,
     tags = [
@@ -91,6 +94,7 @@ go_test(
         "//pkg/sentry/arch",
         "//pkg/sentry/arch/fpu",
         "//pkg/sentry/platform",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sentry/platform/slimvm/testutil",
         "//pkg/sentry/time",
         "@org_golang_x_sys//unix:go_default_library",

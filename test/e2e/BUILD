@@ -13,14 +13,12 @@ go_test(
         "integration_test.go",
     ],
 
-    # runsc is needed to invalidate the bazel cache in case of any code changes.
-    data = ["//runsc"],
-    library = ":integration",
-    tags = [
-        # Requires docker and runsc to be configured before the test runs.
-        "local",
-        "manual",
-    ],
+    # Needed to invalidate the bazel cache in case of any code changes.
+    data = ["//:release"],
+    embed = [":integration"],
+    # Requires docker and runsc to be configured before the test runs.
+    local = True,
+    tags = ["manual"],
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/abi/linux",
@@ -34,22 +32,49 @@ go_test(
 )
 
 go_test(
+    name = "uds_proxy_test",
+    size = "large",
+    srcs = [
+        "uds_proxy_test.go",
+    ],
+    # Needed to invalidate the bazel cache in case of any code changes.
+    data = ["//:release"],
+    embed = [":integration"],
+    # Requires docker and the $(RUNTIME)-net-uds runtime to be configured
+    # before the test runs.
+    local = True,
+    tags = ["manual"],
+    visibility = ["//:sandbox"],
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/adapters/gonet",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/link/fdbased",
+        "//pkg/tcpip/network/ipv4",
+        "//pkg/tcpip/stack",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/test/dockerutil",
+        "//pkg/test/testutil",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
     name = "integration_runtime_test",
     size = "large",
     srcs = [
         "integration_runtime_test.go",
         "systemd_test.go",
     ],
-    # runsc is needed to invalidate the bazel cache in case of any code changes.
-    data = ["//runsc"],
-    library = ":integration",
-    tags = [
-        # Requires docker and runsc to be configured before the test runs.
-        "local",
-        "manual",
-    ],
+    # Needed to invalidate the bazel cache in case of any code changes.
+    data = ["//:release"],
+    embed = [":integration"],
+    # Requires docker and runsc to be configured before the test runs.
+    local = True,
+    tags = ["manual"],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/cleanup",
         "//pkg/fsutil",
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",
@@ -64,19 +89,36 @@ go_test(
     srcs = [
         "runtime_in_docker_test.go",
     ],
-    # runsc is needed to invalidate the bazel cache in case of any code changes.
-    data = ["//runsc"],
-    library = ":integration",
-    tags = [
-        # Requires docker and runsc to be configured before the test runs.
-        "local",
-        "manual",
-    ],
+    # Needed to invalidate the bazel cache in case of any code changes.
+    data = ["//:release"],
+    embed = [":integration"],
+    # Requires docker and runsc to be configured before the test runs.
+    local = True,
+    tags = ["manual"],
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",
         "@com_github_docker_docker//api/types/mount:go_default_library",
+    ],
+)
+
+go_test(
+    name = "podman_test",
+    size = "large",
+    srcs = [
+        "podman_test.go",
+    ],
+    # runsc is needed to invalidate the bazel cache in case of any code changes.
+    data = ["//:release"],
+    embed = [":integration"],
+    # Requires docker and runsc to be configured before the test runs.
+    local = True,
+    tags = ["manual"],
+    visibility = ["//:sandbox"],
+    deps = [
+        "//pkg/test/dockerutil",
+        "//pkg/test/testutil",
     ],
 )
 

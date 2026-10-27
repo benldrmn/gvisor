@@ -13,29 +13,47 @@
 // limitations under the License.
 
 #include <elf.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <linux/capability.h>
+#include <linux/prctl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/flags/flag.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/capability_util.h"
+#include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
 #include "test/util/multiprocess_util.h"
@@ -47,6 +65,7 @@
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 #include "test/util/time_util.h"
+#include "test/util/timer_util.h"
 
 ABSL_FLAG(bool, ptrace_test_execve_child, false,
           "If true, run the "
@@ -99,10 +118,6 @@ namespace {
 // definitions)").
 constexpr auto kPtraceGetSigMask = static_cast<__ptrace_request>(0x420a);
 constexpr auto kPtraceSetSigMask = static_cast<__ptrace_request>(0x420b);
-
-// PTRACE_SYSEMU is not defined until glibc 2.27 (c48831d0eebf "linux/x86: sync
-// sys/ptrace.h with Linux 4.14 [BZ #22433]").
-constexpr auto kPtraceSysemu = static_cast<__ptrace_request>(31);
 
 // PTRACE_EVENT_STOP is not defined until glibc 2.26 (3f67d1a7021e "Add Linux
 // PTRACE_EVENT_STOP").
@@ -248,6 +263,132 @@ TEST(PtraceTest, AttachSameThreadGroup) {
   ScopedThread([&] {
     EXPECT_THAT(ptrace(PTRACE_ATTACH, tid, 0, 0), SyscallFailsWithErrno(EPERM));
   });
+}
+
+// Memory access to a tracee that became non-dumpable after attach is governed
+// by the tracer credentials captured when tracing began, not the tracer's
+// current credentials; see Linux's kernel/ptrace.c:ptrace_access_vm().
+volatile int64_t ptrace_access_vm_marker = 0x123456789abcdef;
+
+void CheckPeekAfterEffectiveCapChange(bool cap_at_attach) {
+  int fds[2];
+  ASSERT_THAT(pipe2(fds, O_NONBLOCK), SyscallSucceeds());
+
+  pid_t const child_pid = fork();
+  if (child_pid == 0) {
+    close(fds[0]);
+    raise(SIGSTOP);
+    // Resumed by the (now attached) tracer.
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) {
+      _exit(30);
+    }
+    if (write(fds[1], "r", 1) != 1) {
+      _exit(31);
+    }
+    close(fds[1]);
+    raise(SIGSTOP);
+    _exit(0);
+  }
+  ASSERT_THAT(child_pid, SyscallSucceeds());
+  close(fds[1]);
+  auto cleanup = Cleanup([child_pid, &fds] {
+    close(fds[0]);
+    kill(child_pid, SIGKILL);
+    RetryEINTR(waitpid)(child_pid, nullptr, 0);
+  });
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, WUNTRACED),
+              SyscallSucceedsWithValue(child_pid));
+  ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) << status;
+
+  {
+    AutoCapability cap(CAP_SYS_PTRACE, cap_at_attach);
+    ASSERT_THAT(ptrace(PTRACE_ATTACH, child_pid, 0, 0), SyscallSucceeds());
+    ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0),
+                SyscallSucceedsWithValue(child_pid));
+    ASSERT_TRUE(WIFSTOPPED(status)) << status;
+
+    // Resume the tracee until it has made itself non-dumpable and stopped
+    // again. It may stop several times first to have pending SIGSTOPs
+    // delivered.
+    bool ready = false;
+    for (int i = 0; i < 5 && !ready; i++) {
+      ASSERT_THAT(ptrace(PTRACE_CONT, child_pid, 0, 0), SyscallSucceeds());
+      ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0),
+                  SyscallSucceedsWithValue(child_pid));
+      ASSERT_TRUE(WIFSTOPPED(status)) << status;
+      char b;
+      ready = ReadFd(fds[0], &b, 1) == 1;
+    }
+    ASSERT_TRUE(ready) << "tracee never became non-dumpable";
+  }
+
+  {
+    AutoCapability cap(CAP_SYS_PTRACE, !cap_at_attach);
+    errno = 0;
+    int64_t const peeked =
+        ptrace(PTRACE_PEEKDATA, child_pid, &ptrace_access_vm_marker, 0);
+    int64_t const peek_errno = (peeked == -1) ? errno : 0;
+    errno = 0;
+    int64_t const poked = ptrace(PTRACE_POKEDATA, child_pid,
+                                 &ptrace_access_vm_marker, 0x11223344);
+    int64_t const poke_errno = (poked == -1) ? errno : 0;
+    if (cap_at_attach) {
+      EXPECT_EQ(peek_errno, 0);
+      EXPECT_EQ(poke_errno, 0);
+    } else {
+      EXPECT_EQ(peek_errno, EIO);
+      EXPECT_EQ(poke_errno, EIO);
+    }
+  }
+}
+
+TEST(PtraceTest, AccessVmUsesAttachCreds_CapDroppedAfterAttach) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_PTRACE)));
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) > 2);
+  CheckPeekAfterEffectiveCapChange(/*cap_at_attach=*/true);
+}
+
+TEST(PtraceTest, AccessVmUsesAttachCreds_CapGainedAfterAttach) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_PTRACE)));
+  // The attach happens without effective CAP_SYS_PTRACE, which Yama scope 2
+  // forbids.
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) > 1);
+  CheckPeekAfterEffectiveCapChange(/*cap_at_attach=*/false);
+}
+
+// PTRACE_TRACEME performs no dumpability check: Linux authorizes it via
+// security_ptrace_traceme() (commoncap.c:cap_ptrace_traceme()), not
+// __ptrace_may_access(), so it succeeds even for a non-dumpable child whose mm
+// belongs to an outer user namespace.
+TEST(PtraceTest, TracemeNonDumpableInUserns) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  // The helper must be single-threaded to unshare a user namespace, so fork
+  // before dropping privileges.
+  pid_t helper = fork();
+  if (helper == 0) {
+    if (setgroups(0, nullptr) != 0) _exit(20);
+    if (setresgid(12345, 12345, 12345) != 0) _exit(21);
+    if (setresuid(12345, 12345, 12345) != 0) _exit(22);
+    if (unshare(CLONE_NEWUSER) != 0) _exit(23);
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) _exit(24);
+    pid_t child = fork();
+    if (child == 0) {
+      _exit(ptrace(PTRACE_TRACEME, 0, 0, 0) == 0 ? 0 : 1);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child) _exit(25);
+    _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 26);
+  }
+  ASSERT_GT(helper, 0);
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(helper, &status, 0),
+              SyscallSucceedsWithValue(helper));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "helper status: " << status;
 }
 
 TEST(PtraceTest, TraceParentNotAllowed) {
@@ -834,14 +975,20 @@ TEST(PtraceTest, PrctlSetPtracerDoesNotPersistPastTracerThreadExit) {
   });
   t.Join();
 
-  // Sleep for a bit before verifying the invalidation. The thread exit above
-  // should cause the ptrace exception to be invalidated, but in Linux, this is
-  // not done immediately. The YAMA exception is dropped during
-  // __put_task_struct(), which occurs (at the earliest) one RCU grace period
-  // after exit_notify() ==> release_task().
-  SleepSafe(absl::Milliseconds(100));
+  // The YAMA exception is dropped during __put_task_struct(), after an RCU
+  // grace period. Joining the thread does not wait for that cleanup, so wait
+  // for the observable denial rather than assuming a fixed delay is enough.
+  const absl::Time deadline = Now(CLOCK_MONOTONIC) + absl::Seconds(5);
+  int ret;
+  do {
+    ret = CheckPtraceAttach(tracee_tid);
+    if (ret < 0) {
+      break;
+    }
+    SleepSafe(absl::Milliseconds(10));
+  } while (Now(CLOCK_MONOTONIC) < deadline);
 
-  TEST_CHECK(CheckPtraceAttach(tracee_tid) == -1);
+  TEST_CHECK(ret == -1);
   TEST_PCHECK(errno == EPERM);
   _exit(0);
 }
@@ -958,6 +1105,9 @@ TEST(PtraceTest, PrctlClearPtracerDoesNotAffectCurrentTracer) {
   pid_t const tracee_pid = fork();
   if (tracee_pid == 0) {
     TEST_PCHECK(close(sockets[1]) == 0);
+    // /proc/PID/mem checks the tracer's effective capabilities against the
+    // tracee's permitted set. AutoCapability only cleared the effective bit.
+    TEST_CHECK(DropPermittedCapability(CAP_SYS_PTRACE).ok());
     TEST_PCHECK(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == 0);
     MaybeSave();
     // Indicate that the prctl has been set.
@@ -1167,8 +1317,7 @@ TEST(PtraceTest, GetSigMask) {
 
     // Install a signal handler for kBlockSignal to avoid termination and block
     // it.
-    TEST_PCHECK(signal(
-                    kBlockSignal, +[](int signo) {}) != SIG_ERR);
+    TEST_PCHECK(signal(kBlockSignal, +[](int signo) {}) != SIG_ERR);
     MaybeSave();
     TEST_PCHECK(sigprocmask(SIG_SETMASK, &blocked, nullptr) == 0);
     MaybeSave();
@@ -1452,6 +1601,44 @@ TEST(PtraceTest, GetRegSetPartialRead) {
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << " status " << status;
 }
+
+#if defined(__aarch64__)
+TEST(PtraceTest, SetRegSetKeepsTLS) {
+  pid_t const child_pid = fork();
+  if (child_pid == 0) {
+    uint64_t tls_before;
+    __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(tls_before));
+    TEST_PCHECK(ptrace(PTRACE_TRACEME, 0, 0, 0) == 0);
+    MaybeSave();
+    kill(getpid(), SIGSTOP);
+    uint64_t tls_after;
+    __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(tls_after));
+    _exit(tls_after == tls_before ? 0 : 1);
+  }
+  ASSERT_THAT(child_pid, SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP)
+      << " status " << status;
+
+  struct user_regs_struct regs;
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  ASSERT_THAT(ptrace(PTRACE_GETREGSET, child_pid, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  ASSERT_THAT(ptrace(PTRACE_SETREGSET, child_pid, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+
+  ASSERT_THAT(ptrace(PTRACE_CONT, child_pid, 0, 0), SyscallSucceeds());
+  ASSERT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+}
+#endif
 
 #if defined(__x86_64__)
 #define SYSNO_STR1(x) #x
@@ -1999,6 +2186,10 @@ TEST(PtraceTest, Int3) {
 }
 
 TEST(PtraceTest, Sysemu_PokeUser) {
+  // PTRACE_SYSEMU is not defined until glibc 2.27 (c48831d0eebf "linux/x86:
+  // sync sys/ptrace.h with Linux 4.14 [BZ #22433]").
+  constexpr auto kPtraceSysemu = static_cast<__ptrace_request>(31);
+
   constexpr int kSysemuHelperFirstExitCode = 126;
   constexpr uint64_t kSysemuInjectedExitGroupReturn = 42;
 
@@ -2380,7 +2571,7 @@ TEST(PtraceTest, SeizeSetOptions) {
 
 TEST(PtraceTest, SetYAMAPtraceScope) {
   // Do not modify the ptrace scope on the host.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
   const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
@@ -2474,6 +2665,8 @@ TEST(PtraceTest, ExecvePtraceLockStress) {
 }  // namespace testing
 }  // namespace gvisor
 
+using gvisor::testing::RunPrctlSetPtracerDoesNotPersistPastNonLeaderExec;
+
 int main(int argc, char** argv) {
   gvisor::testing::TestInit(&argc, &argv);
 
@@ -2501,8 +2694,7 @@ int main(int argc, char** argv) {
   }
 
   if (absl::GetFlag(FLAGS_ptrace_test_prctl_set_ptracer_and_exec_non_leader)) {
-    gvisor::testing::RunPrctlSetPtracerDoesNotPersistPastNonLeaderExec(
-        fd);
+    RunPrctlSetPtracerDoesNotPersistPastNonLeaderExec(fd);
   }
 
   if (absl::GetFlag(

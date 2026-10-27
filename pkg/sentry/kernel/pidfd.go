@@ -129,6 +129,9 @@ func (t *Task) pidFDOpen(pid *pid, isThread bool, nonBlock bool) (*vfs.FileDescr
 }
 
 // PIDFDGetFD helps implement the Linux syscall pidfd_getfd(2).
+//
+// Callers must not hold the mutex of the task selected by pidfd.
+// checklocks cannot name that task from the descriptor number.
 func (t *Task) PIDFDGetFD(pidfd int32, targetfd int32, flags uint32) (uintptr, error) {
 	file := t.GetFile(pidfd)
 	if file == nil {
@@ -385,15 +388,15 @@ func (t *Task) PIDFDSendSignal(vfsfd *vfs.FileDescription, sig linux.Signal, inf
 
 	switch effectiveFlags {
 	case linux.PIDFD_SIGNAL_THREAD:
-		return target.SendSignal(info)
+		return target.SendSignalFrom(t, info)
 	case linux.PIDFD_SIGNAL_THREAD_GROUP:
-		return target.SendGroupSignal(info)
+		return target.SendGroupSignalFrom(t, info)
 	case linux.PIDFD_SIGNAL_PROCESS_GROUP:
 		tg := target.ThreadGroup()
 		if tg.ProcessGroup().Originator() != tg {
 			return linuxerr.EINVAL
 		}
-		return tg.ProcessGroup().SendSignal(info)
+		return tg.ProcessGroup().SendSignalFrom(t, info)
 	default: // Unreachable.
 		t.Warningf("Unexpected error in PIDFDSendSignal with flags %d", flags)
 		return linuxerr.EINVAL

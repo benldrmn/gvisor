@@ -44,7 +44,13 @@ type nic struct {
 	stack   *Stack
 	id      tcpip.NICID
 	name    string
+	kind    string
 	context NICContext
+
+	// minMTU and maxMTU are immutable bounds on MTU changes. Zero means that
+	// the corresponding bound is unrestricted.
+	minMTU uint32
+	maxMTU uint32
 
 	stats sharedStats
 
@@ -55,7 +61,7 @@ type nic struct {
 
 	// The network endpoints themselves may be modified by calling the interface's
 	// methods, but the map reference and entries must be constant.
-	networkEndpoints          map[tcpip.NetworkProtocolNumber]NetworkEndpoint
+	networkEndpoints          map[tcpip.NetworkProtocolNumber]NetworkEndpoint `state:"wait"`
 	linkAddrResolvers         map[tcpip.NetworkProtocolNumber]*linkResolver
 	duplicateAddressDetectors map[tcpip.NetworkProtocolNumber]DuplicateAddressDetector
 
@@ -195,6 +201,9 @@ func newNIC(stack *Stack, id tcpip.NICID, ep LinkEndpoint, opts NICOptions) *nic
 		qDisc:                     qDisc,
 		deliverLinkPackets:        opts.DeliverLinkPackets,
 		experimentIPOptionEnabled: opts.EnableExperimentIPOption,
+		kind:                      opts.Kind,
+		minMTU:                    opts.MinMTU,
+		maxMTU:                    opts.MaxMTU,
 	}
 	nic.linkResQueue.init(nic)
 

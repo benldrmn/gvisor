@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
 
@@ -150,9 +151,14 @@ func (pg *ProcessGroup) incRefWithParent(parentPG *ProcessGroup) {
 //
 // Precondition: callers must hold TaskSet.mu for writing.
 func (pg *ProcessGroup) decRefWithParent(parentPG *ProcessGroup) {
+	// POSIX signals a group's stopped members only when it becomes orphaned
+	// (compare kernel/exit.c:kill_orphaned_pgrp); a member leaving a group
+	// that was already orphaned must not signal it.
+	newlyOrphaned := false
 	// See incRefWithParent regarding parent == nil.
 	if pg != parentPG && (parentPG == nil || pg.session == parentPG.session) {
 		pg.ancestors--
+		newlyOrphaned = pg.ancestors == 0
 	}
 
 	alive := true
@@ -170,7 +176,7 @@ func (pg *ProcessGroup) decRefWithParent(parentPG *ProcessGroup) {
 		pg.session.processGroups.Remove(pg)
 		pg.session.DecRef()
 	})
-	if alive {
+	if alive && newlyOrphaned {
 		pg.handleOrphan()
 	}
 }
@@ -213,13 +219,14 @@ func (pg *ProcessGroup) handleOrphan() {
 	}
 
 	// Deliver appropriate signals to all thread groups.
-	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup, tgLeader *Task) {
+	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup, _ *Task) {
 		if tg.processGroup != pg {
 			return
 		}
 		tg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
-		tgLeader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
-		tgLeader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
+		leader := tg.leader
+		_ = leader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
+		_ = leader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
 		tg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 	})
 
@@ -230,9 +237,22 @@ func (pg *ProcessGroup) Session() *Session {
 	return pg.session
 }
 
-// SendSignal sends a signal to all processes inside the process group. It is
-// analogous to kernel/signal.c:kill_pgrp.
+// SendSignal sends a signal to all processes inside the process group as the
+// sentry itself. It is analogous to kernel/signal.c:kill_pgrp with priv set.
 func (pg *ProcessGroup) SendSignal(info *linux.SignalInfo) error {
+	return pg.sendSignal(info, nil /* sender */)
+}
+
+// SendSignalFrom sends a signal to all processes inside the process group on
+// behalf of sender; see Task.SendSignalFrom.
+func (pg *ProcessGroup) SendSignalFrom(sender *Task, info *linux.SignalInfo) error {
+	return pg.sendSignal(info, sender)
+}
+
+// sendSignal sends a signal to all processes inside the process group. If
+// sender is nil, the signal is sent by the sentry itself and is forced for all
+// of them; see ThreadGroup.signalForcedFrom.
+func (pg *ProcessGroup) sendSignal(info *linux.SignalInfo, sender *Task) error {
 	tasks := pg.originator.TaskSet()
 	tasks.mu.RLock()
 	defer tasks.mu.RUnlock()
@@ -240,9 +260,10 @@ func (pg *ProcessGroup) SendSignal(info *linux.SignalInfo) error {
 	var lastErr error
 	for tg := range tasks.Root.tgids {
 		if tg.processGroup == pg {
+			forced := tg.signalForcedFrom(sender)
 			tg.signalHandlers.mu.Lock()
 			infoCopy := *info
-			if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
+			if err := tg.leader.sendSignalTimerLocked(&infoCopy, true /*group*/, forced, nil); err != nil {
 				lastErr = err
 			}
 			tg.signalHandlers.mu.Unlock()
@@ -255,17 +276,29 @@ func (pg *ProcessGroup) SendSignal(info *linux.SignalInfo) error {
 //
 // EPERM may be returned if either the given ThreadGroup is already a Session
 // leader, or a ProcessGroup already exists for the ThreadGroup's ID.
-func (tg *ThreadGroup) CreateSession() (SessionID, error) {
+func (tg *ThreadGroup) CreateSession(ctx context.Context) (SessionID, error) {
 	tg.pidns.owner.mu.Lock()
-	defer tg.pidns.owner.mu.Unlock()
-	tg.signalHandlers.mu.Lock()
-	defer tg.signalHandlers.mu.Unlock()
-	return tg.createSession()
+	sid, err := tg.createSession()
+	var oldTTY *TTY
+	if err == nil {
+		// tg.tty is protected by the signal mutex, which must not be held
+		// across createSession: it may orphan the old process group, and
+		// handleOrphan locks the signal mutex of each remaining member.
+		tg.signalHandlers.mu.Lock()
+		oldTTY = tg.tty
+		tg.tty = nil
+		tg.signalHandlers.mu.Unlock()
+	}
+	tg.pidns.owner.mu.Unlock()
+	if oldTTY != nil {
+		oldTTY.DecRef(ctx)
+	}
+	return sid, err
 }
 
 // createSession creates a new session for a threadgroup.
 //
-// Precondition: callers must hold TaskSet.mu and the signal mutex for writing.
+// +checklocks:tg.pidns.owner.mu
 func (tg *ThreadGroup) createSession() (SessionID, error) {
 	// Get the ID for this thread in the current namespace.
 	id := tg.pidns.tgids[tg]
@@ -322,11 +355,8 @@ func (tg *ThreadGroup) createSession() (SessionID, error) {
 			childTG.processGroup.incRefWithParent(pg)
 			childTG.processGroup.decRefWithParent(oldParentPG)
 		})
-		// If tg.processGroup is an orphan, decRefWithParent will lock
-		// the signal mutex of each thread group in tg.processGroup.
-		// However, tg's signal mutex may already be locked at this
-		// point. We change tg's process group before calling
-		// decRefWithParent to avoid locking tg's signal mutex twice.
+		// Reassign before decRef so tg isn't signaled as a member of the
+		// old group if it becomes orphaned.
 		oldPG := tg.processGroup
 		tg.processGroup = pg
 		oldPG.decRefWithParent(oldParentPG)
@@ -353,9 +383,8 @@ func (tg *ThreadGroup) createSession() (SessionID, error) {
 		ns.processGroups[ProcessGroupID(local)] = pg
 	}
 
-	// Disconnect from the controlling terminal.
-	tg.tty = nil
-
+	// The caller disconnects the controlling terminal (tg.tty), which is
+	// protected by the signal mutex.
 	return sid, nil
 }
 

@@ -23,11 +23,11 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -56,12 +56,12 @@ func TestExecCapabilities(t *testing.T) {
 
 	// Check that capability.
 	caps := []string{"CapInh", "CapPrm", "CapEff", "CapBnd"}
-	// Expected capabilities for non-root usres.
+	// Expected capabilities for non-root users.
 	wantCaps := map[string]string{}
 	// For the root user.
 	for _, cap := range caps {
 		pattern := fmt.Sprintf("%s:\t([0-9a-f]+)\n", cap)
-		matches, err := d.WaitForOutputSubmatch(ctx, pattern, 5*time.Second)
+		matches, err := d.WaitForOutputSubmatch(ctx, pattern, defaultWait)
 		if err != nil {
 			t.Fatalf("WaitForOutputSubmatch() timeout: %v", err)
 		}
@@ -344,7 +344,7 @@ func TestExecPrivileged(t *testing.T) {
 	}
 
 	// Grab the capabilities from inside container.
-	matches, err := d.WaitForOutputSubmatch(ctx, "CapEff:\t([0-9a-f]+)\n", 5*time.Second)
+	matches, err := d.WaitForOutputSubmatch(ctx, "CapEff:\t([0-9a-f]+)\n", defaultWait)
 	if err != nil {
 		t.Fatalf("WaitForOutputSubmatch() timeout: %v", err)
 	}
@@ -486,16 +486,26 @@ func TestExecJobControl(t *testing.T) {
 		t.Fatalf("docker exec failed: %v", err)
 	}
 
-	if _, err = p.Write(time.Second, []byte("sleep 100 | cat\n")); err != nil {
-		t.Fatalf("error exit: %v", err)
-	}
-	time.Sleep(time.Second)
-
-	if _, err = p.Write(time.Second, []byte{0x03}); err != nil {
+	if _, err = p.Write(defaultWait, []byte("sleep 100 | cat\n")); err != nil {
 		t.Fatalf("error exit: %v", err)
 	}
 
-	if _, err = p.Write(time.Second, []byte("exit $(expr $? + 10)\n")); err != nil {
+	// Wait until a cat is running.
+	if err := testutil.Poll(func() error {
+		out, err := d.Exec(ctx, dockerutil.ExecOpts{}, "sh", "-c", "pgrep -x cat")
+		if err != nil {
+			return fmt.Errorf("sleep|cat pipeline not yet running: %v (output: %s)", err, out)
+		}
+		return nil
+	}, defaultWait); err != nil {
+		t.Fatalf("waiting for the sleep|cat pipeline to start: %v", err)
+	}
+
+	if _, err = p.Write(defaultWait, []byte{0x03}); err != nil {
+		t.Fatalf("error exit: %v", err)
+	}
+
+	if _, err = p.Write(defaultWait, []byte("exit $(expr $? + 10)\n")); err != nil {
 		t.Fatalf("error exit: %v", err)
 	}
 
@@ -528,6 +538,47 @@ func TestExecError(t *testing.T) {
 	}
 	if want := `error finding executable "no_can_find" in PATH`; !strings.Contains(out, want) {
 		t.Fatalf("docker exec wrong error, got: %s, want: .*%s.*", out, want)
+	}
+}
+
+func TestExecCancellation(t *testing.T) {
+	ctx := t.Context()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+	if err := d.Spawn(ctx, dockerutil.RunOpts{
+		Image: "basic/alpine",
+	}, "sleep", "1000"); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	execCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.Exec(execCtx, dockerutil.ExecOpts{}, "sh", "-c", "touch /tmp/exec-started && exec sleep 1000")
+		done <- err
+	}()
+
+	// Cancel only after the exec has started and is holding its output open.
+	startCtx, stopWaiting := context.WithTimeout(ctx, defaultWait)
+	defer stopWaiting()
+	if err := testutil.PollContext(startCtx, func() error {
+		_, err := d.Exec(startCtx, dockerutil.ExecOpts{}, "test", "-f", "/tmp/exec-started")
+		return err
+	}); err != nil {
+		t.Fatalf("waiting for exec to start: %v", err)
+	}
+	cancel()
+
+	waitCtx, stop := context.WithTimeout(ctx, defaultWait)
+	defer stop()
+	select {
+	case err := <-done:
+		if want := context.Canceled; !errors.Is(err, want) {
+			t.Fatalf("Exec error = %v, want %v", err, want)
+		}
+	case <-waitCtx.Done():
+		t.Fatalf("Exec did not return after cancellation: %v", waitCtx.Err())
 	}
 }
 

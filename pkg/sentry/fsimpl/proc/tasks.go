@@ -66,7 +66,7 @@ type tasksInode struct {
 
 var _ kernfs.Inode = (*tasksInode)(nil)
 
-func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns *kernel.PIDNamespace, internalData *InternalData) *tasksInode {
+func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns *kernel.PIDNamespace, internalData *InternalData) (*tasksInode, error) {
 	root := auth.NewRootCredentials(pidns.UserNamespace())
 
 	// /proc is expected to have inode number
@@ -88,6 +88,7 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 		"fs":             fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
 		"irq":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
 		"meminfo":        fs.newInode(ctx, root, 0444, &meminfoData{}),
+		"modules":        fs.newInode(ctx, root, 0444, newStaticFile("")),
 		"mounts":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
 		"net":            kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
 		"sentry-meminfo": fs.newInode(ctx, root, 0444, &sentryMeminfoData{}),
@@ -106,7 +107,11 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 	for _, name := range internalData.OverrideProcs {
 		contents[name] = fs.newInode(ctx, root, 0444, newStaticFile(""))
 	}
-	if gvisorDir := fs.newGvisorInode(ctx, root, internalData, k); gvisorDir != nil {
+	gvisorDir, err := fs.newGvisorInode(ctx, root, internalData, k)
+	if err != nil {
+		return nil, err
+	}
+	if gvisorDir != nil {
 		contents["gvisor"] = gvisorDir
 	}
 
@@ -122,7 +127,7 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 	links := inode.OrderedChildren.Populate(contents)
 	inode.IncLinks(links)
 
-	return inode
+	return inode, nil
 }
 
 // Lookup implements kernfs.inodeDirectory.Lookup.
@@ -133,10 +138,10 @@ func (i *tasksInode) Lookup(ctx context.Context, name string) (kernfs.Inode, err
 	}
 
 	// Not a static entry. Try to lookup a corresponding task.
-	tid, err := strconv.ParseUint(name, 10, 64)
-	if err != nil {
+	tid, ok := parseIDName(name)
+	if !ok {
 		root := auth.NewRootCredentials(i.pidns.UserNamespace())
-		// If it failed to parse, check if it's one of the special handled files.
+		// Check if it's one of the specially handled files.
 		switch name {
 		case selfName:
 			return i.newSelfSymlink(ctx, root), nil
@@ -159,9 +164,9 @@ func (i *tasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.Ite
 	// fs/proc/internal.h: #define FIRST_PROCESS_ENTRY 256
 	const FIRST_PROCESS_ENTRY = 256
 
-	// Use maxTaskID to shortcut searches that will result in 0 entries.
-	const maxTaskID = kernel.TasksLimit + 1
-	if offset >= maxTaskID {
+	// FIRST_PROCESS_ENTRY + 2 + TasksLimit + 1 is the first position past all PIDs.
+	const endOff = FIRST_PROCESS_ENTRY + 2 + kernel.TasksLimit + 1
+	if offset >= endOff {
 		return offset, nil
 	}
 
@@ -204,7 +209,8 @@ func (i *tasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.Ite
 	startTid := offset - FIRST_PROCESS_ENTRY - 2
 	for _, tg := range i.pidns.ThreadGroups() {
 		tid := i.pidns.IDOfThreadGroup(tg)
-		if int64(tid) < startTid {
+		if tid == 0 || int64(tid) < startTid {
+			// Linux has no /proc/0. Skip a thread group whose ID is gone.
 			continue
 		}
 		if leader := tg.Leader(); leader != nil {
@@ -218,18 +224,19 @@ func (i *tasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.Ite
 
 	sort.Ints(tids)
 	for _, tid := range tids {
+		// A process entry's directory offset is FIRST_PROCESS_ENTRY + 2 + tid.
+		offset = FIRST_PROCESS_ENTRY + 2 + int64(tid)
 		dirent := vfs.Dirent{
 			Name:    strconv.FormatUint(uint64(tid), 10),
 			Type:    linux.DT_DIR,
 			Ino:     i.fs.NextIno(),
-			NextOff: FIRST_PROCESS_ENTRY + 2 + int64(tid) + 1,
+			NextOff: offset + 1,
 		}
 		if err := cb.Handle(dirent); err != nil {
 			return offset, err
 		}
-		offset++
 	}
-	return maxTaskID, nil
+	return endOff, nil
 }
 
 // Open implements kernfs.Inode.Open.

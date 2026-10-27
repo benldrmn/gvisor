@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
@@ -335,6 +336,7 @@ func (c *Context) CheckNoPacketTimeout(errMsg string, wait time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
 	if pkt := c.linkEP.ReadContext(ctx); pkt != nil {
+		pkt.DecRef()
 		c.t.Fatal(errMsg)
 	}
 }
@@ -359,26 +361,7 @@ func (c *Context) GetPacketWithTimeout(timeout time.Duration) *buffer.View {
 	}
 	defer pkt.DecRef()
 
-	if got, want := pkt.NetworkProtocolNumber, ipv4.ProtocolNumber; got != want {
-		c.t.Fatalf("got pkt.NetworkProtocolNumber = %d, want = %d", got, want)
-	}
-
-	// Just check that the stack set the transport protocol number for outbound
-	// TCP messages.
-	// TODO(gvisor.dev/issues/3810): Remove when protocol numbers are part
-	// of the headerinfo.
-	if got, want := pkt.TransportProtocolNumber, tcp.ProtocolNumber; got != want {
-		c.t.Fatalf("got pkt.TransportProtocolNumber = %d, want = %d", got, want)
-	}
-
-	view := pkt.ToView()
-
-	if pkt.GSOOptions.Type != stack.GSONone && pkt.GSOOptions.L3HdrLen != header.IPv4MinimumSize {
-		c.t.Errorf("got L3HdrLen = %d, want = %d", pkt.GSOOptions.L3HdrLen, header.IPv4MinimumSize)
-	}
-
-	checker.IPv4(c.t, view, checker.SrcAddr(StackAddr), checker.DstAddr(TestAddr))
-	return view
+	return c.packetView(pkt)
 }
 
 // GetPacket reads a packet from the link layer endpoint and verifies
@@ -409,6 +392,14 @@ func (c *Context) GetPacketNonBlocking() *buffer.View {
 	}
 	defer pkt.DecRef()
 
+	return c.packetView(pkt)
+}
+
+// packetView validates an outgoing IPv4 packet and completes any checksum
+// offload on its returned copy. It does not segment the aggregate GSO packet.
+func (c *Context) packetView(pkt *stack.PacketBuffer) *buffer.View {
+	c.t.Helper()
+
 	if got, want := pkt.NetworkProtocolNumber, ipv4.ProtocolNumber; got != want {
 		c.t.Fatalf("got pkt.NetworkProtocolNumber = %d, want = %d", got, want)
 	}
@@ -422,8 +413,39 @@ func (c *Context) GetPacketNonBlocking() *buffer.View {
 	}
 
 	view := pkt.ToView()
+	cu := cleanup.Make(view.Release)
+	defer cu.Clean()
+
+	if pkt.GSOOptions.Type != stack.GSONone && pkt.GSOOptions.L3HdrLen != header.IPv4MinimumSize {
+		c.t.Errorf("got L3HdrLen = %d, want = %d", pkt.GSOOptions.L3HdrLen, header.IPv4MinimumSize)
+	}
 
 	checker.IPv4(c.t, view, checker.SrcAddr(StackAddr), checker.DstAddr(TestAddr))
+	if gso := pkt.GSOOptions; gso.NeedsCsum {
+		if got, want := gso.Type, stack.GSOTCPv4; got != want {
+			c.t.Fatalf("GSO type = %v, want %v", got, want)
+		}
+		ip := header.IPv4(view.AsSlice())
+		if got, want := gso.L3HdrLen, uint16(ip.HeaderLength()); got != want {
+			c.t.Fatalf("GSO L3 header length = %d, want %d", got, want)
+		}
+		if got, want := gso.CsumOffset, uint16(header.TCPChecksumOffset); got != want {
+			c.t.Fatalf("GSO checksum offset = %d, want %d", got, want)
+		}
+		tcp := header.TCP(ip.Payload())
+		want := header.PseudoHeaderChecksum(header.TCPProtocolNumber, ip.SourceAddress(), ip.DestinationAddress(), uint16(len(tcp)))
+		if got := tcp.Checksum(); got != want {
+			c.t.Fatalf("partial TCP checksum = %d, want %d", got, want)
+		}
+	}
+	if pkt.GSOOptions.NeedsCsum {
+		// The channel has no host to complete CHECKSUM_PARTIAL. Finish the
+		// verified pseudo-header seed on the copy so ordinary TCP checkers
+		// can inspect the aggregate GSO packet without mutating the packet.
+		tcp := header.TCP(header.IPv4(view.AsSlice()).Payload())
+		tcp.SetChecksum(^checksum.Checksum(tcp, 0))
+	}
+	cu.Release()
 	return view
 }
 
@@ -661,8 +683,11 @@ func (c *Context) GetV6Packet() *buffer.View {
 		c.t.Fatalf("got pkt.NetworkProtocolNumber = %d, want = %d", got, want)
 	}
 	v := pkt.ToView()
+	cu := cleanup.Make(v.Release)
+	defer cu.Clean()
 
 	checker.IPv6(c.t, v, checker.SrcAddr(StackV6Addr), checker.DstAddr(TestV6Addr))
+	cu.Release()
 	return v
 }
 

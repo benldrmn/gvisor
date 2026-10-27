@@ -24,8 +24,10 @@ go_test(
     srcs = [
         "coretag_test.go",
     ],
-    library = ":coretag",
+    embed = [":coretag"],
+    pure = True,
+    tags = ["nogotsan"],
     deps = [
-        "//pkg/hostos",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

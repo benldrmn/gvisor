@@ -88,10 +88,10 @@ func (fd *fileDescription) Release(ctx context.Context) {
 	} else {
 		opcode = linux.FUSE_RELEASE
 	}
-	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
+	// As in Linux, FUSE_RELEASE is sent as a forced background request.
 	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, opcode, &in)
-	// The reply will be ignored since no callback is defined in asyncCallBack().
-	fs.conn.Call(ctx, req)
+	req.force = true
+	fs.conn.CallAsync(ctx, req)
 }
 
 // OnClose implements vfs.FileDescriptionImpl.OnClose.
@@ -113,7 +113,16 @@ func (fd *fileDescription) OnClose(ctx context.Context) error {
 		LockOwner: 0, // TODO(gvisor.dev/issue/3245): file lock
 	}
 	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FLUSH, &in)
+	// As in Linux, FUSE_FLUSH must reach the server even if the calling task
+	// is killed.
+	req.force = true
 	res, err := fs.conn.Call(ctx, req)
+	if linuxerr.Equals(linuxerr.ERESTARTSYS, err) {
+		// The task had to stop (e.g. for checkpointing) while waiting. Unlike
+		// most syscalls, close(2) can't be restarted. Report success rather
+		// than a spurious EINTR, since the FD is closed regardless.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -159,14 +168,14 @@ func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions)
 	inode := fd.inode()
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
-	if err := vfs.CheckSetStat(ctx, creds, &opts, inode.filemode(), auth.KUID(inode.uid.Load()), auth.KGID(inode.gid.Load())); err != nil {
+	if err := vfs.CheckSetStat(ctx, creds, &opts, inode.filemode(), nil, auth.KUID(inode.uid.Load()), auth.KGID(inode.gid.Load())); err != nil {
 		return err
 	}
 	return inode.setAttr(ctx, fs, creds, opts, fhOptions{useFh: true, fh: fd.Fh})
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
-func (fd *fileDescription) Sync(ctx context.Context) error {
+func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 	inode := fd.inode()
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
@@ -176,9 +185,14 @@ func (fd *fileDescription) Sync(ctx context.Context) error {
 		return linuxerr.EINVAL
 	}
 
+	var syncFlags uint32
+	if opts.DataOnly {
+		syncFlags |= linux.FUSE_FSYNC_FDATASYNC
+	}
+
 	in := linux.FUSEFsyncIn{
 		Fh:         fd.Fh,
-		FsyncFlags: fd.statusFlags(),
+		FsyncFlags: syncFlags,
 	}
 	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
 	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FSYNC, &in)

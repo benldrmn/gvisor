@@ -14,24 +14,34 @@
 
 #include <errno.h>
 #include <linux/audit.h>
+#include <linux/bpf_common.h>
+#include <linux/capability.h>
 #include <linux/filter.h>
+#include <linux/prctl.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/ucontext.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <iterator>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/base/macros.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "test/util/file_descriptor.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
@@ -39,11 +49,16 @@
 #include "test/util/platform_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/proc_util.h"
+#include "test/util/save_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
 #ifndef SYS_SECCOMP
 #define SYS_SECCOMP 1
+#endif
+
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
 #endif
 
 namespace gvisor {
@@ -55,8 +70,9 @@ namespace {
 #ifdef __x86_64__
 constexpr uint32_t kFilteredSyscall = SYS_vserver;
 #elif __aarch64__
-// Use the last of arch_specific_syscalls which are not implemented on arm64.
-constexpr uint32_t kFilteredSyscall = __NR_arch_specific_syscall + 15;
+// ARM64 leaves the architecture-specific range (244-259) unassigned.
+// https://github.com/torvalds/linux/blob/7d0a66e4b/scripts/syscall.tbl#L291-L305
+constexpr uint32_t kFilteredSyscall = 259;
 #endif
 
 // Applies a seccomp-bpf filter that returns `filtered_result` for
@@ -96,7 +112,7 @@ void ApplySeccompFilter(uint32_t sysno, uint32_t filtered_result,
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
   };
   struct sock_fprog prog;
-  prog.len = ABSL_ARRAYSIZE(filter);
+  prog.len = std::size(filter);
   prog.filter = filter;
   if (flags) {
     TEST_CHECK(syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, flags, &prog) ==
@@ -144,7 +160,7 @@ void ApplyUncacheableFilter(uint32_t sysno) {
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
   };
   struct sock_fprog prog;
-  prog.len = ABSL_ARRAYSIZE(filter);
+  prog.len = std::size(filter);
   prog.filter = filter;
   TEST_PCHECK(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) == 0);
   MaybeSave();
@@ -217,10 +233,47 @@ TEST(SeccompTest, RetKillOnlyKillsOneThread) {
       << "status " << status;
 }
 
+TEST(SeccompTest, RetKillProcessKillsWholeThreadGroup) {
+  Mapping stack = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(2 * kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE));
+
+  pid_t const pid = fork();
+  if (pid == 0) {
+    // Register a signal handler for SIGSYS that we don't expect to be invoked.
+    RegisterSignalHandler(SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
+    ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_KILL_PROCESS);
+    // Pass CLONE_VFORK to block the original thread in the child process until
+    // the clone thread exits. Unlike SECCOMP_RET_KILL, which only kills the
+    // offending thread, SECCOMP_RET_KILL_PROCESS must terminate the whole
+    // thread group, so the CLONE_VFORK-blocked original thread dies too.
+    //
+    // N.B. clone(2) is not officially async-signal-safe, but at minimum glibc's
+    // x86_64 implementation is safe. See glibc
+    // sysdeps/unix/sysv/linux/x86_64/clone.S.
+    clone(
+        +[](void* arg) {
+          syscall(kFilteredSyscall);  // should kill the whole thread group
+          _exit(1);                   // should be unreachable
+          return 2;  // should be very unreachable, shut up the compiler
+        },
+        stack.endptr(),
+        CLONE_FILES | CLONE_FS | CLONE_SIGHAND | CLONE_THREAD | CLONE_VM |
+            CLONE_VFORK,
+        nullptr);
+    _exit(0);  // Should be unreachable: the group exit killed this thread.
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS)
+      << "status " << status;
+}
+
 TEST(SeccompTest, RetTrapCausesSIGSYS) {
   pid_t const pid = fork();
   if (pid == 0) {
     constexpr uint16_t kTrapValue = 0xdead;
+    constexpr intptr_t kTrapReturn = 4242;
     RegisterSignalHandler(
         SIGSYS, +[](int signo, siginfo_t* info, void* ucv) {
           ucontext_t* uc = static_cast<ucontext_t*>(ucv);
@@ -233,15 +286,30 @@ TEST(SeccompTest, RetTrapCausesSIGSYS) {
 #if defined(__x86_64__)
           TEST_CHECK(info->si_arch == AUDIT_ARCH_X86_64);
           TEST_CHECK(uc->uc_mcontext.gregs[REG_RAX] == kFilteredSyscall);
+          TEST_CHECK(uc->uc_mcontext.gregs[REG_RDI] == 0x11);
+          TEST_CHECK(uc->uc_mcontext.gregs[REG_RSI] == 0x22);
+          TEST_CHECK(uc->uc_mcontext.gregs[REG_RDX] == 0x33);
+          TEST_CHECK(uc->uc_mcontext.gregs[REG_R10] == 0x44);
+          TEST_CHECK(uc->uc_mcontext.gregs[REG_R8] == 0x55);
+          TEST_CHECK(uc->uc_mcontext.gregs[REG_R9] == 0x66);
+          uc->uc_mcontext.gregs[REG_RAX] = kTrapReturn;
 #elif defined(__aarch64__)
           TEST_CHECK(info->si_arch == AUDIT_ARCH_AARCH64);
           TEST_CHECK(uc->uc_mcontext.regs[8] == kFilteredSyscall);
+          TEST_CHECK(uc->uc_mcontext.regs[0] == 0x11);
+          TEST_CHECK(uc->uc_mcontext.regs[1] == 0x22);
+          TEST_CHECK(uc->uc_mcontext.regs[2] == 0x33);
+          TEST_CHECK(uc->uc_mcontext.regs[3] == 0x44);
+          TEST_CHECK(uc->uc_mcontext.regs[4] == 0x55);
+          TEST_CHECK(uc->uc_mcontext.regs[5] == 0x66);
+          uc->uc_mcontext.regs[0] = kTrapReturn;
 #endif  // defined(__x86_64__)
-          _exit(0);
         });
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_TRAP | kTrapValue);
-    syscall(kFilteredSyscall);
-    TEST_CHECK_MSG(false, "Survived invocation of test syscall");
+    int64_t ret =
+        syscall(kFilteredSyscall, 0x11L, 0x22L, 0x33L, 0x44L, 0x55L, 0x66L);
+    TEST_CHECK(ret == kTrapReturn);
+    _exit(0);
   }
   ASSERT_THAT(pid, SyscallSucceeds());
   int status;
@@ -344,6 +412,39 @@ TEST(SeccompTest, RetAllowAllowsSyscall) {
   if (pid == 0) {
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_ALLOW);
     TEST_CHECK(syscall(kFilteredSyscall) == -1 && errno == ENOSYS);
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "status " << status;
+}
+
+TEST(SeccompTest, RetLogAllowsSyscall) {
+  pid_t const parent = getpid();
+  pid_t const pid = fork();
+  if (pid == 0) {
+    RegisterSignalHandler(SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
+    ApplySeccompFilter(__NR_getppid, SECCOMP_RET_LOG);
+    TEST_CHECK(syscall(__NR_getppid) == parent);
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "status " << status;
+}
+
+TEST(SeccompTest, RetLogAllowsNonCachableSyscall) {
+  pid_t const parent = getpid();
+  pid_t const pid = fork();
+  if (pid == 0) {
+    RegisterSignalHandler(SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
+    ApplySeccompFilter(__NR_getppid, SECCOMP_RET_LOG);
+    ApplyUncacheableFilter(__NR_getppid);
+    TEST_CHECK(syscall(__NR_getppid) == parent);
     _exit(0);
   }
   ASSERT_THAT(pid, SyscallSucceeds());
@@ -537,7 +638,7 @@ TEST(SeccompTest, ProgramTooLargeIsRejected) {
   filter[kTooLargeFilterSize - 1] =
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);  // Return allow
   struct sock_fprog prog;
-  prog.len = ABSL_ARRAYSIZE(filter);
+  prog.len = std::size(filter);
   prog.filter = filter;
   ASSERT_THAT(syscall(__NR_seccomp, SECCOMP_MODE_FILTER, &prog),
               SyscallFailsWithErrno(EINVAL));
@@ -548,7 +649,7 @@ TEST(SeccompTest, ProgramTooLargeIsRejected) {
 
 TEST(SeccompTest, SeccompValidatesAllFilterFlags) {
   // LINT.IfChange
-  SKIP_IF(!IsRunningOnGvisor() || GvisorPlatform() == Platform::kStarnix);
+  SKIP_IF(!IsRunningOnGvisor());
   TEST_PCHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
   struct sock_filter filter[] = {
       BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 0),
@@ -557,7 +658,7 @@ TEST(SeccompTest, SeccompValidatesAllFilterFlags) {
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
   struct sock_fprog prog;
-  prog.len = ABSL_ARRAYSIZE(filter);
+  prog.len = std::size(filter);
   prog.filter = filter;
 
   // 1. TSYNC should SUCCEED (supported)
@@ -589,7 +690,121 @@ TEST(SeccompTest, SeccompValidatesAllFilterFlags) {
   if (ret > 0) {
     close(ret);
   }
-  // LINT.ThenChange(../../../runsc/specutils/seccomp/seccomp.go)
+  // LINT.ThenChange(../../../runsc/specutils/seccomp.go)
+}
+
+// Linux evaluates seccomp filters on the restart_syscall that resumes a syscall
+// interrupted by a stop, so a filter that kills restart_syscall kills the task
+// once a group stop ends.
+TEST(SeccompTest, RestartSyscallAfterGroupStopIsFiltered) {
+  DisableSave ds;
+  pid_t const pid = fork();
+  if (pid == 0) {
+    ApplySeccompFilter(__NR_restart_syscall, SECCOMP_RET_KILL);
+    struct timespec req = {.tv_sec = 5, .tv_nsec = 0};
+    syscall(SYS_nanosleep, &req, nullptr);
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  absl::SleepFor(absl::Milliseconds(200));
+  ASSERT_THAT(kill(pid, SIGSTOP), SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, WUNTRACED), SyscallSucceedsWithValue(pid));
+  ASSERT_TRUE(WIFSTOPPED(status)) << "status " << status;
+  ASSERT_THAT(kill(pid, SIGCONT), SyscallSucceeds());
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS)
+      << "status " << status;
+}
+
+// A checkpoint is not a Linux concept: the sentry interrupts a blocked syscall
+// to quiesce the task, and the guest never asked for the restart_syscall that
+// resumes it. That restart must not be subject to the guest's filter.
+TEST(SeccompTest, RestartSyscallAfterCheckpointIsNotFiltered) {
+  SKIP_IF(!IsRunningWithSaveRestore());
+  const DisableSave ds;
+  int pipefd[2];
+  ASSERT_THAT(pipe(pipefd), SyscallSucceeds());
+  FileDescriptor read_fd(pipefd[0]);
+  FileDescriptor write_fd(pipefd[1]);
+  pid_t const pid = fork();
+  if (pid == 0) {
+    // Created before the filter is installed so that it is unfiltered. A kill
+    // from the filter only ends the calling thread, so completion is reported
+    // through the pipe instead of the process exit status.
+    ScopedThread saver(+[] {
+      absl::SleepFor(absl::Milliseconds(500));
+      internal::DoCooperativeSave();
+    });
+    ApplySeccompFilter(__NR_restart_syscall, SECCOMP_RET_KILL);
+    struct timespec req = {.tv_sec = 2, .tv_nsec = 0};
+    TEST_PCHECK(syscall(SYS_nanosleep, &req, nullptr) == 0);
+    TEST_PCHECK(write(pipefd[1], "k", 1) == 1);
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  write_fd.reset();
+  char c = 0;
+  EXPECT_THAT(read(read_fd.get(), &c, 1), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(c, 'k');
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+}
+
+// The bypass is saved with the task, so it covers a restart_syscall that is
+// preceded by more than one checkpoint.
+TEST(SeccompTest, RestartSyscallAfterTwoCheckpointsIsNotFiltered) {
+  SKIP_IF(!IsRunningWithSaveRestore());
+  const DisableSave ds;
+  int pipefd[2];
+  ASSERT_THAT(pipe(pipefd), SyscallSucceeds());
+  FileDescriptor read_fd(pipefd[0]);
+  FileDescriptor write_fd(pipefd[1]);
+  pid_t const pid = fork();
+  if (pid == 0) {
+    ScopedThread saver(+[] {
+      absl::SleepFor(absl::Milliseconds(500));
+      internal::DoCooperativeSave();
+      internal::DoCooperativeSave();
+    });
+    ApplySeccompFilter(__NR_restart_syscall, SECCOMP_RET_KILL);
+    struct timespec req = {.tv_sec = 3, .tv_nsec = 0};
+    TEST_PCHECK(syscall(SYS_nanosleep, &req, nullptr) == 0);
+    TEST_PCHECK(write(pipefd[1], "k", 1) == 1);
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  write_fd.reset();
+  char c = 0;
+  EXPECT_THAT(read(read_fd.get(), &c, 1), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(c, 'k');
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+}
+
+// A task that is in a group stop when the checkpoint is taken restarts through
+// the same filter as on Linux once the stop ends.
+TEST(SeccompTest, RestartSyscallAfterGroupStopAndCheckpointIsFiltered) {
+  SKIP_IF(!IsRunningWithSaveRestore());
+  DisableSave ds;
+  pid_t const pid = fork();
+  if (pid == 0) {
+    ApplySeccompFilter(__NR_restart_syscall, SECCOMP_RET_KILL);
+    struct timespec req = {.tv_sec = 5, .tv_nsec = 0};
+    syscall(SYS_nanosleep, &req, nullptr);
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  absl::SleepFor(absl::Milliseconds(200));
+  ASSERT_THAT(kill(pid, SIGSTOP), SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, WUNTRACED), SyscallSucceedsWithValue(pid));
+  ASSERT_TRUE(WIFSTOPPED(status)) << "status " << status;
+  internal::DoCooperativeSave();
+  ASSERT_THAT(kill(pid, SIGCONT), SyscallSucceeds());
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS)
+      << "status " << status;
 }
 
 }  // namespace

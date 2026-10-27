@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/platform/slimvm/testutil"
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 )
@@ -48,11 +49,19 @@ const testSandboxID = "deadbeef"
 
 func slimvmTest(t testHarness, setup func(*SlimVM), fn func(*vCPU) bool) {
 	// Create the machine.
-	deviceFile, err := OpenDevice("")
+	desc, err := platformdesc.Lookup("slimvm")
+	if err != nil {
+		t.Fatalf("error looking up platform: %v", err)
+	}
+	deviceFile, err := desc.OpenDevice("")
 	if err != nil {
 		t.Fatalf("error opening device file: %v", err)
 	}
-	k, err := New(deviceFile, testSandboxID, 0)
+	k, err := New(platform.Options{
+		DeviceFile:       deviceFile,
+		SandboxID:        testSandboxID,
+		ApplicationCores: 0,
+	})
 	if err != nil {
 		t.Fatalf("error creating SlimVM instance: %v", err)
 	}
@@ -136,7 +145,7 @@ func applicationTest(t testHarness, useHostMappings bool, targetFn uintptr, fn f
 
 	slimvmTest(t, func(k *SlimVM) {
 		// Create new page tables.
-		as, err := k.NewAddressSpace()
+		as, err := k.NewAddressSpace(platform.AddressSpaceOptions{})
 		if err != nil {
 			t.Fatalf("can't create new address space: %v", err)
 		}

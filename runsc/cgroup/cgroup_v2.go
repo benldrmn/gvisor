@@ -45,10 +45,12 @@ const (
 	memoryLimitCgroup = "memory.max"
 	cpuLimitCgroup    = "cpu.max"
 	maxLimitStr       = "max"
-
-	// https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
-	defaultPeriod = 100000
 )
+
+// DefaultCPUPeriod is the CFS period used when the OCI spec sets none, in
+// microseconds.
+// https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+const DefaultCPUPeriod = 100000
 
 var (
 	ErrInvalidFormat    = errors.New("cgroup: parsing file with invalid format failed")
@@ -277,13 +279,24 @@ func (c *cgroupV2) Join() (func(), error) {
 	return cu.Release(), nil
 }
 
+// CloneIntoCgroup implements Cgroup.CloneIntoCgroup.
+func (c *cgroupV2) CloneIntoCgroup() (*os.File, error) {
+	if reason := cannotCloneIntoCgroupReason(); reason != "" {
+		return nil, fmt.Errorf("clone3(CLONE_INTO_CGROUP) is unavailable: %s", reason)
+	}
+	return os.OpenFile(c.MakePath(""), unix.O_DIRECTORY|os.O_RDONLY, 0)
+}
+
 // readCPUQuotaAndPeriod reads and parses cpu.max from the given path.
 func readCPUQuotaAndPeriod(path string) (int64, int64, error) {
 	cpuMax, err := getValue(path, cpuLimitCgroup)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return -1, -1, nil
+		}
 		return -1, -1, err
 	}
-	return parseCPUQuotaAndPeriod(cpuMax)
+	return ParseCPUMax(cpuMax)
 }
 
 // CPUQuota returns the raw CFS CPU quota in microseconds.
@@ -300,7 +313,7 @@ func (c *cgroupV2) CPUQuota() (int64, error) {
 		if parentErr != nil && !errors.Is(parentErr, os.ErrNotExist) {
 			return -1, parentErr
 		}
-		if parentErr == nil {
+		if parentErr == nil && parentQuota != -1 {
 			quota = parentQuota
 		}
 	}
@@ -320,14 +333,16 @@ func (c *cgroupV2) CPUPeriod() (int64, error) {
 		if parentErr != nil && !errors.Is(parentErr, os.ErrNotExist) {
 			return -1, parentErr
 		}
-		if parentErr == nil {
+		if parentErr == nil && parentPeriod != -1 {
 			period = parentPeriod
 		}
 	}
 	return period, nil
 }
 
-func parseCPUQuotaAndPeriod(cpuMax string) (int64, int64, error) {
+// ParseCPUMax parses a cpu.max value into its quota and period.
+// The quota is -1 for "max".
+func ParseCPUMax(cpuMax string) (int64, int64, error) {
 	data := strings.SplitN(strings.TrimSpace(cpuMax), " ", 2)
 	if len(data) != 2 {
 		return -1, -1, fmt.Errorf("invalid cpu.max data %q", cpuMax)
@@ -462,7 +477,7 @@ func (*cpu2) generateProperties(spec *specs.LinuxResources) ([]dbus.Property, er
 		if quota > 0 {
 			if period == 0 {
 				// Assume the default.
-				period = defaultPeriod
+				period = DefaultCPUPeriod
 			}
 			// systemd converts CPUQuotaPerSecUSec (microseconds per CPU second) to
 			// CPUQuota (integer percentage of CPU) internally. This means that if a
@@ -503,7 +518,7 @@ func (*cpu2) set(spec *specs.LinuxResources, path string) error {
 		if spec.CPU.Period != nil && *spec.CPU.Period != 0 {
 			period = *spec.CPU.Period
 		} else {
-			period = defaultPeriod
+			period = DefaultCPUPeriod
 		}
 
 		v += " " + strconv.FormatUint(period, 10)
@@ -680,27 +695,12 @@ type io2 struct {
 	mandatory
 }
 
-func (*io2) generateProperties(spec *specs.LinuxResources) ([]dbus.Property, error) {
-	props := []dbus.Property{}
-	if spec == nil || spec.BlockIO == nil {
-		return props, nil
-	}
-	io := spec.BlockIO
-	if io != nil {
-		if io.Weight != nil && *io.Weight != 0 {
-			ioWeight := convertBlkIOToIOWeightValue(*io.Weight)
-			props = append(props, newProp("IOWeight", ioWeight))
-		}
-		for _, dev := range io.WeightDevice {
-			val := fmt.Sprintf("%d:%d %d", dev.Major, dev.Minor, *dev.Weight)
-			props = append(props, newProp("IODeviceWeight", val))
-		}
-		props = addIOProps(props, "IOReadBandwidthMax", io.ThrottleReadBpsDevice)
-		props = addIOProps(props, "IOWriteBandwidthMax", io.ThrottleWriteBpsDevice)
-		props = addIOProps(props, "IOReadIOPSMax", io.ThrottleReadIOPSDevice)
-		props = addIOProps(props, "IOWriteIOPSMax", io.ThrottleWriteIOPSDevice)
-	}
-	return props, nil
+func (*io2) generateProperties(*specs.LinuxResources) ([]dbus.Property, error) {
+	// Systemd's IOWeight-to-BFQ mapping differs from our cgroupfs mapping:
+	// https://github.com/systemd/systemd/blob/b3d8fc43e/src/basic/cgroup-util.h#L100-L112
+	// Apply I/O resources directly after creating or updating the scope, using
+	// the same filesystem translation as other cgroup v2 users.
+	return nil, nil
 }
 
 func (*io2) set(spec *specs.LinuxResources, path string) error {
@@ -716,7 +716,7 @@ func (*io2) set(spec *specs.LinuxResources, path string) error {
 
 	// If BFQ IO scheduler is available, use it.
 	if blkio.Weight != nil || len(blkio.WeightDevice) > 0 {
-		bfq, err = os.Open(filepath.Join(path, "io.bfq.weight"))
+		bfq, err = os.OpenFile(filepath.Join(path, "io.bfq.weight"), os.O_RDWR, 0)
 		if err == nil {
 			defer bfq.Close()
 		} else if !os.IsNotExist(err) {
@@ -893,12 +893,13 @@ func bfqDeviceWeightSupported(bfq *os.File) bool {
 	}
 
 	buf := make([]byte, 32)
-	if _, err := bfq.Read(buf); err != nil {
+	n, err := bfq.Read(buf)
+	if err != nil {
 		return false
 	}
-	// If only a single number (default weight) if read back, we have older
+	// If only a single number (default weight) is read back, we have an older
 	// kernel.
-	_, err := strconv.ParseInt(string(bytes.TrimSpace(buf)), 10, 64)
+	_, err = strconv.ParseInt(string(bytes.TrimSpace(buf[:n])), 10, 64)
 	return err != nil
 }
 

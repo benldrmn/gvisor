@@ -48,6 +48,11 @@ type hostConnection struct {
 
 	// writeMu serializes write operations on hostFD.
 	writeMu sync.Mutex
+
+	// closed is true once hostFD has been closed by release.
+	//
+	// +checklocks:writeMu
+	closed bool
 }
 
 // newHostConnection creates a hostConnection that communicates over hostFD.
@@ -94,6 +99,21 @@ func (hc *hostConnection) readLoop() {
 		}
 
 		hc.conn.mu.Lock()
+		if hdr.Unique&linux.FUSE_INT_REQ_BIT != 0 {
+			fut, err := hc.conn.handleInterruptReplyLocked(&hdr, int64(hdr.Len))
+			hc.conn.mu.Unlock()
+			respBufPool.Put(bufp)
+			if err != nil {
+				// ENOENT is expected if the interrupted request has been
+				// answered or abandoned in the meantime.
+				if !linuxerr.Equals(linuxerr.ENOENT, err) {
+					log.Warningf("fuse host connection: invalid FUSE_INTERRUPT reply for request %d: %v", hdr.Unique&^linux.FUSE_INT_REQ_BIT, err)
+				}
+			} else if fut != nil {
+				go hc.sendInterrupt(fut.unique)
+			}
+			continue
+		}
 		fut, ok := hc.conn.completions[hdr.Unique]
 		if ok {
 			delete(hc.conn.completions, hdr.Unique)
@@ -120,6 +140,11 @@ func (hc *hostConnection) abortPending() {
 	for id, fut := range hc.conn.completions {
 		delete(hc.conn.completions, id)
 		hc.conn.numActiveRequests--
+		fut.hdr = &linux.FUSEHeaderOut{
+			Len:    linux.SizeOfFUSEHeaderOut,
+			Error:  -int32(unix.ECONNABORTED),
+			Unique: id,
+		}
 		close(fut.ch)
 	}
 }
@@ -135,6 +160,9 @@ func (hc *hostConnection) call(ctx context.Context, r *Request) (*Response, erro
 	}
 	hc.conn.numActiveRequests++
 	fut := newFutureResponse(r)
+	// The request is written synchronously below, before we wait for the
+	// response, so it can be considered sent for the purposes of interrupts.
+	fut.sent = true
 	hc.conn.completions[r.id] = fut
 	hc.conn.mu.Unlock()
 
@@ -143,10 +171,31 @@ func (hc *hostConnection) call(ctx context.Context, r *Request) (*Response, erro
 		delete(hc.conn.completions, r.id)
 		hc.conn.numActiveRequests--
 		hc.conn.mu.Unlock()
-		return nil, err
+		return nil, linuxError(err)
 	}
 
-	return fut.resolve(ctx)
+	if fut.async {
+		return nil, nil
+	}
+	return hc.conn.waitForResponse(ctx, r, fut)
+}
+
+// interrupt implements fuseConn.interrupt.
+func (hc *hostConnection) interrupt(fut *futureResponse) {
+	hc.conn.mu.Lock()
+	ok := hc.conn.markInterruptedLocked(fut)
+	hc.conn.mu.Unlock()
+	if ok {
+		go hc.sendInterrupt(fut.unique)
+	}
+}
+
+// sendInterrupt sends a FUSE_INTERRUPT request for the request with the given
+// unique ID.
+func (hc *hostConnection) sendInterrupt(unique linux.FUSEOpID) {
+	if err := hc.writeRequest(newInterruptRequest(unique)); err != nil {
+		log.Warningf("fuse host connection: failed to send FUSE_INTERRUPT for request %d: %v", unique, err)
+	}
 }
 
 // Call makes a request to the server via the host FD and blocks until a
@@ -154,7 +203,7 @@ func (hc *hostConnection) call(ctx context.Context, r *Request) (*Response, erro
 // host I/O path.
 func (hc *hostConnection) Call(ctx context.Context, r *Request) (*Response, error) {
 	if !hc.conn.isInitialized() && r.hdr.Opcode != linux.FUSE_INIT {
-		if err := ctx.Block(hc.conn.initializedChan); err != nil {
+		if err := blockKillable(ctx, hc.conn.initializedChan); err != nil {
 			return nil, linuxError(err)
 		}
 	}
@@ -172,7 +221,8 @@ func (hc *hostConnection) Call(ctx context.Context, r *Request) (*Response, erro
 		return nil, linuxerr.ECONNREFUSED
 	}
 
-	return hc.call(ctx, r)
+	res, err := hc.call(ctx, r)
+	return res, linuxError(err)
 }
 
 // CallAsync makes an async (fire-and-forget) request via the host FD. The
@@ -186,13 +236,22 @@ func (hc *hostConnection) CallAsync(ctx context.Context, r *Request) error {
 // release implements fuseConn.release.
 func (hc *hostConnection) release(ctx context.Context) {
 	hc.conn.DecRef(ctx)
-	unix.Close(int(hc.hostFD))
+	unix.Shutdown(int(hc.hostFD), unix.SHUT_RDWR)
+	hc.writeMu.Lock()
+	defer hc.writeMu.Unlock()
+	if !hc.closed {
+		hc.closed = true
+		unix.Close(int(hc.hostFD))
+	}
 }
 
 // writeRequest writes a FUSE request to the host FD under writeMu.
 func (hc *hostConnection) writeRequest(r *Request) error {
 	hc.writeMu.Lock()
 	defer hc.writeMu.Unlock()
+	if hc.closed {
+		return unix.EBADF
+	}
 	data := r.data
 	for len(data) > 0 {
 		n, err := unix.Write(int(hc.hostFD), data)
@@ -212,7 +271,9 @@ func (hc *hostConnection) InitSend(creds *auth.Credentials, pid uint32, hasSysAd
 		Major:        linux.FUSE_KERNEL_VERSION,
 		Minor:        linux.FUSE_KERNEL_MINOR_VERSION,
 		MaxReadahead: fuseDefaultMaxReadahead,
-		Flags:        fuseDefaultInitFlags,
+		// Each request is a single SOCK_SEQPACKET datagram, which
+		// writeRequest cannot fragment.
+		Flags: fuseDefaultInitFlags &^ fuseDatagramUnsafeInitFlags,
 	}
 
 	req := hc.conn.NewRequest(creds, pid, 0, linux.FUSE_INIT, &in)
@@ -244,6 +305,9 @@ func (hc *hostConnection) InitSend(creds *auth.Credentials, pid uint32, hasSysAd
 	if err := hc.conn.InitRecv(res, hasSysAdminCap); err != nil {
 		return err
 	}
+	// Big writes stay off even if the server echoes the flag unsolicited;
+	// the transport cannot carry them.
+	hc.conn.bigWrites = false
 
 	hc.startReader()
 	return nil

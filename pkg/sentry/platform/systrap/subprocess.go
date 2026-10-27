@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
@@ -69,9 +70,10 @@ var (
 //
 // These constants are only used in subprocess.go.
 const (
-	ERESTARTSYS    = unix.Errno(512)
-	ERESTARTNOINTR = unix.Errno(513)
-	ERESTARTNOHAND = unix.Errno(514)
+	ERESTARTSYS           = unix.Errno(512)
+	ERESTARTNOINTR        = unix.Errno(513)
+	ERESTARTNOHAND        = unix.Errno(514)
+	ERESTART_RESTARTBLOCK = unix.Errno(516)
 )
 
 // thread is a traced thread; it is a thread identifier.
@@ -104,8 +106,8 @@ type requestStub struct {
 }
 
 // maxSysmsgThreads is the maximum number of sysmsg threads that a subprocess
-// can create. It is based on GOMAXPROCS and set once, so it must be set after
-// GOMAXPROCS has been adjusted (see loader.go:Args.NumCPU).
+// can create. It is based on base GOMAXPROCS and set once, so it must be set
+// after base GOMAXPROCS has been set (see loader.go:Args.NumCPU).
 var maxSysmsgThreads = 0
 
 // maxChildThreads is the max number of all child system threads that a
@@ -180,6 +182,9 @@ type subprocess struct {
 	// user mode.
 	contextQueue *contextQueue
 
+	// aliveMu synchronizes active subprocess operations with termination.
+	aliveMu sync.RWMutex
+
 	// dead indicates whether the subprocess is alive or not.
 	dead atomicbitops.Bool
 }
@@ -206,7 +211,7 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool)
 
 	id, ok := s.sysmsgStackPool.Get()
 	if !ok {
-		panic("unable to allocate a sysmsg stub thread")
+		return fmt.Errorf("unable to allocate a sysmsg stub thread")
 	}
 
 	ptraceThread.sysmsgStackID = id
@@ -216,7 +221,7 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool)
 	}
 
 	if err := t.init(seccompNotify); err != nil {
-		panic("failed to create a syscall thread")
+		return fmt.Errorf("failed to create a syscall thread: %w", err)
 	}
 	s.syscallThread = &t
 
@@ -241,6 +246,15 @@ func handlePtraceSyscallRequestError(req any, format string, values ...any) {
 func (s *subprocess) handlePtraceSyscallRequest(req any) {
 	s.syscallThreadMu.Lock()
 	defer s.syscallThreadMu.Unlock()
+	if s.dead.Load() {
+		switch req := req.(type) {
+		case requestThread:
+			req.thread <- nil
+		case requestStub:
+			req.done <- nil
+		}
+		return
+	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	if err := s.syscallThread.attach(); err != nil {
@@ -265,8 +279,8 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 		// (Hopefully nobody tgkilled it with a signal <
 		// SIGSTOP before the SIGSTOP was delivered, in which
 		// case that signal would be delivered before SIGSTOP.)
-		if sig := t.wait(stopped); sig != unix.SIGSTOP {
-			handlePtraceSyscallRequestError(req, "error waiting for new clone: expected SIGSTOP, got %v", sig)
+		if sig, err := t.wait(stopped); err != nil || sig != unix.SIGSTOP {
+			handlePtraceSyscallRequestError(req, "error waiting for new clone: expected SIGSTOP, got %v (err: %v)", sig, err)
 			return
 		}
 
@@ -335,18 +349,21 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 // newSubprocess returns a usable subprocess.
 //
 // This will either be a newly created subprocess, or one from the global pool.
-// The create function will be called in the latter case, which is guaranteed
+// The create function will be called in the former case, which is guaranteed
 // to happen with the runtime thread locked.
 //
-// seccompNotify indicates a ways of comunications with syscall threads.
+// seccompNotify indicates a ways of communications with syscall threads.
 // If it is false, futex-s are used. Otherwise, seccomp-unotify is used.
 // seccomp-unotify can't be used for the source pool process, because it is a
 // parent of all other stub processes, but only one filter can be installed
 // with SECCOMP_FILTER_FLAG_NEW_LISTENER.
-func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile, seccompNotify bool) (*subprocess, error) {
+//
+// disablePatching prevents this subprocess from patching syscall
+// instructions in the application's address space.
+func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile, seccompNotify bool, disablePatching bool) (*subprocess, error) {
 	if sp := globalPool.fetchAvailable(); sp != nil {
 		sp.subprocessRefs.InitRefs()
-		sp.usertrap = usertrap.New()
+		sp.usertrap = usertrap.New(disablePatching)
 		return sp, nil
 	}
 
@@ -392,7 +409,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	}()
 
 	sp.unmap()
-	sp.usertrap = usertrap.New()
+	sp.usertrap = usertrap.New(disablePatching)
 	sp.mapSharedRegions()
 	sp.mapPrivateRegions()
 
@@ -499,31 +516,63 @@ func (s *subprocess) unmap() {
 	}
 }
 
-// Release kills the subprocess.
-//
-// Just kidding! We can't safely coordinate the detaching of all the
-// tracees (since the tracers are random runtime threads, and the process
-// won't exit until tracers have been notifier).
-//
-// Therefore we simply unmap everything in the subprocess and return it to the
-// globalPool. This has the added benefit of reducing creation time for new
-// subprocesses.
+// Release makes the subprocess available for reuse, or cleans it up if it died
+// an unexpected death.
 func (s *subprocess) Release() {
-	if !s.alive() {
-		return
+	if s.alive() {
+		s.unmap()
 	}
-	s.unmap()
 	s.DecRef(s.release)
 }
 
-// release returns the subprocess to the global pool.
 func (s *subprocess) release() {
 	if s.alive() {
 		globalPool.markAvailable(s)
 		return
 	}
-	if s.syscallThread != nil && s.syscallThread.seccompNotify != nil {
-		s.syscallThread.seccompNotify.Close()
+	if s.syscallThread != nil {
+		if s.syscallThread.seccompNotify != nil {
+			s.syscallThread.seccompNotify.Close()
+		}
+		wstatus := unix.WaitStatus(0)
+		unix.Wait4(int(s.syscallThread.thread.tid), &wstatus, unix.WNOHANG, nil)
+	}
+}
+
+// withAliveRLock executes fn while holding aliveMu.RLock(), ensuring the subprocess is alive.
+func (s *subprocess) withAliveRLock(fn func() error) error {
+	if s.dead.Load() {
+		return errDeadSubprocess
+	}
+	s.aliveMu.RLock()
+	defer s.aliveMu.RUnlock()
+	if s.dead.Load() {
+		return errDeadSubprocess
+	}
+	return fn()
+}
+
+// kill marks the subprocess dead, terminates the stub process, and unblocks
+// all contexts waiting in waitOnState or sleepOnState.
+//
+// This is only done on expected events that indicate we can't proceed using this
+// subprocess (e.g. stub threads unexpectedly die during execution). Well-behaved
+// subprocesses do no call this.
+func (s *subprocess) kill() {
+	if !s.dead.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Broadcast to sleeping task goroutines that it's time to go.
+	s.wakeAllContexts()
+
+	// Ensure in-flight createSysmsgThread and syscalls (MapFile/Unmap)
+	// complete before killing.
+	s.aliveMu.Lock()
+	defer s.aliveMu.Unlock()
+
+	if s.syscallThread != nil && s.syscallThread.thread != nil {
+		s.syscallThread.thread.kill()
 	}
 }
 
@@ -537,13 +586,14 @@ func (t *thread) attach() error {
 	// stopped from the SIGSTOP queued by CLONE_PTRACE (see inner loop of
 	// newSubprocess), so we always expect to see signal-delivery-stop with
 	// SIGSTOP.
-	if sig := t.wait(stopped); sig != unix.SIGSTOP {
+	if sig, err := t.wait(stopped); err != nil {
+		return fmt.Errorf("wait failed: %w", err)
+	} else if sig != unix.SIGSTOP {
 		return fmt.Errorf("wait failed: expected SIGSTOP, got %v", sig)
 	}
 
 	// Initialize options.
-	t.init()
-	return nil
+	return t.init()
 }
 
 func (t *thread) grabInitRegs() {
@@ -626,7 +676,7 @@ func (t *thread) dumpRegs(message string) {
 	log.Infof("%s", message)
 }
 
-func (t *thread) unexpectedStubExit() {
+func (t *thread) unexpectedStubExit() error {
 	msg, err := t.getEventMessage()
 	status := unix.WaitStatus(msg)
 	if status.Signaled() && status.Signal() == unix.SIGKILL {
@@ -636,17 +686,16 @@ func (t *thread) unexpectedStubExit() {
 		log.Warningf("The ptrace stub process %v has been killed by SIGKILL.", t.tgid)
 		err := sighandling.KillItself()
 		if err != nil {
-			t.dumpAndPanic(fmt.Sprintf(
-				"failed to kill the process %d:%d: %v", t.tgid, t.tid, err))
+			return fmt.Errorf("failed to kill the process %d:%d: %w", t.tgid, t.tid, err)
 		}
 	}
-	t.dumpAndPanic(fmt.Sprintf("wait failed: the process %d:%d exited: %x (err %v)", t.tgid, t.tid, msg, err))
+	return fmt.Errorf("wait failed: the process %d:%d exited: %x (err %v): %w", t.tgid, t.tid, msg, err, errDeadSubprocess)
 }
 
 // wait waits for a stop event.
 //
 // Precondition: outcome is a valid waitOutcome.
-func (t *thread) wait(outcome waitOutcome) unix.Signal {
+func (t *thread) wait(outcome waitOutcome) (unix.Signal, error) {
 	var status unix.WaitStatus
 
 	for {
@@ -655,15 +704,15 @@ func (t *thread) wait(outcome waitOutcome) unix.Signal {
 			// Wait was interrupted; wait again.
 			continue
 		} else if err != nil {
-			panic(fmt.Sprintf("ptrace wait failed: %v", err))
+			return 0, fmt.Errorf("ptrace wait failed: %w", err)
 		}
 		if int(r) != int(t.tid) {
-			panic(fmt.Sprintf("ptrace wait returned %v, expected %v", r, t.tid))
+			return 0, fmt.Errorf("ptrace wait returned %v, expected %v", r, t.tid)
 		}
 		switch outcome {
 		case stopped:
 			if !status.Stopped() {
-				t.dumpAndPanic(fmt.Sprintf("ptrace status unexpected: got %v, wanted stopped", status))
+				return 0, fmt.Errorf("ptrace status unexpected: got %v, wanted stopped (%w)", status, errDeadSubprocess)
 			}
 			stopSig := status.StopSignal()
 			if stopSig == 0 {
@@ -671,18 +720,18 @@ func (t *thread) wait(outcome waitOutcome) unix.Signal {
 			}
 			if stopSig == unix.SIGTRAP {
 				if status.TrapCause() == unix.PTRACE_EVENT_EXIT {
-					t.unexpectedStubExit()
+					return 0, t.unexpectedStubExit()
 				}
 				// Re-encode the trap cause the way it's expected.
-				return stopSig | unix.Signal(status.TrapCause()<<8)
+				return stopSig | unix.Signal(status.TrapCause()<<8), nil
 			}
 			// Not a trap signal.
-			return stopSig
+			return stopSig, nil
 		case killed:
 			if !status.Exited() && !status.Signaled() {
-				t.dumpAndPanic(fmt.Sprintf("ptrace status unexpected: got %v, wanted exited", status))
+				return 0, fmt.Errorf("ptrace status unexpected: got %v, wanted exited", status)
 			}
-			return unix.Signal(status.ExitStatus())
+			return unix.Signal(status.ExitStatus()), nil
 		default:
 			// Should not happen.
 			t.dumpAndPanic(fmt.Sprintf("unknown outcome: %v", outcome))
@@ -707,7 +756,7 @@ func (t *thread) destroy() {
 }
 
 // init initializes trace options.
-func (t *thread) init() {
+func (t *thread) init() error {
 	// Set the TRACESYSGOOD option to differentiate real SIGTRAP.
 	// set PTRACE_O_EXITKILL to ensure that the unexpected exit of the
 	// sentry will immediately kill the associated stubs.
@@ -719,8 +768,9 @@ func (t *thread) init() {
 		unix.PTRACE_O_TRACESYSGOOD|unix.PTRACE_O_TRACEEXIT|unix.PTRACE_O_EXITKILL,
 		0, 0)
 	if errno != 0 {
-		panic(fmt.Sprintf("ptrace set options failed: %v", errno))
+		return fmt.Errorf("ptrace set options failed: %w", errno)
 	}
+	return nil
 }
 
 // syscall executes a system call cycle in the traced context.
@@ -731,7 +781,7 @@ func (t *thread) init() {
 func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 	// Set registers.
 	if err := t.setRegs(regs); err != nil {
-		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
+		return 0, fmt.Errorf("ptrace set regs failed: %w", err)
 	}
 
 	for {
@@ -739,10 +789,13 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 		// trap instruction which is right after the syscall
 		// instruction.
 		if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(t.tid), 0); errno != 0 {
-			panic(fmt.Sprintf("ptrace syscall-enter failed: %v", errno))
+			return 0, fmt.Errorf("ptrace syscall-enter failed: %w", errno)
 		}
 
-		sig := t.wait(stopped)
+		sig, err := t.wait(stopped)
+		if err != nil {
+			return 0, err
+		}
 		if sig == unix.SIGTRAP {
 			// Reached syscall-enter-stop.
 			break
@@ -757,7 +810,7 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 
 	// Grab registers.
 	if err := t.getRegs(regs); err != nil {
-		panic(fmt.Sprintf("ptrace get regs failed: %v", err))
+		return 0, fmt.Errorf("ptrace get regs failed: %w", err)
 	}
 	return syscallReturnValue(regs)
 }
@@ -814,12 +867,12 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
 	s.resetSysemuRegs(regs)
-	ctx := c.sharedContext
+	ctx := c.sharedContext.Load()
 	ctx.shared.Regs = regs.PtraceRegs
-	restoreArchSpecificState(ctx.shared, ac)
+	s.restoreArchSpecificState(ctx.shared, ac)
 
 	// Check for interrupts, and ensure that future interrupts signal the context.
-	if !c.interrupt.Enable(c.sharedContext) {
+	if !c.interrupt.Enable() {
 		// Pending interrupt; simulate.
 		ctx.clearInterrupt()
 		c.signalInfo = linux.SignalInfo{Signo: int32(platform.SignalInterrupt)}
@@ -843,12 +896,17 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	}
 
 	if err := s.waitOnState(ctx); err != nil {
+		if errors.Is(err, errDeadSubprocess) {
+			return false, false, hostarch.NoAccess, errDeadSubprocessContext
+		}
 		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(err.Error())
 	}
 
+	ctxState := ctx.state()
+
 	// Check if there's been an error.
-	threadID := ctx.threadID()
-	if threadID != invalidThreadID {
+	if ctxState == sysmsg.ContextStateUnexpectedDeath {
+		threadID := ctx.threadID()
 		s.sysmsgThreadsMu.RLock()
 		sysThread, ok := s.sysmsgThreads[threadID]
 		s.sysmsgThreadsMu.RUnlock()
@@ -857,18 +915,20 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 			log.BugTraceback(sysmsgErr)
 			return false, false, hostarch.NoAccess, sysmsgErr
 		}
-		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(fmt.Sprintf("found unexpected ThreadContext.ThreadID field, expected %d found %d", invalidThreadID, threadID))
+		return false, false, hostarch.NoAccess, &platform.ContextError{
+			Err:   fmt.Errorf("systrap unexpected death"),
+			Errno: unix.ECHILD,
+		}
 	}
 
 	// Copy register state locally.
 	regs.PtraceRegs = ctx.shared.Regs
-	retrieveArchSpecificState(ctx.shared, ac)
+	s.retrieveArchSpecificState(ctx.shared, ac)
 	c.needToPullFullState = true
 	// We have a signal. We verify however, that the signal was
 	// either delivered from the kernel or from this process. We
 	// don't respect other signals.
 	c.signalInfo = ctx.shared.SignalInfo
-	ctxState := ctx.state()
 	if ctxState == sysmsg.ContextStateSyscallCanBePatched {
 		ctxState = sysmsg.ContextStateSyscall
 		shouldPatchSyscall = true
@@ -877,13 +937,8 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 		if maybePatchSignalInfo(regs, &c.signalInfo) {
 			return false, false, hostarch.Execute, nil
 		}
-		updateSyscallRegs(regs)
+		updateSyscallRegs(regs, ctxState)
 		return true, shouldPatchSyscall, hostarch.NoAccess, nil
-	} else if ctxState == sysmsg.ContextStateUnexpectedDeath {
-		return false, shouldPatchSyscall, hostarch.NoAccess, &platform.ContextError{
-			Err:   fmt.Errorf("systrap unexpected death"),
-			Errno: unix.ECHILD,
-		}
 	} else if ctxState != sysmsg.ContextStateFault {
 		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(fmt.Sprintf("unknown context state: %v", ctxState))
 	}
@@ -896,6 +951,9 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 }
 
 func (s *subprocess) waitOnState(ctx *sharedContext) error {
+	if s.dead.Load() {
+		return errDeadSubprocess
+	}
 	ctx.kicked = false
 	slowPath := false
 	if !s.contextQueue.fastPathEnabled() || atomic.LoadUint32(&s.contextQueue.numActiveThreads) == 0 {
@@ -945,6 +1003,9 @@ func (s *subprocess) waitOnState(ctx *sharedContext) error {
 // The second return value is the expected number of threads after kicking a
 // new one.
 func (s *subprocess) canKickSysmsgThread() (bool, uint32) {
+	if s.dead.Load() {
+		return false, 0
+	}
 	// numActiveContexts and numActiveThreads can be changed from stub
 	// threads that handles the contextQueue without any locks. The idea
 	// here is that any stub thread that gets CPU time can make some
@@ -1001,10 +1062,15 @@ func (s *subprocess) kickSysmsgThread() bool {
 
 // syscall executes the given system call without handling interruptions.
 func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
-	s.syscallThreadMu.Lock()
-	defer s.syscallThreadMu.Unlock()
-
-	return s.syscallThread.syscall(sysno, args...)
+	var ret uintptr
+	err := s.withAliveRLock(func() error {
+		s.syscallThreadMu.Lock()
+		defer s.syscallThreadMu.Unlock()
+		r, err := s.syscallThread.syscall(sysno, args...)
+		ret = r
+		return err
+	})
+	return ret, err
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
@@ -1041,10 +1107,11 @@ func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 }
 
 func (s *subprocess) PullFullState(c *platformContext, ac *arch.Context64) error {
-	if !c.sharedContext.isActiveInSubprocess(s) {
+	sc := c.sharedContext.Load()
+	if !sc.isActiveInSubprocess(s) {
 		panic("Attempted to PullFullState for context that is not used in subprocess")
 	}
-	saveFPState(c.sharedContext, ac)
+	saveFPState(sc, ac)
 	return nil
 }
 
@@ -1069,6 +1136,11 @@ func initSysmsgThreadPriority() {
 // createSysmsgThread creates a new sysmsg thread.
 // The thread starts processing any available context in the context queue.
 func (s *subprocess) createSysmsgThread() error {
+	return s.withAliveRLock(s.createSysmsgThreadLocked)
+}
+
+// +checklocksread:s.aliveMu
+func (s *subprocess) createSysmsgThreadLocked() error {
 	// Create a new seccomp process.
 	var r requestThread
 	r.thread = make(chan *thread)
@@ -1077,6 +1149,12 @@ func (s *subprocess) createSysmsgThread() error {
 	if p == nil {
 		return fmt.Errorf("createSysmsgThread: failed to get clone")
 	}
+	success := false
+	defer func() {
+		if !success {
+			s.sysmsgStackPool.Put(p.sysmsgStackID)
+		}
+	}()
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -1086,11 +1164,14 @@ func (s *subprocess) createSysmsgThread() error {
 
 	// Skip SIGSTOP.
 	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(p.tid), 0); errno != 0 {
-		panic(fmt.Sprintf("ptrace cont failed: %v", errno))
+		return fmt.Errorf("ptrace cont failed: %w", errno)
 	}
-	sig := p.wait(stopped)
+	sig, err := p.wait(stopped)
+	if err != nil {
+		return fmt.Errorf("error waiting for new clone: %w", err)
+	}
 	if sig != unix.SIGSTOP {
-		panic(fmt.Sprintf("error waiting for new clone: expected SIGSTOP, got %v", sig))
+		return fmt.Errorf("error waiting for new clone: expected SIGSTOP, got %v", sig)
 	}
 
 	// Allocate a new stack for the BPF process.
@@ -1100,9 +1181,13 @@ func (s *subprocess) createSysmsgThread() error {
 	}
 	fr, err := s.memoryFile.Allocate(uint64(sysmsg.PerThreadSharedStackSize), opts)
 	if err != nil {
-		// TODO(b/144063246): Need to fail the clone system call.
-		panic(fmt.Sprintf("failed to allocate a new stack: %v", err))
+		return fmt.Errorf("failed to allocate a new stack: %w", err)
 	}
+	defer func() {
+		if !success {
+			s.memoryFile.DecRef(fr)
+		}
+	}()
 	sysThread := &sysmsgThread{
 		thread:     p,
 		subproc:    s,
@@ -1121,8 +1206,13 @@ func (s *subprocess) createSysmsgThread() error {
 		unix.MAP_SHARED|unix.MAP_FILE,
 		uintptr(s.memoryFile.FD()), uintptr(fr.Start))
 	if errno != 0 {
-		panic(fmt.Sprintf("mmap failed: %v", errno))
+		return fmt.Errorf("mmap failed: %w", errno)
 	}
+	defer func() {
+		if !success {
+			hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, sentryStackAddr, sysmsg.PerThreadSharedStackSize, 0)
+		}
+	}()
 
 	// Before installing the stub syscall filters, we need to call a few
 	// system calls (e.g. sigaltstack, sigaction) which have in-memory
@@ -1132,24 +1222,24 @@ func (s *subprocess) createSysmsgThread() error {
 	sysmsgStackAddr := sysThread.sysmsgPerThreadMemAddr() + sysmsg.PerThreadSharedStackOffset
 	err = sysThread.mapStack(sysmsgStackAddr, true)
 	if err != nil {
-		panic(fmt.Sprintf("mmap failed: %v", err))
+		return fmt.Errorf("mmap failed: %w", err)
 	}
 
-	sysThread.init(sentryStackAddr, sysmsgStackAddr)
+	if err := sysThread.init(sentryStackAddr, sysmsgStackAddr); err != nil {
+		return err
+	}
 
 	// Map the stack into the BPF process.
 	err = sysThread.mapStack(sysmsgStackAddr, false)
 	if err != nil {
-		s.memoryFile.DecRef(fr)
-		panic(fmt.Sprintf("mmap failed: %v", err))
+		return fmt.Errorf("mmap failed: %w", err)
 	}
 
 	// Map the stack into the BPF process.
 	privateStackAddr := sysThread.sysmsgPerThreadMemAddr() + sysmsg.PerThreadPrivateStackOffset
 	err = sysThread.mapPrivateStack(privateStackAddr, sysmsg.PerThreadPrivateStackSize)
 	if err != nil {
-		s.memoryFile.DecRef(fr)
-		panic(fmt.Sprintf("mmap failed: %v", err))
+		return fmt.Errorf("mmap failed: %w", err)
 	}
 
 	sysThread.setMsg(sysmsg.StackAddrToMsg(sentryStackAddr))
@@ -1173,7 +1263,7 @@ func (s *subprocess) createSysmsgThread() error {
 		arch.SyscallArgument{Value: uintptr(0)},
 		arch.SyscallArgument{Value: uintptr(0)})
 	if err != nil {
-		panic(fmt.Sprintf("prctl(PR_SET_NO_NEW_PRIVS) failed: %v", err))
+		return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS) failed: %w", err)
 	}
 
 	_, err = p.syscallIgnoreInterrupt(&p.initRegs, seccomp.SYS_SECCOMP,
@@ -1181,7 +1271,7 @@ func (s *subprocess) createSysmsgThread() error {
 		arch.SyscallArgument{Value: uintptr(0)},
 		arch.SyscallArgument{Value: stubSysmsgRules})
 	if err != nil {
-		panic(fmt.Sprintf("seccomp failed: %v", err))
+		return fmt.Errorf("seccomp failed: %w", err)
 	}
 
 	// Prepare to start the BPF process.
@@ -1189,25 +1279,29 @@ func (s *subprocess) createSysmsgThread() error {
 	s.resetSysemuRegs(tregs)
 	setArchSpecificRegs(sysThread, tregs)
 	if err := p.setRegs(tregs); err != nil {
-		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
+		return fmt.Errorf("ptrace set regs failed: %w", err)
 	}
 	// Send a fake event to stop the BPF process so that it enters the sighandler.
 	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(sysThread.thread.tgid), uintptr(sysThread.thread.tid), uintptr(unix.SIGSEGV)); e != 0 {
-		panic(fmt.Sprintf("tkill failed: %v", e))
+		return fmt.Errorf("tkill failed: %w", e)
 	}
 	// Skip SIGSTOP.
 	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(p.tgid), uintptr(p.tid), uintptr(unix.SIGCONT)); e != 0 {
-		panic(fmt.Sprintf("tkill failed: %v", e))
+		return fmt.Errorf("tkill failed: %w", e)
 	}
-	// Resume the BPF process.
-	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(p.tid), 0); errno != 0 {
-		panic(fmt.Sprintf("can't detach new clone: %v", errno))
-	}
-
 	s.sysmsgThreadsMu.Lock()
 	s.sysmsgThreads[threadID] = sysThread
 	s.sysmsgThreadsMu.Unlock()
 
+	// Resume the BPF process.
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(p.tid), 0); errno != 0 {
+		s.sysmsgThreadsMu.Lock()
+		delete(s.sysmsgThreads, threadID)
+		s.sysmsgThreadsMu.Unlock()
+		return fmt.Errorf("can't detach new clone: %w", errno)
+	}
+
+	success = true
 	return nil
 }
 
@@ -1223,19 +1317,34 @@ func (s *subprocess) PostFork() {
 	s.usertrap.PostFork() // +checklocksforce: PreFork acquires, above.
 }
 
+// UserModifiedGS implements platform.AddressSpace.UserModifiedGS.
+func (s *subprocess) UserModifiedGS(ctx pkgcontext.Context, mm platform.MemoryManager) error {
+	if s.usertrap == nil || s.usertrap.Disabled() {
+		return nil
+	}
+
+	if err := s.usertrap.UnpatchSyscalls(ctx, mm); err != nil {
+		s.kill()
+		return err
+	}
+
+	return nil
+}
+
 // activateContext activates the context in this subprocess.
 // No-op if the context is already active within the subprocess; if not,
 // deactivates it from its last subprocess.
 func (s *subprocess) activateContext(c *platformContext) error {
-	if !c.sharedContext.isActiveInSubprocess(s) {
-		c.sharedContext.release()
-		c.sharedContext = nil
+	if !c.sharedContext.Load().isActiveInSubprocess(s) {
+		if sc := c.sharedContext.Swap(nil); sc != nil {
+			sc.release()
+		}
 
 		shared, err := s.getSharedContext()
 		if err != nil {
 			return err
 		}
-		c.sharedContext = shared
+		c.sharedContext.Store(shared)
 	}
 	return nil
 }

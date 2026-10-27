@@ -64,6 +64,9 @@ const (
 // by the task goroutine while it is running. The task goroutine does not
 // require synchronization to read or write these fields.
 //
+// A task's Kernel and ThreadGroup belong to the same TaskSet.
+//
+// +checklocksalias:tg.pidns.owner.mu=k.tasks.mu
 // +stateify savable
 type Task struct {
 	taskNode
@@ -81,15 +84,17 @@ type Task struct {
 
 	// taskWorkCount represents the current size of the task work queue. It is
 	// used to avoid acquiring taskWorkMu when the queue is empty.
+	//
+	// +checkatomic
+	// +checklocks:taskWorkMu
 	taskWorkCount atomicbitops.Int32
 
-	// taskWorkMu protects taskWork.
 	taskWorkMu taskWorkMutex `state:"nosave"`
 
 	// taskWork is a queue of work to be executed before resuming user execution.
 	// It is similar to the task_work mechanism in Linux.
 	//
-	// taskWork is exclusive to the task goroutine.
+	// +checklocks:taskWorkMu
 	taskWork []TaskWorker
 
 	// haveSyscallReturn is true if image.Arch().Return() represents a value
@@ -97,6 +102,18 @@ type Task struct {
 	//
 	// haveSyscallReturn is exclusive to the task goroutine.
 	haveSyscallReturn bool
+
+	// bypassSeccompRestartSyscall causes the next restart_syscall to skip
+	// seccomp filtering. It is armed by Kernel.SaveTo, while the kernel is
+	// paused, for a task checkpointed with ERESTART_RESTARTBLOCK pending (see
+	// armSeccompRestartSyscallBypass), and is saved with the task. It is
+	// cleared when consumed, when a signal handler is delivered, or when the
+	// task begins an internal stop.
+	//
+	// bypassSeccompRestartSyscall is exclusive to the task goroutine, except
+	// that armSeccompRestartSyscallBypass writes it while the kernel is
+	// paused.
+	bypassSeccompRestartSyscall bool
 
 	// interruptChan is notified whenever the task goroutine is interrupted
 	// (usually by a pending signal). interruptChan is effectively a condition
@@ -106,22 +123,20 @@ type Task struct {
 	// interruptChan is always notified after restore (see Task.run).
 	interruptChan chan struct{} `state:"nosave"`
 
-	// gostateSeq allows Task.TaskGoroutineStateTime() to read gostate and
-	// gostateTime atomically.
+	// gostate combines two fields in one 64-bit integer:
+	//  - First `gostateBits` bits are the `TaskGoroutineState` enum value.
+	//  - Rest of the bits are the value of Kernel.cpuClock when the state was
+	//   last updated or refreshed.
+	// Packing them this way allows efficient atomic reads and writes, which
+	// is critical for performance on the syscall hot path.
 	//
-	// gostateSeq is owned by the task goroutine.
-	gostateSeq sync.SeqCount `state:"nosave"`
-
-	// gostate is the current scheduling state of the task goroutine.
+	// Despite the use of `atomicbitops.Uint64`, `gostate` is written to
+	// **with no barrier guarantee** from the task goroutine, for syscall hot
+	// path performance reasons. This means all readers (other than from the
+	// task goroutine) **must** tolerate stale reads.
 	//
 	// gostate is owned by the task goroutine.
-	gostate atomicbitops.Uint32
-
-	// gostateTime was the value of Kernel.cpuClock when gostate was last
-	// updated or refreshed.
-	//
-	// gostateTime is owned by the task goroutine.
-	gostateTime atomicbitops.Int64
+	gostate atomicbitops.Uint64
 
 	// appCPUClock approximates the amount of time the task goroutine has spent
 	// in TaskGoroutineRunningApp.
@@ -194,6 +209,30 @@ type Task struct {
 	// groupStopPending is protected by the signal mutex.
 	groupStopPending bool
 
+	// freezeOrdered mirrors t's cgroup's effective cgroup.freeze state;
+	// runInterrupt parks t in frozenStop when set. Relayed by cgroup2fs
+	// (Task.ApplyFreezeTasksLocked) to avoid a signalHandlers.mu ->
+	// fs.tasksMu deadlock.
+	//
+	// Protected by the signal mutex.
+	freezeOrdered bool
+
+	// hasFreezeCredit: t owes a cgroup a resolution, paid by parking,
+	// thaw, exit, or migration. Not inferable from t.stop's type: a
+	// killable stop force-ends (killLocked) even post-resolution, so
+	// t.stop can't distinguish "never parked" from "parked, then killed".
+	//
+	// Protected by the signal mutex.
+	hasFreezeCredit bool
+
+	// freezeCreditCgroup is the cgroup that issued the outstanding
+	// credit -- always use it, never re-derive via Cgroup2(): cgroup2Mu
+	// isn't nested under signalHandlers.mu, so a fresh lookup racing a
+	// migration could credit/debit the wrong cgroup.
+	//
+	// Protected by the signal mutex.
+	freezeCreditCgroup Cgroup2
+
 	// If groupStopAcknowledged is true, the task has already acknowledged that
 	// it is entering the most recent group stop that has been initiated on its
 	// thread group.
@@ -258,7 +297,9 @@ type Task struct {
 
 	// exitStatus is the task's exit status.
 	//
-	// exitStatus is protected by the signal mutex.
+	// The task goroutine writes exitStatus under the signal mutex. After
+	// TaskExitZombie it is immutable and may be read with only TaskSet.mu.
+	// checklocks cannot express this lifecycle-dependent locking rule.
 	exitStatus linux.WaitStatus
 
 	// syscallRestartBlock represents a custom restart function to run in
@@ -299,6 +340,13 @@ type Task struct {
 	//
 	// fdTable is protected by mu, and is owned by the task goroutine.
 	fdTable *FDTable
+
+	// userDumpable caches the dumpability state of the task's MemoryManager
+	// before it is cleared during process exit. This cached state is used to perform
+	// ptrace access checks after the MemoryManager has been released.
+	//
+	// userDumpable is protected by mu.
+	userDumpable bool
 
 	// If vforkParent is not nil, it is the task that created this task with
 	// vfork() or clone(CLONE_VFORK), and should have its vforkStop ended when
@@ -356,6 +404,14 @@ type Task struct {
 	// mutex, notably the syscall path, to check if ptraceTracer is nil without
 	// additional synchronization.
 	ptraceTracer atomic.Pointer[Task] `state:".(*Task)"`
+
+	// ptracerCreds is a snapshot of this task's tracer's credentials,
+	// captured when the tracing relationship was established, analogous to
+	// Linux's task_struct::ptracer_cred. It is nil if and only if the task is
+	// not being traced.
+	//
+	// ptracerCreds is protected by the TaskSet mutex.
+	ptracerCreds *auth.Credentials
 
 	// ptraceTracees is the set of tasks that this task is ptrace-attached to.
 	//
@@ -462,7 +518,7 @@ type Task struct {
 
 	// noNewPrivs determines whether the task is allowed to gain new privileges.
 	//
-	// noNewPrivs is protected by mu.
+	// +checklocks:mu
 	noNewPrivs bool
 
 	// utsns is the task's UTS namespace.
@@ -475,6 +531,11 @@ type Task struct {
 	// ipcns is protected by mu. ipcns is owned by the task goroutine.
 	ipcns *IPCNamespace
 
+	// cgroupns is the task's cgroup namespace.
+	//
+	// cgroupns is protected by mu. cgroupns is owned by the task goroutine.
+	cgroupns *CgroupNamespace
+
 	// mountNamespace is the task's mount namespace.
 	//
 	// It is protected by mu. It is owned by the task goroutine.
@@ -482,7 +543,7 @@ type Task struct {
 
 	// parentDeathSignal is sent to this task's thread group when its parent exits.
 	//
-	// parentDeathSignal is protected by mu.
+	// +checklocks:mu
 	parentDeathSignal linux.Signal
 
 	// seccomp contains all seccomp-bpf syscall filters applicable to the task.
@@ -503,9 +564,9 @@ type Task struct {
 	// don't really control the affinity.
 	//
 	// Invariant: allowedCPUMask.Size() ==
-	// sched.CPUMaskSize(Kernel.applicationCores).
+	// sched.CPUSetSize(Kernel.applicationCores).
 	//
-	// allowedCPUMask is protected by mu.
+	// +checklocks:mu
 	allowedCPUMask sched.CPUSet
 
 	// cpu is the fake cpu number returned by getcpu(2). cpu is ignored
@@ -516,7 +577,7 @@ type Task struct {
 	// It has no effect and is only used to provide a reasonable return value for
 	// sched_getattr() and similar.
 	//
-	// scheduler is protected by mu.
+	// +checklocks:mu
 	scheduler uint
 
 	// This is used to keep track of changes made to a process' priority/niceness.
@@ -526,13 +587,13 @@ type Task struct {
 	// NOTE: This represents the userspace view of priority (nice).
 	// This means that the value should be in the range [-20, 19].
 	//
-	// niceness is protected by mu.
+	// +checklocks:mu
 	niceness int
 
 	// This is used to keep track of a process's IO class and priority.
 	// It is only used to provide a reasonable return value for ioprio_get().
 	//
-	// ioprio is protected by mu.
+	// +checklocks:mu
 	ioprio int
 
 	// This is used to track the numa policy for the current thread. This can be
@@ -544,8 +605,10 @@ type Task struct {
 	// always report a single node so never need to save more than a single
 	// bit.
 	//
-	// numaPolicy and numaNodeMask are protected by mu.
-	numaPolicy   linux.NumaPolicy
+	// +checklocks:mu
+	numaPolicy linux.NumaPolicy
+
+	// +checklocks:mu
 	numaNodeMask uint64
 
 	// netns is the task's network namespace. It has to be changed under mu
@@ -664,7 +727,10 @@ type Task struct {
 	Origin TaskOrigin
 
 	// onDestroyAction is a set of callbacks that are executed when the
-	// task is destroyed.
+	// task is destroyed. The map is detached under mu before callbacks run
+	// asynchronously without mu.
+	//
+	// +checklocks:mu
 	onDestroyAction map[TaskDestroyAction]struct{}
 
 	// Helps serializes an execve(2) with a PTRACE_ATTACH and seccomp tsync. See the comment for
@@ -709,7 +775,7 @@ func (t *Task) afterLoad(gocontext.Context) {
 		ts.populateCache(t)
 	}
 	t.interruptChan = make(chan struct{}, 1)
-	t.gostate.Store(uint32(TaskGoroutineNonexistent))
+	t.setGostate(TaskGoroutineNonexistent)
 	if t.stop != nil {
 		t.stopCount = atomicbitops.FromInt32(1)
 	}
@@ -851,7 +917,9 @@ func (t *Task) NewFDAt(fd int32, file *vfs.FileDescription, flags FDFlags) (*vfs
 	return t.fdTable.NewFDAt(t, fd, file, flags)
 }
 
-// WithMuLocked executes f with t.mu locked.
+// WithMuLocked acquires t.mu, calls f synchronously, and releases t.mu.
+//
+// +checklocksexclude:t.mu
 func (t *Task) WithMuLocked(f func(*Task)) {
 	t.mu.Lock()
 	f(t)
@@ -903,14 +971,16 @@ func (t *Task) SetOOMScoreAdj(adj int32) error {
 	return nil
 }
 
-// KUID returns t's kuid.
+// KUID implements tcpip.PacketOwner.KUID. Like Linux's netfilter owner match,
+// it uses the filesystem UID.
 func (t *Task) KUID() uint32 {
-	return uint32(t.Credentials().EffectiveKUID)
+	return uint32(t.Credentials().FilesystemKUID)
 }
 
-// KGID returns t's kgid.
+// KGID implements tcpip.PacketOwner.KGID. Like Linux's netfilter owner match,
+// it uses the filesystem GID.
 func (t *Task) KGID() uint32 {
-	return uint32(t.Credentials().EffectiveKGID)
+	return uint32(t.Credentials().FilesystemKGID)
 }
 
 // SetKcov sets the kcov instance associated with t.
@@ -919,6 +989,8 @@ func (t *Task) SetKcov(k *Kcov) {
 }
 
 // ResetKcov clears the kcov instance associated with t.
+//
+// +checklocksexclude:t.kcov.mu
 func (t *Task) ResetKcov() {
 	if t.kcov != nil {
 		t.kcov.OnTaskExit()

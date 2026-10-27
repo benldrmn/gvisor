@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
@@ -32,61 +34,61 @@ func TestGetMountAccessType(t *testing.T) {
 		{
 			name: "container=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "container",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessExclusive,
 		},
 		{
 			name: "pod=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "pod",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "pod",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "share=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "shared",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "shared",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "default=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source + "mismatch",
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "container",
+				sentryapi.MountPrefix + "mount1.source": source + "mismatch",
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "tmpfs+container=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "tmpfs",
-				MountPrefix + "mount1.share":  "container",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "tmpfs",
+				sentryapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessExclusive,
 		},
 		{
 			name: "tmpfs+pod=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "tmpfs",
-				MountPrefix + "mount1.share":  "pod",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "tmpfs",
+				sentryapi.MountPrefix + "mount1.share":  "pod",
 			},
 			want: config.FileAccessExclusive,
 		},
 	} {
 		t.Run(tst.name, func(t *testing.T) {
 			spec := &specs.Spec{Annotations: tst.annotations}
-			podHints, err := NewPodMountHints(spec)
+			podHints, err := sentryapi.NewPodMountHints(spec)
 			if err != nil {
 				t.Fatalf("newPodMountHints failed: %v", err)
 			}
@@ -178,5 +180,48 @@ func TestCgroupfsCPUDefaults(t *testing.T) {
 				t.Errorf("period = %d, want %d", got, tc.wantPeriod)
 			}
 		})
+	}
+}
+
+func TestFindByResourceID(t *testing.T) {
+	type testItem struct {
+		id checkpoint.ResourceID
+	}
+	getID := func(item testItem) checkpoint.ResourceID {
+		return item.id
+	}
+
+	m := map[checkpoint.ResourceID]testItem{
+		{ContainerName: "c1", Path: "/data"}: {id: checkpoint.ResourceID{ContainerName: "c1", Path: "/data"}},
+		{ContainerName: "", Path: "/shared"}: {id: checkpoint.ResourceID{ContainerName: "", Path: "/shared"}},
+	}
+
+	// Exact match.
+	if got, ok, err := findByResourceID(m, checkpoint.ResourceID{ContainerName: "c1", Path: "/data"}, getID, "Test"); err != nil || !ok || got.id.Path != "/data" {
+		t.Errorf("findByResourceID exact match got (%v, %v, %v), want ({c1, /data}, true, nil)", got, ok, err)
+	}
+
+	// Fallback match: query has empty container name, matches c1:/data unambiguously.
+	if got, ok, err := findByResourceID(m, checkpoint.ResourceID{ContainerName: "", Path: "/data"}, getID, "Test"); err != nil || !ok || got.id.Path != "/data" {
+		t.Errorf("findByResourceID fallback match got (%v, %v, %v), want ({c1, /data}, true, nil)", got, ok, err)
+	}
+
+	// Fallback match: query has container name c2, matches :/shared unambiguously.
+	if got, ok, err := findByResourceID(m, checkpoint.ResourceID{ContainerName: "c2", Path: "/shared"}, getID, "Test"); err != nil || !ok || got.id.Path != "/shared" {
+		t.Errorf("findByResourceID fallback match got (%v, %v, %v), want ({, /shared}, true, nil)", got, ok, err)
+	}
+
+	// Conflicting container names: query has c2 for /data, map only has c1. Should not match.
+	if got, ok, err := findByResourceID(m, checkpoint.ResourceID{ContainerName: "c2", Path: "/data"}, getID, "Test"); err != nil || ok {
+		t.Errorf("findByResourceID conflicting container got (%v, %v, %v), want zero, false, nil", got, ok, err)
+	}
+
+	// Ambiguous match: two containers have /multi, query has empty container name. Should error.
+	ambiguousMap := map[checkpoint.ResourceID]testItem{
+		{ContainerName: "c1", Path: "/multi"}: {id: checkpoint.ResourceID{ContainerName: "c1", Path: "/multi"}},
+		{ContainerName: "c2", Path: "/multi"}: {id: checkpoint.ResourceID{ContainerName: "c2", Path: "/multi"}},
+	}
+	if got, ok, err := findByResourceID(ambiguousMap, checkpoint.ResourceID{ContainerName: "", Path: "/multi"}, getID, "Test"); err == nil || ok {
+		t.Errorf("findByResourceID ambiguous match got (%v, %v, %v), want zero, false, error", got, ok, err)
 	}
 }

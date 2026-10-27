@@ -115,9 +115,9 @@ pkg_tar(
     srcs = [
         "_config.yml",
         ":css",
+        "//website/application_compatibility:index.html",
         "//website/blog:index.html",
         "//website/security_track_record:index.html",
-        "//website/users:index.html",
     ] + glob([
         "_data/**",
         "assets/**",
@@ -142,12 +142,14 @@ docs(
     name = "docs",
     deps = [
         ":index",
+        "//:adopters",
         "//:code_of_conduct",
         "//:contributing",
         "//:governance",
         "//:security",
         "//g3doc:community",
         "//g3doc:index",
+        "//g3doc:release",
         "//g3doc:roadmap",
         "//g3doc:style",
         "//g3doc/architecture_guide:intro_to_gvisor",
@@ -163,12 +165,15 @@ docs(
         "//g3doc/user_guide:debugging",
         "//g3doc/user_guide:filesystem",
         "//g3doc/user_guide:fs_snapshot",
+        "//g3doc/user_guide:fuse",
         "//g3doc/user_guide:gpu",
         "//g3doc/user_guide:install",
         "//g3doc/user_guide:networking",
+        "//g3doc/user_guide:no_root_container",
         "//g3doc/user_guide:observability",
         "//g3doc/user_guide:platforms",
         "//g3doc/user_guide:production",
+        "//g3doc/user_guide:rdma",
         "//g3doc/user_guide:rootfs_snapshot",
         "//g3doc/user_guide:rootless",
         "//g3doc/user_guide:runtime_monitoring",
@@ -176,11 +181,15 @@ docs(
         "//g3doc/user_guide:tpu",
         "//g3doc/user_guide/containerd:configuration",
         "//g3doc/user_guide/containerd:containerd_11",
+        "//g3doc/user_guide/containerd:crio",
         "//g3doc/user_guide/containerd:quick_start",
+        "//g3doc/user_guide/personalities:bwrap",
         "//g3doc/user_guide/quick_start:docker",
         "//g3doc/user_guide/quick_start:kubernetes",
         "//g3doc/user_guide/quick_start:oci",
         "//g3doc/user_guide/sdk:go",
+        "//g3doc/user_guide/sdk:python",
+        "//g3doc/user_guide/sdk:python_quickstart",
         "//g3doc/user_guide/sdk:quickstart",
         "//g3doc/user_guide/tutorials:cni",
         "//g3doc/user_guide/tutorials:docker",
@@ -197,8 +206,8 @@ docs(
 genrule(
     name = "syscalljson",
     outs = ["syscalls.json"],
-    cmd = "$(location //runsc) -- help syscalls -format json -filename $@",
-    tools = ["//runsc"],
+    cmd = "$(location //runsc/cmd/sentry:gvisor_sentry) -- help syscalls -format json -filename $@",
+    tools = ["//runsc/cmd/sentry:gvisor_sentry"],
 )
 
 # Generate markdown from the json dump.
@@ -224,4 +233,10 @@ yaml_test(
     srcs = ["_data/cve-track-record.yml"],
     disallow_comments = True,
     schema = "//website:cve-track-record.schema.json",
+)
+
+yaml_test(
+    name = "application_compatibility_test",
+    srcs = ["_data/application-compatibility.yml"],
+    schema = "//website:application-compatibility.schema.json",
 )

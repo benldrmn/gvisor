@@ -25,20 +25,23 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // Install implements subcommands.Command.
 type Install struct {
-	ConfigFile     string
-	Runtime        string
-	Experimental   bool
-	Clobber        bool
-	CgroupDriver   string
-	executablePath string
-	runtimeArgs    []string
+	ConfigFile       string
+	Runtime          string
+	Experimental     bool
+	Clobber          bool
+	CgroupDriver     string
+	DownloadSidecars config.SidecarReleasePolicy
+	SidecarURL       string
+	RequireSidecars  config.SidecarReleasePolicy
+	executablePath   string
+	runtimeArgs      []string
 }
 
 // Name implements subcommands.Command.Name.
@@ -63,6 +66,11 @@ func (i *Install) SetFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&i.Experimental, "experimental", false, "enable/disable experimental features")
 	fs.BoolVar(&i.Clobber, "clobber", true, "clobber existing runtime configuration")
 	fs.StringVar(&i.CgroupDriver, "cgroupdriver", "", "docker cgroup driver")
+	i.DownloadSidecars = config.SidecarReleaseIfReleaseBuild
+	i.RequireSidecars = config.SidecarReleaseIfReleaseBuild
+	fs.Var(&i.DownloadSidecars, "download-sidecars", "when to download missing sidecar binaries into gvisor-bin/ next to runsc: NEVER, ALWAYS, or IF_RELEASE_BUILD. This flag will go away in a few weeks! See gvisor.dev/issue/13718")
+	fs.Var(&i.RequireSidecars, "require-sidecars", "when missing sidecar binaries that cannot be installed are fatal: NEVER, ALWAYS, or IF_RELEASE_BUILD. This flag will go away in a few weeks! See gvisor.dev/issue/13718")
+	fs.StringVar(&i.SidecarURL, "sidecar-url", "", "download sidecar binaries from this gvisor.tar.bz2 URL instead of the release URL derived from the runsc version. This flag will go away in a few weeks! See gvisor.dev/issue/13718")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -78,11 +86,11 @@ func (i *Install) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	conf := args[0].(*config.Config)
 
 	// Check the platform.
-	p, err := platform.Lookup(conf.Platform)
+	p, err := platformdesc.Lookup(conf.Platform)
 	if err != nil {
 		log.Fatalf("invalid platform: %v", err)
 	}
-	deviceFile, err := p.OpenDevice(conf.PlatformDevicePath)
+	deviceFile, err := p.OpenDevice(conf.PlatformDeviceFor(conf.Platform))
 	if err != nil {
 		log.Printf("WARNING: unable to open platform, runsc may fail to start: %v", err)
 	}
@@ -105,6 +113,13 @@ func (i *Install) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 
 	if err := doInstallConfig(i, installRW); err != nil {
 		log.Fatalf("Install failed: %v", err)
+	}
+
+	if err := i.installSidecars(); err != nil {
+		if i.RequireSidecars.Applies() {
+			log.Fatalf("Cannot install sidecar binaries: %v", err)
+		}
+		log.Printf("WARNING: cannot install sidecar binaries; sandboxes cannot start without the Sentry sidecar, and sidecar-dependent features (metric server, GCS checkpoints) may be unavailable: %v", err)
 	}
 
 	// Success.
@@ -298,7 +313,11 @@ func defaultWriteConfig(c map[string]any, filename string) error {
 			return fmt.Errorf("error reading config file %q: %v", filename, err)
 		}
 	} else {
-		if err := os.WriteFile(filename+"~", old, 0644); err != nil {
+		perm := os.FileMode(0644)
+		if info, err := os.Stat(filename); err == nil {
+			perm = info.Mode().Perm()
+		}
+		if err := writeFileWithExplicitMode(filename+"~", old, perm); err != nil {
 			return fmt.Errorf("error backing up config file %q: %v", filename, err)
 		}
 	}
@@ -314,4 +333,20 @@ func defaultWriteConfig(c map[string]any, filename string) error {
 	}
 
 	return nil
+}
+
+func writeFileWithExplicitMode(filename string, data []byte, perm os.FileMode) error {
+	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Chmod(perm); err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	return err
 }

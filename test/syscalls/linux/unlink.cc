@@ -14,15 +14,21 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdlib>
+#include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/strings/str_cat.h"
 #include "test/util/capability_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -225,6 +231,31 @@ TEST(RmdirTest, CanRemoveWithTrailingSlashes) {
   auto dir2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   const std::string slashslash = absl::StrCat(dir2.path(), "//");
   ASSERT_THAT(rmdir(slashslash.c_str()), SyscallSucceeds());
+}
+
+TEST(UnlinkTest, TrailingSlash) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  // A nonexistent path is reported as such, whether or not it has a trailing
+  // slash.
+  const std::string missing = JoinPath(dir.path(), "missing");
+  EXPECT_THAT(unlink(missing.c_str()), SyscallFailsWithErrno(ENOENT));
+  EXPECT_THAT(unlink(absl::StrCat(missing, "/").c_str()),
+              SyscallFailsWithErrno(ENOENT));
+  EXPECT_THAT(unlinkat(AT_FDCWD, absl::StrCat(missing, "/").c_str(), 0),
+              SyscallFailsWithErrno(ENOENT));
+
+  // An existing directory is a directory, whether or not it has a trailing
+  // slash.
+  auto subdir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  EXPECT_THAT(unlink(absl::StrCat(subdir.path(), "/").c_str()),
+              SyscallFailsWithErrno(EISDIR));
+
+  // An existing file can't be named with a trailing slash, and isn't removed.
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  EXPECT_THAT(unlink(absl::StrCat(file.path(), "/").c_str()),
+              SyscallFailsWithErrno(ENOTDIR));
+  EXPECT_THAT(access(file.path().c_str(), F_OK), SyscallSucceeds());
 }
 
 TEST(UnlinkTest, UnlinkAtEmptyPath) {

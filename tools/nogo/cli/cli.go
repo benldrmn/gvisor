@@ -29,6 +29,7 @@ import (
 	"text/template" // NOLINT
 
 	"github.com/google/subcommands"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/term"
 	yaml "gopkg.in/yaml.v2"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -44,7 +45,7 @@ func openOutput(filename string, def *os.File) (*os.File, error) {
 		if def != nil {
 			return def, nil
 		}
-		filename = "/dev/null" // Sink.
+		filename = os.DevNull // Sink.
 	}
 	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
 	if err != nil {
@@ -65,7 +66,7 @@ func closeOutput(w io.Writer) {
 	}
 }
 
-// failure exits with the given failure message.
+// failure prints the given failure message and returns a failure status.
 func failure(fmtStr string, v ...any) subcommands.ExitStatus {
 	fmt.Fprintf(os.Stderr, fmtStr+"\n", v...)
 	return subcommands.ExitFailure
@@ -316,7 +317,7 @@ func loadFindings(filename string) (check.FindingSet, error) {
 	inputFindings, err := check.ExtractFindingsFrom(r, false /* json */)
 	if err != nil {
 		// Seek to reread the file.
-		if _, err := r.Seek(0, os.SEEK_SET); err != nil {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("unable to reseek in findings %q: %w", filename, err)
 		}
 		// Attempt to interpret as a json input.
@@ -513,9 +514,6 @@ func (r *Render) Execute(ctx context.Context, fs *flag.FlagSet, args ...any) sub
 	return subcommands.ExitSuccess
 }
 
-// goVersionRe matches a `go VERSION` line in go.mod, capturing VERSION.
-var goVersionRe = regexp.MustCompile(`^go\s+(\S+)`)
-
 // resolveGOVERSION sets flags.GOVERSION from flags.GOVERSIONModFile, if necessary.
 func resolveGOVERSION() error {
 	if flags.GOVERSIONModFile == "" {
@@ -531,11 +529,14 @@ func resolveGOVERSION() error {
 		return err
 	}
 
-	m := goVersionRe.FindStringSubmatch(string(b))
-	if len(m) != 2 {
-		return fmt.Errorf("go line not found in go.mod:\n%s", string(b))
+	m, err := modfile.Parse(flags.GOVERSIONModFile, b, nil)
+	if err != nil {
+		return err
 	}
-	flags.GOVERSION = m[1]
+	if m.Go == nil {
+		return fmt.Errorf("go directive not found in %s", flags.GOVERSIONModFile)
+	}
+	flags.GOVERSION = "go" + m.Go.Version
 	return nil
 }
 
@@ -549,7 +550,7 @@ func Main() {
 	subcommands.Register(subcommands.FlagsCommand(), "")
 	flag.CommandLine.Parse(os.Args[1:])
 	if err := resolveGOVERSION(); err != nil {
-		failure("error resolving GOVERSION: %v", err)
+		os.Exit(int(failure("error resolving GOVERSION: %v", err)))
 	}
 	os.Exit(int(subcommands.Execute(context.Background())))
 }

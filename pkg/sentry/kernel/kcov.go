@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	goContext "context"
 	"fmt"
 	"io"
 	"sync"
@@ -40,35 +41,50 @@ const kcovAreaSizeMax = 10 * 1024 * 1024
 //
 // To give the illusion that the data is always up to date, we update the shared
 // memory every time before we return to userspace.
+//
+// +stateify savable
 type Kcov struct {
 	// mf stores application memory. It is immutable after creation.
-	mf *pgalloc.MemoryFile
+	mf *pgalloc.MemoryFile `state:"nosave"`
 
-	// mu protects all of the fields below.
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 
 	// mode is the current kcov mode.
+	//
+	// +checklocks:mu
 	mode uint8
 
 	// size is the size of the mapping through which the kernel conveys coverage
 	// information to userspace.
+	//
+	// +checklocks:mu
 	size uint64
 
 	// owningTask is the task that currently owns coverage data on the system. The
 	// interface for kcov essentially requires that coverage is only going to a
 	// single task. Note that kcov should only generate coverage data for the
 	// owning task, but we currently generate global coverage.
+	//
+	// +checklocks:mu
 	owningTask *Task
 
 	// count is a locally cached version of the first uint64 in the kcov data,
 	// which is the number of subsequent entries representing PCs.
 	//
-	// It is used with kcovInode.countBlock(), to copy in/out the first element of
+	// It is used with Kcov.countBlock(), to copy in/out the first element of
 	// the actual data in an efficient manner, avoid boilerplate, and prevent
 	// accidental garbage escapes by the temporary counts.
+	//
+	// +checklocks:mu
 	count uint64
 
+	// +checklocks:mu
 	mappable *mm.SpecialMappable
+}
+
+// afterLoad is invoked by stateify.
+func (kcov *Kcov) afterLoad(ctx goContext.Context) {
+	kcov.mf = pgalloc.MemoryFileFromContext(ctx)
 }
 
 // NewKcov creates and returns a Kcov instance.
@@ -85,6 +101,9 @@ var coveragePool = sync.Pool{
 }
 
 // TaskWork implements TaskWorker.TaskWork.
+//
+// +checklocksexclude:kcov.mu
+// +checklocksexclude:t.taskWorkMu
 func (kcov *Kcov) TaskWork(t *Task) {
 	kcov.mu.Lock()
 	defer kcov.mu.Unlock()
@@ -120,18 +139,14 @@ func (kcov *Kcov) TaskWork(t *Task) {
 }
 
 // InitTrace performs the KCOV_INIT_TRACE ioctl.
+//
+// +checklocksexclude:kcov.mu
 func (kcov *Kcov) InitTrace(size uint64) error {
 	kcov.mu.Lock()
 	defer kcov.mu.Unlock()
 
 	if kcov.mode != linux.KCOV_MODE_DISABLED {
 		return linuxerr.EBUSY
-	}
-
-	// To simplify all the logic around mapping, we require that the length of the
-	// shared region is a multiple of the system page size.
-	if (8*size)&(hostarch.PageSize-1) != 0 {
-		return linuxerr.EINVAL
 	}
 
 	// We need space for at least two uint64s to hold current position and a
@@ -146,6 +161,8 @@ func (kcov *Kcov) InitTrace(size uint64) error {
 }
 
 // EnableTrace performs the KCOV_ENABLE_TRACE ioctl.
+//
+// +checklocksexclude:kcov.mu
 func (kcov *Kcov) EnableTrace(ctx context.Context, traceKind uint8) error {
 	t := TaskFromContext(ctx)
 	if t == nil {
@@ -185,6 +202,8 @@ func (kcov *Kcov) EnableTrace(ctx context.Context, traceKind uint8) error {
 }
 
 // DisableTrace performs the KCOV_DISABLE_TRACE ioctl.
+//
+// +checklocksexclude:kcov.mu
 func (kcov *Kcov) DisableTrace(ctx context.Context) error {
 	kcov.mu.Lock()
 	defer kcov.mu.Unlock()
@@ -209,6 +228,8 @@ func (kcov *Kcov) DisableTrace(ctx context.Context) error {
 // Clear resets the mode and clears the owning task and memory mapping for kcov.
 // It is called when the fd corresponding to kcov is closed. Note that the mode
 // needs to be set so that the next call to kcov.TaskWork() will exit early.
+//
+// +checklocksexclude:kcov.mu
 func (kcov *Kcov) Clear(ctx context.Context) {
 	kcov.mu.Lock()
 	kcov.mode = linux.KCOV_MODE_INIT
@@ -223,6 +244,8 @@ func (kcov *Kcov) Clear(ctx context.Context) {
 // OnTaskExit is called when the owning task exits. It is similar to
 // kcov.Clear(), except the memory mapping is not cleared, so that the same
 // mapping can be used in the future if kcov is enabled again by another task.
+//
+// +checklocksexclude:kcov.mu
 func (kcov *Kcov) OnTaskExit() {
 	kcov.mu.Lock()
 	kcov.mode = linux.KCOV_MODE_INIT
@@ -232,11 +255,20 @@ func (kcov *Kcov) OnTaskExit() {
 
 // ConfigureMMap is called by the vfs.FileDescription for this kcov instance to
 // implement vfs.FileDescription.ConfigureMMap.
+//
+// +checklocksexclude:kcov.mu
 func (kcov *Kcov) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
 	kcov.mu.Lock()
 	defer kcov.mu.Unlock()
 
 	if kcov.mode != linux.KCOV_MODE_INIT {
+		return linuxerr.EINVAL
+	}
+
+	// Linux accepts unaligned sizes in KCOV_INIT_TRACE, but requires mmap's
+	// page-rounded length to match the entire buffer, starting at offset zero.
+	length, ok := hostarch.PageRoundUp(opts.Length)
+	if !ok || opts.Offset != 0 || length != kcov.size*8 {
 		return linuxerr.EINVAL
 	}
 

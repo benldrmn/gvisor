@@ -65,7 +65,11 @@ func (mi *masterInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernf
 		t:     t,
 	}
 	fd.LockFD.Init(&mi.locks)
-	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Credentials(), rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Credentials(), rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{
+		DenyPRead:   true,
+		DenyPWrite:  true,
+		SpecialFile: true,
+	}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -158,25 +162,27 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 	case linux.TCGETS2:
 		return mfd.t.ld.getTermios2(t, args)
 	case linux.TCSETS,
-		linux.TCSETSW,
-		linux.TCSETSF:
+		linux.TCSETSW:
 		// N.B. TCSETS on the master actually affects the configuration
 		// of the replica end.
 		//
-		// Note that TCSETSW and TCSETSF should drain the output queue
-		// first (and flush input for F), but we don't implement that
-		// yet.
-		return mfd.t.ld.setTermios(t, args)
+		// Draining output is a no-op for PTYs.
+		return mfd.t.ld.setTermios(t, args, false /* flushInput */)
+	case linux.TCSETSF:
+		// N.B. TCSETSF on the master actually affects the configuration
+		// of the replica end and flushes the replica input queue.
+		return mfd.t.ld.setTermios(t, args, true /* flushInput */)
 	case linux.TCSETS2,
-		linux.TCSETSW2,
-		linux.TCSETSF2:
+		linux.TCSETSW2:
 		// N.B. TCSETS2 on the master actually affects the configuration
 		// of the replica end.
 		//
-		// Note that TCSETSW2 and TCSETSF2 should drain the output queue
-		// first (and flush input for F), but we don't implement that
-		// yet.
-		return mfd.t.ld.setTermios2(t, args)
+		// Draining output is a no-op for PTYs.
+		return mfd.t.ld.setTermios2(t, args, false /* flushInput */)
+	case linux.TCSETSF2:
+		// N.B. TCSETSF2 on the master actually affects the configuration
+		// of the replica end and flushes the replica input queue.
+		return mfd.t.ld.setTermios2(t, args, true /* flushInput */)
 	case linux.TCSBRK:
 		// TCSBRK with arg != 0 is tcdrain, which waits for output to
 		// drain. For a pty with no real hardware, this is a no-op.
@@ -202,7 +208,7 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 		return 0, t.ThreadGroup().SetControllingTTY(ctx, mfd.t.masterKTTY, steal, mfd.vfsfd.IsReadable())
 	case linux.TIOCNOTTY:
 		// Release this process's controlling terminal.
-		return 0, t.ThreadGroup().ReleaseControllingTTY(mfd.t.masterKTTY)
+		return 0, t.ThreadGroup().ReleaseControllingTTY(ctx, mfd.t.masterKTTY)
 	case linux.TIOCGPGRP:
 		// Get the foreground process group id.
 		pgid, err := t.ThreadGroup().ForegroundProcessGroupID(mfd.t.masterKTTY)
@@ -219,6 +225,17 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 			return 0, err
 		}
 		return 0, t.ThreadGroup().SetForegroundProcessGroupID(ctx, mfd.t.masterKTTY, kernel.ProcessGroupID(pgid))
+	case linux.TIOCGSID:
+		// Get the session id. N.B. TIOCGSID on the master returns the
+		// session of the replica end, and does not require the caller
+		// to be part of that session.
+		sid, err := t.ThreadGroup().SessionID(mfd.t.replicaKTTY, false /* requireCtty */)
+		if err != nil {
+			return 0, err
+		}
+		ret := primitive.Int32(sid)
+		_, err = ret.CopyOut(t, args[2].Pointer())
+		return 0, err
 	case linux.TIOCPKT:
 		// Enable or disable packet mode.
 		var mode primitive.Int32
@@ -305,7 +322,6 @@ func maybeEmitUnimplementedEvent(ctx context.Context, sysno uintptr, cmd uint32)
 		linux.TIOCEXCL,
 		linux.TIOCNXCL,
 		linux.TIOCGEXCL,
-		linux.TIOCGSID,
 		linux.TIOCGETD,
 		linux.TIOCVHANGUP,
 		linux.TIOCGDEV,

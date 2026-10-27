@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -59,6 +60,11 @@ type InternalData struct {
 	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
 	// accelerators.
 	EnableTPUProxyPaths bool
+	// RDMASysfs, when non-nil, is the host sysfs snapshot from which the
+	// RDMA device topology (/sys/devices/pci..., /sys/class/infiniband*,
+	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices,
+	// /sys/devices/system/node) is constructed.
+	RDMASysfs *rdma.Snapshot
 	// TestSysfsPathPrefix is a prefix for the sysfs paths. It is useful for
 	// unit testing.
 	TestSysfsPathPrefix string
@@ -73,7 +79,10 @@ type filesystem struct {
 	devMinor            uint32
 	enableTPUProxyPaths bool
 	testSysfsPathPrefix string
-	root                *dir
+	// productName is the value of devices/virtual/dmi/id/product_name. If
+	// empty, the DMI directories are not created.
+	productName string
+	root        *dir
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -120,21 +129,21 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fsDirChildren["cgroup"] = fs.newCgroupDir(ctx, creds, defaultSysDirMode, nil)
 	}
 
-	classSub := map[string]kernfs.Inode{
+	classSub := map[string]kernfs.Inode{ // /sys/class
 		"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	}
-	devicesSub := map[string]kernfs.Inode{
-		"system": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"cpu": cpuDir(ctx, fs, creds),
-		}),
+	devicesSub := map[string]kernfs.Inode{} // /sys/devices
+	systemSub := map[string]kernfs.Inode{   // /sys/devices/system
+		"cpu": cpuDir(ctx, fs, creds),
 	}
 
-	productName := ""
-	busSub := make(map[string]kernfs.Inode)
-	kernelSub := kernelDir(ctx, fs, creds)
+	busSub := make(map[string]kernfs.Inode)     // /sys/bus
+	pciDevices := make(map[string]kernfs.Inode) // /sys/bus/pci/devices
+	pciDrivers := make(map[string]kernfs.Inode) // /sys/bus/pci/drivers
+	kernelSub := kernelDir(ctx, fs, creds)      // /sys/kernel
 	if opts.InternalData != nil {
 		idata := opts.InternalData.(*InternalData)
-		productName = idata.ProductName
+		fs.productName = idata.ProductName
 		if idata.EnableTPUProxyPaths {
 			fs.enableTPUProxyPaths = true
 			fs.testSysfsPathPrefix = idata.TestSysfsPathPrefix
@@ -166,9 +175,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			if err != nil {
 				return nil, nil, err
 			}
-			busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"devices": fs.newDir(ctx, creds, defaultSysDirMode, pciDevicesSub),
-			})
+			for name, sub := range pciDevicesSub {
+				pciDevices[name] = sub
+			}
 
 			iommuGroups, err := fs.mirrorIOMMUGroups(ctx, creds, iommuGroupsPath, pciInfos)
 			if err != nil {
@@ -176,21 +185,49 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			kernelSub["iommu_groups"] = fs.newDir(ctx, creds, defaultSysDirMode, iommuGroups)
 		}
+		if idata.RDMASysfs != nil {
+			rdmaDirs, err := fs.newRDMASysfs(ctx, creds, idata.RDMASysfs)
+			if err != nil {
+				return nil, nil, err
+			}
+			for name, sub := range rdmaDirs.devices {
+				// The TPU-proxy devices and the RDMA ConnectX devices come from
+				// two different accelerator stacks and aren't exposed to the
+				// same sandbox today, so a shared /sys/devices root complex
+				// shouldn't occur. Deep-merging two sealed kernfs subtrees
+				// isn't supported, so reject an overlap.
+				if _, ok := devicesSub[name]; ok {
+					return nil, nil, fmt.Errorf("TPU proxy and RDMA sysfs both populate /sys/devices/%s", name)
+				}
+				devicesSub[name] = sub
+			}
+			for name, sub := range rdmaDirs.class {
+				classSub[name] = sub
+			}
+			for name, sub := range rdmaDirs.busPCIDevices {
+				pciDevices[name] = sub
+			}
+			for name, sub := range rdmaDirs.busPCIDrivers {
+				pciDrivers[name] = sub
+			}
+			if rdmaDirs.node != nil {
+				systemSub["node"] = rdmaDirs.node
+			}
+		}
 	}
+	if len(pciDevices) > 0 || len(pciDrivers) > 0 {
+		pciSub := map[string]kernfs.Inode{}
+		if len(pciDevices) > 0 {
+			pciSub["devices"] = fs.newDir(ctx, creds, defaultSysDirMode, pciDevices)
+		}
+		if len(pciDrivers) > 0 {
+			pciSub["drivers"] = fs.newDir(ctx, creds, defaultSysDirMode, pciDrivers)
+		}
+		busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, pciSub)
+	}
+	devicesSub["system"] = fs.newDir(ctx, creds, defaultSysDirMode, systemSub)
 
-	if len(productName) > 0 {
-		log.Debugf("Setting product_name: %q", productName)
-		classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
-		})
-		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-					"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
-				}),
-			}),
-		})
-	}
+	fs.addDMIDirs(ctx, creds, classSub, devicesSub)
 	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"bus":   fs.newDir(ctx, creds, defaultSysDirMode, busSub),
@@ -210,6 +247,25 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	var rootD kernfs.Dentry
 	rootD.InitRoot(&fs.Filesystem, root)
 	return fs.VFSFilesystem(), rootD.VFSDentry(), nil
+}
+
+// addDMIDirs adds the DMI entries to classSub (/sys/class) and devicesSub
+// (/sys/devices) if fs.productName is set.
+func (fs *filesystem) addDMIDirs(ctx context.Context, creds *auth.Credentials, classSub, devicesSub map[string]kernfs.Inode) {
+	if len(fs.productName) == 0 {
+		return
+	}
+	log.Debugf("Setting product_name: %q", fs.productName)
+	classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
+	})
+	devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, fs.productName+"\n"),
+			}),
+		}),
+	})
 }
 
 func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
@@ -333,7 +389,12 @@ func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credent
 			subs[dent] = fs.newHostFile(ctx, creds, defaultSysMode, absPath)
 		case unix.S_IFLNK:
 			if pciDeviceRegex.MatchString(dent) {
-				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", pciInfos[dent].path))
+				info, ok := pciInfos[dent]
+				if !ok {
+					log.Infof("Skipping IOMMU group link %q: not a known PCI device", absPath)
+					continue
+				}
+				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", info.path))
 			}
 		}
 	}
@@ -493,4 +554,22 @@ func (fs *filesystem) newHostFile(ctx context.Context, creds *auth.Credentials, 
 	hf := &hostFile{hostPath: hostPath}
 	hf.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), hf, mode)
 	return hf
+}
+
+// errorFile is an inode whose reads fail with a fixed errno.
+//
+// +stateify savable
+type errorFile struct {
+	kernfs.DynamicBytesFile
+	errno int32
+}
+
+func (ef *errorFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	return unix.Errno(ef.errno)
+}
+
+func (fs *filesystem) newErrorFile(ctx context.Context, creds *auth.Credentials, mode linux.FileMode, errno int32) kernfs.Inode {
+	ef := &errorFile{errno: errno}
+	ef.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), ef, mode)
+	return ef
 }

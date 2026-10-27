@@ -15,14 +15,236 @@
 package runsc
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/containerd/console"
+	apievents "github.com/containerd/containerd/api/events"
 	task "github.com/containerd/containerd/api/runtime/task/v2"
+	coreevents "github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/shim/v1/proc"
+	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+// errorPublisher is a publisher that always returns an error. It records the
+// contexts it is called with and whether it was closed.
+type errorPublisher struct {
+	ctxs   []context.Context
+	closed bool
+}
+
+func (p *errorPublisher) Publish(ctx context.Context, _ string, _ coreevents.Event) error {
+	p.ctxs = append(p.ctxs, ctx)
+	return fmt.Errorf("dial unix: missing address")
+}
+
+func (p *errorPublisher) Close() error {
+	p.closed = true
+	return nil
+}
+
+// TestForwardDoesNotPanicOnPublishError verifies that the event forward loop
+// logs publish errors instead of panicking, whether or not an event sink is
+// configured (TTRPC_ADDRESS is empty under CRI-O). The publisher queues failed
+// events for retry, and with shim grouping a panic would take down every
+// container in the pod. It also verifies that events are published with a live
+// context that keeps the namespace, even once the shim context is done, and
+// that the publisher is closed once all events are drained.
+func TestForwardDoesNotPanicOnPublishError(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ttrpcAddress string
+	}{
+		{name: "no-event-sink", ttrpcAddress: ""},
+		{name: "containerd", ttrpcAddress: "/run/containerd/containerd.sock.ttrpc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TTRPC_ADDRESS", tc.ttrpcAddress)
+
+			s := &runscService{
+				events: make(chan any, 2),
+			}
+			s.events <- &apievents.TaskCreate{ContainerID: "test"}
+			s.events <- &apievents.TaskExit{ContainerID: "test"}
+			close(s.events)
+
+			// The shim context is done once shutdown completes.
+			ctx, cancel := context.WithCancel(namespaces.WithNamespace(context.Background(), "k8s.io"))
+			cancel()
+
+			pub := &errorPublisher{}
+			panicked := make(chan any, 1)
+			go func() {
+				defer func() { panicked <- recover() }()
+				s.forward(ctx, pub)
+			}()
+
+			select {
+			case r := <-panicked:
+				if r != nil {
+					t.Fatalf("forward panicked on publish error: %v", r)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("forward did not complete within timeout")
+			}
+			if got, want := len(pub.ctxs), 2; got != want {
+				t.Errorf("forward published %d events, want %d", got, want)
+			}
+			for _, pctx := range pub.ctxs {
+				if err := pctx.Err(); err != nil {
+					t.Errorf("event published with a done context: %v", err)
+				}
+				if ns, _ := namespaces.Namespace(pctx); ns != "k8s.io" {
+					t.Errorf("event published in namespace %q, want %q", ns, "k8s.io")
+				}
+			}
+			if !pub.closed {
+				t.Error("forward did not close the publisher")
+			}
+		})
+	}
+}
+
+// fakeOOMPoller reports a fixed OOM verdict per container id.
+type fakeOOMPoller struct {
+	status map[string]oomStatus
+}
+
+func (f *fakeOOMPoller) add(string, any) error { return nil }
+func (f *fakeOOMPoller) run(context.Context)   {}
+func (f *fakeOOMPoller) isOOM(id string) oomStatus {
+	return f.status[id]
+}
+func (f *fakeOOMPoller) Close() error { return nil }
+
+// nopPlatform is a no-op console platform for proc.Init.
+type nopPlatform struct{}
+
+func (nopPlatform) CopyConsole(_ context.Context, cons console.Console, _, _, _, _ string, _ *sync.WaitGroup) (console.Console, error) {
+	return cons, nil
+}
+func (nopPlatform) ShutdownConsole(context.Context, console.Console) error { return nil }
+func (nopPlatform) Close() error                                           { return nil }
+
+// TestCheckProcessesOOMExitStatus verifies the exit status published on init
+// process exit when the container was OOM-killed. When the memcg kill lands on
+// the sentry, `runsc wait` cannot recover the real signal status and reports
+// the synthetic proc.InternalErrorCode; since the cgroup confirms an OOM kill,
+// the shim must publish 128+SIGKILL (137) instead so tooling keyed on the
+// standard OOM exit code works. A real exit status must never be overridden.
+func TestCheckProcessesOOMExitStatus(t *testing.T) {
+	const sigkillStatus = 137 // 128 + SIGKILL
+	for _, tc := range []struct {
+		name        string
+		oom         oomStatus
+		exitStatus  int
+		wantStatus  int
+		wantTaskOOM bool
+	}{
+		{
+			// Sentry OOM-killed: wait failed (128) and cgroup confirms OOM.
+			name:        "oom-internal-error-becomes-137",
+			oom:         oomKilledUnpublished,
+			exitStatus:  proc.InternalErrorCode,
+			wantStatus:  sigkillStatus,
+			wantTaskOOM: true,
+		},
+		{
+			// The async watcher already published TaskOOM before the exit was
+			// processed: no duplicate event, but the exit status must still
+			// become 137 -- the kill happened whoever announced it.
+			name:        "oom-async-already-published-still-137",
+			oom:         oomKilledPublished,
+			exitStatus:  proc.InternalErrorCode,
+			wantStatus:  sigkillStatus,
+			wantTaskOOM: false,
+		},
+		{
+			// OOM confirmed but runsc reported a real status: keep it.
+			name:        "oom-real-status-preserved",
+			oom:         oomKilledUnpublished,
+			exitStatus:  2,
+			wantStatus:  2,
+			wantTaskOOM: true,
+		},
+		{
+			// Wait failure without OOM: generic status stays 128.
+			name:        "no-oom-internal-error-preserved",
+			oom:         oomNotKilled,
+			exitStatus:  proc.InternalErrorCode,
+			wantStatus:  proc.InternalErrorCode,
+			wantTaskOOM: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const cid = "test-container"
+			init := proc.New(cid, &runsccmd.Runsc{Command: "/nonexistent/runsc"}, stdio.Stdio{})
+			init.Platform = nopPlatform{}
+			c := &Container{
+				ID:   cid,
+				task: init,
+			}
+			s := &runscService{
+				events:     make(chan any, 4),
+				containers: map[string]*Container{cid: c},
+				oomPoller: &fakeOOMPoller{
+					status: map[string]oomStatus{cid: tc.oom},
+				},
+			}
+
+			s.checkProcesses(context.Background(), proc.Exit{
+				Timestamp: time.Now(),
+				ID:        cid,
+				Status:    tc.exitStatus,
+			})
+
+			if got := init.ExitStatus(); got != tc.wantStatus {
+				t.Errorf("init.ExitStatus() = %d, want %d", got, tc.wantStatus)
+			}
+
+			var got []any
+			for len(s.events) > 0 {
+				got = append(got, <-s.events)
+			}
+			want := 1
+			if tc.wantTaskOOM {
+				want = 2
+			}
+			if len(got) != want {
+				t.Fatalf("got %d events (%v), want %d", len(got), got, want)
+			}
+			idx := 0
+			if tc.wantTaskOOM {
+				oomEv, ok := got[idx].(*apievents.TaskOOM)
+				if !ok {
+					t.Fatalf("event %d = %T, want *TaskOOM (must precede TaskExit)", idx, got[idx])
+				}
+				if oomEv.ContainerID != cid {
+					t.Errorf("TaskOOM.ContainerID = %q, want %q", oomEv.ContainerID, cid)
+				}
+				idx++
+			}
+			exitEv, ok := got[idx].(*apievents.TaskExit)
+			if !ok {
+				t.Fatalf("event %d = %T, want *TaskExit", idx, got[idx])
+			}
+			if exitEv.ExitStatus != uint32(tc.wantStatus) {
+				t.Errorf("TaskExit.ExitStatus = %d, want %d", exitEv.ExitStatus, tc.wantStatus)
+			}
+		})
+	}
+}
 
 func TestContainerUpdateNilResources(t *testing.T) {
 	c := &Container{}
@@ -128,5 +350,89 @@ func TestCgroupNoUpdate(t *testing.T) {
 				t.Errorf("setPodCgroup(%+v), got: %v, want: false", tc.spec.Linux, updated)
 			}
 		})
+	}
+}
+
+// TestHasPodCgroupParent covers the gate on the exit-time OOM fallback. The
+// parent cgroup may stand in for the sandbox's own only when the sandbox sits
+// in a scope under the pod slice, which happens under Kubernetes with the
+// systemd cgroup driver and nowhere else.
+func TestHasPodCgroupParent(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		cgroupsPath string
+		cgPath      string
+		noLinux     bool
+		want        bool
+	}{
+		{
+			name:        "k8s-systemd-containerd",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			cgroupsPath: "kubepods-burstable-pod4a846df6_57ff_4ead_b37f_51b0d766508e.slice:cri-containerd:6bb325afe8a0",
+			cgPath:      "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod4a846df6_57ff_4ead_b37f_51b0d766508e.slice/cri-containerd-6bb325afe8a0.scope",
+			want:        true,
+		},
+		{
+			name:        "k8s-systemd-crio",
+			annotations: map[string]string{specutils.CRIOContainerTypeAnnotation: specutils.CRIOContainerTypeSandbox},
+			cgroupsPath: "kubepods-besteffort-pod4a846df6.slice:crio:6bb325afe8a0",
+			cgPath:      "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod4a846df6.slice/crio-6bb325afe8a0.scope",
+			want:        true,
+		},
+		{
+			// The spec asks for the pod slice but the sandbox landed
+			// elsewhere, so the parent is not the pod cgroup.
+			name:        "k8s-systemd-parent-mismatch",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			cgroupsPath: "kubepods-burstable-pod4a846df6.slice:cri-containerd:6bb325afe8a0",
+			cgPath:      "/system.slice/cri-containerd-6bb325afe8a0.scope",
+		},
+		{
+			// The sandbox joins the pod cgroup instead of nesting under it,
+			// so the parent is the QoS slice shared by every burstable pod.
+			name:        "k8s-cgroupfs",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			cgroupsPath: "/kubepods/burstable/pod4a846df6/6bb325afe8a0",
+			cgPath:      "/kubepods/burstable/pod4a846df6",
+		},
+		{
+			// The parent is /system.slice, shared with sshd and containerd.
+			name:        "docker-systemd",
+			cgroupsPath: "system.slice:docker:6bb325afe8a0",
+			cgPath:      "/system.slice/docker-6bb325afe8a0.scope",
+		},
+		{
+			name:        "docker-cgroupfs",
+			cgroupsPath: "/docker/6bb325afe8a0",
+			cgPath:      "/docker/6bb325afe8a0",
+		},
+		{
+			name:        "no-linux-section",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			noLinux:     true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := t.TempDir()
+			spec := &specs.Spec{Annotations: tc.annotations}
+			if !tc.noLinux {
+				spec.Linux = &specs.Linux{CgroupsPath: tc.cgroupsPath}
+			}
+			if err := utils.WriteSpec(bundle, spec); err != nil {
+				t.Fatalf("WriteSpec: %v", err)
+			}
+			if got := hasPodCgroupParent(bundle, tc.cgPath); got != tc.want {
+				t.Errorf("hasPodCgroupParent(%q) = %v, want %v", tc.cgPath, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHasPodCgroupParentNoSpec verifies that an unreadable bundle leaves the
+// fallback disabled rather than arming it on a guess.
+func TestHasPodCgroupParentNoSpec(t *testing.T) {
+	if hasPodCgroupParent(filepath.Join(t.TempDir(), "missing"), "/kubepods.slice/pod.slice/c.scope") {
+		t.Error("hasPodCgroupParent() = true for a bundle with no spec")
 	}
 }

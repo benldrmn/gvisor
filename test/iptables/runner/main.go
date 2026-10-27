@@ -28,10 +28,12 @@ import (
 var (
 	name = flag.String("name", "", "name of the test to run")
 	ipv6 = flag.Bool("ipv6", false, "whether the test utilizes ip6tables")
+	nft  = flag.Bool("nft", false, "whether to use iptables-nft")
 )
 
 func main() {
 	flag.Parse()
+	iptables.NFT = *nft
 
 	// Find out which test we're running.
 	test, ok := iptables.Tests[*name]
@@ -53,8 +55,7 @@ func main() {
 		log.Fatalf("Failed running test %q: %v", *name, err)
 	}
 
-	// Emit the final line.
-	log.Printf("%s", iptables.TerminalStatement)
+	log.Print("Finished!")
 }
 
 // getIP listens for a connection from the local process and returns the source

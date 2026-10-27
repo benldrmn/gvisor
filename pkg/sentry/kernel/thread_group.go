@@ -34,6 +34,10 @@ import (
 //
 // ThreadGroup is a superset of Linux's struct signal_struct.
 //
+// A nonnil leader always belongs to this thread group.
+//
+// +checklocksalias:leader.tg.signalHandlers.mu=signalHandlers.mu
+// +checklocksalias:leader.tg.pidns.owner.mu=pidns.owner.mu
 // +stateify savable
 type ThreadGroup struct {
 	threadGroupNode
@@ -78,12 +82,12 @@ type ThreadGroup struct {
 	//
 	// groupStopDequeued is analogous to Linux's JOBCTL_STOP_DEQUEUED.
 	//
-	// groupStopDequeued is protected by the signal mutex.
+	// +checklocks:signalHandlers.mu
 	groupStopDequeued bool
 
 	// groupStopSignal is the signal that caused a group stop to be initiated.
 	//
-	// groupStopSignal is protected by the signal mutex.
+	// +checklocks:signalHandlers.mu
 	groupStopSignal linux.Signal
 
 	// groupStopPendingCount is the number of active tasks in the thread group
@@ -92,7 +96,7 @@ type ThreadGroup struct {
 	// groupStopPendingCount is analogous to Linux's
 	// signal_struct::group_stop_count.
 	//
-	// groupStopPendingCount is protected by the signal mutex.
+	// +checklocks:signalHandlers.mu
 	groupStopPendingCount int
 
 	// If groupStopComplete is true, groupStopPendingCount transitioned from
@@ -100,7 +104,7 @@ type ThreadGroup struct {
 	//
 	// groupStopComplete is analogous to Linux's SIGNAL_STOP_STOPPED.
 	//
-	// groupStopComplete is protected by the signal mutex.
+	// +checklocks:signalHandlers.mu
 	groupStopComplete bool
 
 	// If groupStopWaitable is true, the thread group is indicating a waitable
@@ -109,7 +113,7 @@ type ThreadGroup struct {
 	// Linux represents the analogous state as SIGNAL_STOP_STOPPED being set
 	// and group_exit_code being non-zero.
 	//
-	// groupStopWaitable is protected by the signal mutex.
+	// +checklocks:signalHandlers.mu
 	groupStopWaitable bool
 
 	// If groupContNotify is true, then a SIGCONT has recently ended a group
@@ -128,9 +132,10 @@ type ThreadGroup struct {
 	//
 	//	- !groupContNotify is represented by neither flag being set.
 	//
-	// groupContNotify and groupContInterrupted are protected by the signal
-	// mutex.
-	groupContNotify      bool
+	// +checklocks:signalHandlers.mu
+	groupContNotify bool
+
+	// +checklocks:signalHandlers.mu
 	groupContInterrupted bool
 
 	// If groupContWaitable is true, the thread group is indicating a waitable
@@ -138,8 +143,17 @@ type ThreadGroup struct {
 	//
 	// groupContWaitable is analogous to Linux's SIGNAL_STOP_CONTINUED.
 	//
-	// groupContWaitable is protected by the signal mutex.
+	// +checklocks:signalHandlers.mu
 	groupContWaitable bool
+
+	// signalUnkillable is true if the thread group is the init process of its
+	// PID namespace and, under SignalUnkillableLinux, ignores signals it does
+	// not handle; see Task.isUnkillableInit. signalUnkillable is analogous to
+	// Linux's SIGNAL_UNKILLABLE.
+	//
+	// signalUnkillable is written with the signal mutex locked and is read
+	// atomically without it.
+	signalUnkillable atomicbitops.Bool
 
 	// exiting is true if all tasks in the ThreadGroup should exit. exiting is
 	// analogous to Linux's SIGNAL_GROUP_EXIT.
@@ -157,7 +171,7 @@ type ThreadGroup struct {
 	// terminationSignal is the signal that this thread group's leader will
 	// send to its parent when it exits.
 	//
-	// terminationSignal is protected by the TaskSet mutex.
+	// +checklocks:pidns.owner.mu
 	terminationSignal linux.Signal
 
 	// liveGoroutines is the number of non-exited task goroutines in the thread
@@ -279,6 +293,14 @@ type ThreadGroup struct {
 	isChildSubreaper  bool
 	hasChildSubreaper bool
 
+	// containerInit is true if Kernel.CreateProcess created this thread group
+	// as a container's init process, not for an exec. It has no equivalent in
+	// Linux. runsc uses it to find a container's init process after restore:
+	// without a global init, an orphan has no parent either.
+	//
+	// containerInit is immutable.
+	containerInit bool
+
 	// These help serialize execve(2) with PTRACE_ATTACH and seccomp thread-sync. Since checkpointing
 	// precludes holding onto a sync.Mutex across taskRunStates, and execve(2) spans multiple
 	// taskRunStates, we implement locking by way of the ptraceExecveMutexStop internal stop.
@@ -303,6 +325,8 @@ type ThreadGroup struct {
 // thread group leader will send its parent terminationSignal when it exits.
 // The new thread group isn't visible to the system until a task has been
 // created inside of it by a successful call to TaskSet.NewTask.
+//
+// Preconditions: pidns must be non-nil and belong to k.
 func (k *Kernel) NewThreadGroup(pidns *PIDNamespace, sh *SignalHandlers, terminationSignal linux.Signal, limits *limits.LimitSet) *ThreadGroup {
 	pidns.IncRef()
 	tg := &ThreadGroup{
@@ -351,6 +375,9 @@ func (tg *ThreadGroup) Limits() *limits.LimitSet {
 }
 
 // Release releases the thread group's resources.
+//
+// +checklocksexclude:tg.pidns.owner.mu
+// +checklocksexclude:tg.signalHandlers.mu
 func (tg *ThreadGroup) Release(ctx context.Context) {
 	// Timers must be destroyed without holding the TaskSet or signal mutexes
 	// since timers send signals with Timer.mu locked.
@@ -381,6 +408,7 @@ func (tg *ThreadGroup) Release(ctx context.Context) {
 		}
 		tg.signalHandlers.mu.Unlock()
 		tty.mu.Unlock()
+		tty.DecRef(ctx)
 	}
 	for _, it := range its {
 		it.DestroyTimer()
@@ -422,15 +450,43 @@ func (tg *ThreadGroup) walkDescendantThreadGroupsLocked(visitor func(*ThreadGrou
 }
 
 // TTY returns the thread group's controlling terminal. If nil, there is no
-// controlling terminal.
+// controlling terminal. No reference is taken; the returned TTY is only safe
+// to use while the caller can otherwise guarantee it stays alive. Callers that
+// open the TTY must use GetTTY instead.
 func (tg *ThreadGroup) TTY() *TTY {
 	sh := tg.signalLock()
 	defer sh.mu.Unlock()
 	return tg.tty
 }
 
+// GetTTY returns the thread group's controlling terminal with a
+// reference taken on it, or nil if there is no controlling terminal. The
+// caller must DecRef the returned TTY when done with it.
+func (tg *ThreadGroup) GetTTY() *TTY {
+	sh := tg.signalLock()
+	defer sh.mu.Unlock()
+	if tg.tty == nil {
+		return nil
+	}
+	tg.tty.IncRef()
+	return tg.tty
+}
+
 // SetControllingTTY sets tty as the controlling terminal of tg.
+//
+// +checklocksexclude:tty.mu
+// +checklocksexclude:tg.pidns.owner.mu
+// +checklocksexclude:tg.signalHandlers.mu
 func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bool, isReadable bool) error {
+	var toDecRef []*TTY
+	defer func() {
+		for _, t := range toDecRef {
+			if t != nil {
+				t.DecRef(ctx)
+			}
+		}
+	}()
+
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
@@ -474,6 +530,9 @@ func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bo
 			//		group.
 			if othertg.processGroup.session == tty.tg.processGroup.session {
 				othertg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
+				if othertg.tty != nil {
+					toDecRef = append(toDecRef, othertg.tty)
+				}
 				othertg.tty = nil
 				othertg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 			}
@@ -485,6 +544,10 @@ func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bo
 	}
 
 	// Set the controlling terminal and foreground process group.
+	if tg.tty != nil {
+		toDecRef = append(toDecRef, tg.tty)
+	}
+	tty.IncRef()
 	tg.tty = tty
 	tg.processGroup.session.foreground = tg.processGroup
 	// Set this as the controlling process of the terminal.
@@ -494,7 +557,20 @@ func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bo
 }
 
 // ReleaseControllingTTY gives up tty as the controlling tty of tg.
-func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
+//
+// +checklocksexclude:tty.mu
+// +checklocksexclude:tg.pidns.owner.mu
+// +checklocksexclude:tg.signalHandlers.mu
+func (tg *ThreadGroup) ReleaseControllingTTY(ctx context.Context, tty *TTY) error {
+	var toDecRef []*TTY
+	defer func() {
+		for _, t := range toDecRef {
+			if t != nil {
+				t.DecRef(ctx)
+			}
+		}
+	}()
+
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
@@ -520,6 +596,9 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 
 	// If we're not the session leader, we don't have to do much.
 	if tty.tg != tg {
+		if tg.tty != nil {
+			toDecRef = append(toDecRef, tg.tty)
+		}
 		tg.tty = nil
 		tg.signalHandlers.mu.Unlock()
 		return nil
@@ -528,11 +607,16 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 	tg.signalHandlers.mu.Unlock()
 
 	// We're the session leader. SIGHUP and SIGCONT the foreground process
-	// group and remove all controlling terminals in the session.
+	// group and remove all controlling terminals in the session. The
+	// terminal itself also loses its session.
+	tty.tg = nil
 	var lastErr error
 	for othertg := range tg.pidns.owner.Root.tgids {
 		if othertg.processGroup.session == tg.processGroup.session {
 			othertg.signalHandlers.mu.Lock()
+			if othertg.tty != nil {
+				toDecRef = append(toDecRef, othertg.tty)
+			}
 			othertg.tty = nil
 			if othertg.processGroup == tg.processGroup.session.foreground {
 				if err := othertg.leader.sendSignalLocked(&linux.SignalInfo{Signo: int32(linux.SIGHUP)}, true /* group */); err != nil {
@@ -551,6 +635,10 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 
 // ForegroundProcessGroup returns the foreground process group of the thread
 // group.
+//
+// +checklocksexclude:tty.mu
+// +checklocksexclude:tg.pidns.owner.mu
+// +checklocksexclude:tg.signalHandlers.mu
 func (tg *ThreadGroup) ForegroundProcessGroup(tty *TTY) (*ProcessGroup, error) {
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
@@ -571,6 +659,10 @@ func (tg *ThreadGroup) ForegroundProcessGroup(tty *TTY) (*ProcessGroup, error) {
 
 // ForegroundProcessGroupID returns the foreground process group ID of the
 // thread group.
+//
+// +checklocksexclude:tty.mu
+// +checklocksexclude:tg.pidns.owner.mu
+// +checklocksexclude:tg.signalHandlers.mu
 func (tg *ThreadGroup) ForegroundProcessGroupID(tty *TTY) (ProcessGroupID, error) {
 	pg, err := tg.ForegroundProcessGroup(tty)
 	if err != nil {
@@ -579,8 +671,39 @@ func (tg *ThreadGroup) ForegroundProcessGroupID(tty *TTY) (ProcessGroupID, error
 	return pg.id, nil
 }
 
+// SessionID returns the ID of the session that tty is associated with, as seen
+// from tg's PID namespace. It corresponds to Linux's
+// drivers/tty/tty_jobctrl.c:tiocgsid().
+//
+// requireCtty indicates whether tty must be the controlling terminal of tg.
+func (tg *ThreadGroup) SessionID(tty *TTY, requireCtty bool) (SessionID, error) {
+	tty.mu.Lock()
+	defer tty.mu.Unlock()
+
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	tg.signalHandlers.mu.Lock()
+	defer tg.signalHandlers.mu.Unlock()
+
+	if requireCtty && tg.tty != tty {
+		return 0, linuxerr.ENOTTY
+	}
+
+	// The tty must have a session.
+	if tty.tg == nil {
+		return 0, linuxerr.ENOTTY
+	}
+
+	// If the session isn't visible from tg's PID namespace, fallback to 0.
+	return tg.pidns.sids[tty.tg.processGroup.session], nil
+}
+
 // SetForegroundProcessGroupID sets the foreground process group of tty to
 // pgid. It corresponds to Linux's drivers/tty/tty_io.c:tiocspgrp().
+//
+// +checklocksexclude:tty.mu
+// +checklocksexclude:tg.pidns.owner.mu
+// +checklocksexclude:tg.signalHandlers.mu
 func (tg *ThreadGroup) SetForegroundProcessGroupID(ctx context.Context, tty *TTY, pgid ProcessGroupID) error {
 	// First check that the change is allowed.
 	if err := tty.CheckChange(ctx, linux.SIGTTOU); err != nil {
@@ -661,6 +784,12 @@ func (tg *ThreadGroup) IsChildSubreaper() bool {
 	return tg.isChildSubreaper
 }
 
+// IsContainerInit returns whether this ThreadGroup was created as a
+// container's init process.
+func (tg *ThreadGroup) IsContainerInit() bool {
+	return tg.containerInit
+}
+
 // IsInitIn returns whether this ThreadGroup has TID 1 int the given
 // PIDNamespace.
 func (tg *ThreadGroup) IsInitIn(pidns *PIDNamespace) bool {
@@ -702,7 +831,9 @@ func (tg *ThreadGroup) SigsegvUnlock() {
 		for t := tg.tasks.Front(); t != nil; t = t.Next() {
 			if _, ok := t.stop.(*sigsegvLockStop); ok {
 				t.Infof("Resuming execution due to SigsegvUnlock")
-				t.endInternalStopLocked()
+				// signalLock holds tg's current signal mutex, and t is
+				// in tg; checklocks cannot infer either owner identity.
+				t.endInternalStopLocked() // +checklocksignore
 			}
 		}
 	} else if count < 0 {

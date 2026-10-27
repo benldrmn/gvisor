@@ -61,13 +61,6 @@ declare_rwmutex(
     prefix = "keyset",
 )
 
-declare_mutex(
-    name = "keyset_transaction_mutex",
-    out = "keyset_transaction_mutex.go",
-    package = "auth",
-    prefix = "keysetTransaction",
-)
-
 go_library(
     name = "auth",
     srcs = [
@@ -83,7 +76,6 @@ go_library(
         "id_map_set.go",
         "key.go",
         "keyset_mutex.go",
-        "keyset_transaction_mutex.go",
         "user_namespace.go",
         "user_namespace_mutex.go",
     ],
@@ -94,14 +86,13 @@ go_library(
     ],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/atomicbitops",
         "//pkg/bits",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/log",
         "//pkg/rand",
         "//pkg/refs",
-        "//pkg/sentry/seccheck",
-        "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sync",
         "//pkg/sync/locking",
     ],
@@ -110,7 +101,7 @@ go_library(
 go_test(
     name = "auth_test",
     srcs = ["capability_set_test.go"],
-    library = ":auth",
+    embed = [":auth"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/errors/linuxerr",

@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -47,12 +47,17 @@ func (*ReadControl) Usage() string {
 	return `read-control <container-id> <controller> <cgroup-path> <control-value-name>
 
 Where "<container-id>" is the name for the instance of the container,
-"<controller>" is the name of an active cgroupv1 controller, <cgroup-path> is
-the path to the cgroup to read and <control-value-name> is the name of the
-control file to read.
+"<controller>" is the name of an active cgroup controller (used for cgroup v1
+hierarchies; ignored for cgroup v2 unified hierarchy), <cgroup-path> is the path
+to the cgroup to read and <control-value-name> is the name of the control file
+to read.
 
 EXAMPLE:
+       # cgroup v1:
        # runsc read-control <container-id> cpuacct / cpuacct.usage
+       # cgroup v2:
+       # runsc read-control <container-id> memory / memory.current
+       # runsc read-control <container-id> cpu / cpu.stat
 `
 }
 
@@ -61,7 +66,7 @@ func (r *ReadControl) SetFlags(f *flag.FlagSet) {}
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (r *ReadControl) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -76,12 +81,12 @@ func (r *ReadControl) Execute(_ context.Context, f *flag.FlagSet, args ...any) s
 	}
 
 	conf := args[0].(*config.Config)
-	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
 
-	out, err := c.Sandbox.CgroupsReadControlFile(control.CgroupControlFile{
+	out, err := c.Sandbox.CgroupsReadControlFile(controlapi.CgroupControlFile{
 		Controller: f.Arg(1),
 		Path:       f.Arg(2),
 		Name:       f.Arg(3),

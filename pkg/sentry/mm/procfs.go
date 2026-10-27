@@ -29,28 +29,32 @@ const (
 	// include/linux/kdev_t.h:MINORBITS
 	devMinorBits = 20
 
-	vsyscallEnd        = hostarch.Addr(0xffffffffff601000)
-	vsyscallMapsEntry  = "ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]\n"
-	vsyscallSmapsEntry = vsyscallMapsEntry +
-		"Size:                  4 kB\n" +
-		"Rss:                   0 kB\n" +
-		"Pss:                   0 kB\n" +
-		"Shared_Clean:          0 kB\n" +
-		"Shared_Dirty:          0 kB\n" +
-		"Private_Clean:         0 kB\n" +
-		"Private_Dirty:         0 kB\n" +
-		"Referenced:            0 kB\n" +
-		"Anonymous:             0 kB\n" +
-		"AnonHugePages:         0 kB\n" +
-		"Shared_Hugetlb:        0 kB\n" +
-		"Private_Hugetlb:       0 kB\n" +
-		"Swap:                  0 kB\n" +
-		"SwapPss:               0 kB\n" +
-		"KernelPageSize:        4 kB\n" +
-		"MMUPageSize:           4 kB\n" +
-		"Locked:                0 kB\n" +
-		"VmFlags: rd ex \n"
+	vsyscallEnd       = hostarch.Addr(0xffffffffff601000)
+	vsyscallMapsEntry = "ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]\n"
 )
+
+// vsyscallSmapsEntry is the /proc/[pid]/smaps entry for the vsyscall region.
+// KernelPageSize and MMUPageSize match those of real vmas; see
+// vmaSmapsEntryIntoLocked.
+var vsyscallSmapsEntry = vsyscallMapsEntry +
+	"Size:                  4 kB\n" +
+	"Rss:                   0 kB\n" +
+	"Pss:                   0 kB\n" +
+	"Shared_Clean:          0 kB\n" +
+	"Shared_Dirty:          0 kB\n" +
+	"Private_Clean:         0 kB\n" +
+	"Private_Dirty:         0 kB\n" +
+	"Referenced:            0 kB\n" +
+	"Anonymous:             0 kB\n" +
+	"AnonHugePages:         0 kB\n" +
+	"Shared_Hugetlb:        0 kB\n" +
+	"Private_Hugetlb:       0 kB\n" +
+	"Swap:                  0 kB\n" +
+	"SwapPss:               0 kB\n" +
+	fmt.Sprintf("KernelPageSize: %8d kB\n", hostarch.PageSize/1024) +
+	fmt.Sprintf("MMUPageSize:    %8d kB\n", hostarch.PageSize/1024) +
+	"Locked:                0 kB\n" +
+	"VmFlags: rd ex \n"
 
 // MapsCallbackFuncForBuffer creates a /proc/[pid]/maps entry including the trailing newline.
 func (mm *MemoryManager) MapsCallbackFuncForBuffer(buf *bytes.Buffer) MapsCallbackFunc {
@@ -76,7 +80,11 @@ func (mm *MemoryManager) MapsCallbackFuncForBuffer(buf *bytes.Buffer) MapsCallba
 }
 
 // ReadMapsDataInto is called by fsimpl/proc.mapsData.Generate to
-// implement /proc/[pid]/maps.
+// implement /proc/[pid]/maps. It invokes fn synchronously with mappingMu read
+// locked. The callback must not reacquire mappingMu or violate the lock order;
+// checklocks cannot attach this incoming lock state to the function value.
+//
+// +checklocksexclude:mm.mappingMu
 func (mm *MemoryManager) ReadMapsDataInto(ctx context.Context, fn MapsCallbackFunc) {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
@@ -98,14 +106,14 @@ func (mm *MemoryManager) ReadMapsDataInto(ctx context.Context, fn MapsCallbackFu
 // vmaMapsEntryLocked returns a /proc/[pid]/maps entry for the vma iterated by
 // vseg, including the trailing newline.
 //
-// Preconditions: mm.mappingMu must be locked.
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) vmaMapsEntryLocked(ctx context.Context, vseg vmaIterator) []byte {
 	var b bytes.Buffer
 	mm.appendVMAMapsEntryLocked(ctx, vseg, mm.MapsCallbackFuncForBuffer(&b))
 	return b.Bytes()
 }
 
-// Preconditions: mm.mappingMu must be locked.
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) appendVMAMapsEntryLocked(ctx context.Context, vseg vmaIterator, fn MapsCallbackFunc) {
 	vma := vseg.ValuePtr()
 	private := "p"
@@ -133,6 +141,9 @@ func (mm *MemoryManager) appendVMAMapsEntryLocked(ctx context.Context, vseg vmaI
 
 // ReadSmapsDataInto is called by fsimpl/proc.smapsData.Generate to
 // implement /proc/[pid]/maps.
+//
+// +checklocksexclude:mm.mappingMu
+// +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) ReadSmapsDataInto(ctx context.Context, buf *bytes.Buffer) {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
@@ -149,13 +160,16 @@ func (mm *MemoryManager) ReadSmapsDataInto(ctx context.Context, buf *bytes.Buffe
 // vmaSmapsEntryLocked returns a /proc/[pid]/smaps entry for the vma iterated
 // by vseg, including the trailing newline.
 //
-// Preconditions: mm.mappingMu must be locked.
+// +checklocksread:mm.mappingMu
+// +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) vmaSmapsEntryLocked(ctx context.Context, vseg vmaIterator) []byte {
 	var b bytes.Buffer
 	mm.vmaSmapsEntryIntoLocked(ctx, vseg, &b)
 	return b.Bytes()
 }
 
+// +checklocksread:mm.mappingMu
+// +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) vmaSmapsEntryIntoLocked(ctx context.Context, vseg vmaIterator, b *bytes.Buffer) {
 	mm.appendVMAMapsEntryLocked(ctx, vseg, mm.MapsCallbackFuncForBuffer(b))
 	vma := vseg.ValuePtr()

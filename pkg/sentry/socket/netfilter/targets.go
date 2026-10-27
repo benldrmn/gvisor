@@ -80,6 +80,14 @@ func init() {
 		NetworkProtocol: header.IPv6ProtocolNumber,
 	})
 
+	// MASQUERADE targets (source NAT to the outgoing interface's address).
+	registerTargetMaker(&masqueradeTargetMaker{
+		NetworkProtocol: header.IPv4ProtocolNumber,
+	})
+	registerTargetMaker(&masqueradeTargetMaker{
+		NetworkProtocol: header.IPv6ProtocolNumber,
+	})
+
 	// CT targets (used in the raw table for conntrack zone assignment).
 	registerTargetMaker(&ctTargetMaker{
 		NetworkProtocol: header.IPv4ProtocolNumber,
@@ -491,7 +499,7 @@ func translateToStandardTarget(val int32, netProto tcpip.NetworkProtocolNumber) 
 
 // parseTarget parses a target from optVal. optVal should contain only the
 // target.
-func parseTarget(filter stack.IPHeaderFilter, optVal []byte, ipv6 bool) (stack.Target, *syserr.Error) {
+func parseTarget(filter stack.IPHeaderFilter, optVal []byte, ipv6 bool, tableName string) (stack.Target, *syserr.Error) {
 	nflog("set entries: parsing target of size %d", len(optVal))
 	if len(optVal) < linux.SizeOfXTEntryTarget {
 		nflog("optVal has insufficient size for entry target %d", len(optVal))
@@ -502,7 +510,22 @@ func parseTarget(filter stack.IPHeaderFilter, optVal []byte, ipv6 bool) (stack.T
 	// XTEntryTarget again but with some added fields.
 	target.UnmarshalUnsafe(optVal)
 
+	name := target.Name.String()
+	if want := targetTable(name); want != "" && want != tableName {
+		nflog("target %q is only valid in the %s table, not %s", name, want, tableName)
+		return nil, syserr.ErrInvalidArgument
+	}
+
 	return unmarshalTarget(target, filter, optVal)
+}
+
+func targetName(optVal []byte) string {
+	if len(optVal) < linux.SizeOfXTEntryTarget {
+		return ""
+	}
+	var target linux.XTEntryTarget
+	target.UnmarshalUnsafe(optVal)
+	return target.Name.String()
 }
 
 // JumpTarget implements stack.Target.

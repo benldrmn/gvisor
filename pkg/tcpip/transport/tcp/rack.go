@@ -71,23 +71,34 @@ type rackControl struct {
 // init initializes RACK specific fields.
 func (rc *rackControl) init(snd *sender, iss seqnum.Value) {
 	rc.FACK = iss
+	rc.EndSequence = iss
+	rc.RTTSeq = iss
 	rc.ReoWndIncr = 1
 	rc.snd = snd
 }
 
 // update will update the RACK related fields when an ACK has been received.
-// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-6.2
+// See: https://www.rfc-editor.org/rfc/rfc8985.html#section-6.2
+//
+// +checklocks:rc.snd.ep.mu
 func (rc *rackControl) update(seg *segment, ackSeg *segment) {
-	rtt := rc.snd.ep.stack.Clock().NowMonotonic().Sub(seg.xmitTime)
+	// Compute the RTT sample against the time the ACK was received at ingress
+	// (ackSeg.rcvdTime), not the current clock. The two differ when the ACK was
+	// delayed inside the stack before being processed (e.g. it sat in the
+	// endpoint's segment queue while the application held the endpoint lock
+	// during a Write that synchronously flushed a window). Using the processing
+	// time would inflate the RTT by that internal delay, corrupting RACK.RTT,
+	// RACK.minRTT and the reorder window, and causing spurious loss detection.
+	// detectLoss already uses ackSeg.rcvdTime; this keeps update consistent.
+	rtt := ackSeg.rcvdTime.Sub(seg.xmitTime)
 
 	// If the ACK is for a retransmitted packet, do not update if it is a
 	// spurious inference which is determined by below checks:
-	// 1. When Timestamping option is available, if the TSVal is less than
+	// 1. When Timestamping option is available, if the TSecr is less than
 	// the transmit time of the most recent retransmitted packet.
-	// 2. When RTT calculated for the packet is less than the smoothed RTT
+	// 2. When RTT calculated for the packet is less than the minimum RTT
 	// for the connection.
-	// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
-	// step 2
+	// See: https://www.rfc-editor.org/rfc/rfc8985.html#section-6.2, step 2.
 	if seg.xmitCount > 1 {
 		if ackSeg.parsedOptions.TS && ackSeg.parsedOptions.TSEcr != 0 {
 			if ackSeg.parsedOptions.TSEcr < rc.snd.ep.tsVal(seg.xmitTime) {
@@ -148,6 +159,8 @@ func (rc *rackControl) setDSACKSeen(dsackSeen bool) {
 
 // shouldSchedulePTO dictates whether we should schedule a PTO or not.
 // See https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.5.1.
+//
+// +checklocks:s.ep.mu
 func (s *sender) shouldSchedulePTO() bool {
 	// Schedule PTO only if RACK loss detection is enabled.
 	return s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 &&
@@ -163,6 +176,7 @@ func (s *sender) shouldSchedulePTO() bool {
 // https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.5.1.
 //
 // +checklocks:s.ep.mu
+// +checklocksexclude:s.rtt.rttMutex
 func (s *sender) schedulePTO() {
 	pto := time.Second
 	s.rtt.Lock()
@@ -189,6 +203,7 @@ func (s *sender) schedulePTO() {
 // https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.5.2.
 //
 // +checklocks:s.ep.mu
+// +checklocksexclude:s.rtt.rttMutex
 func (s *sender) probeTimerExpired() tcpip.Error {
 	if s.probeTimer.isUninitialized() || !s.probeTimer.checkExpiration() {
 		return nil
@@ -285,6 +300,7 @@ func (s *sender) detectTLPRecovery(ack seqnum.Value, rcvdSeg *segment) {
 //     DUPACKthreshold.
 //
 // +checklocks:rc.snd.ep.mu
+// +checklocksexclude:rc.snd.rtt.rttMutex
 func (rc *rackControl) updateRACKReorderWindow() {
 	dsackSeen := rc.DSACKSeen
 	snd := rc.snd
@@ -363,6 +379,7 @@ func (rc *rackControl) exitRecovery() {
 func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
 	var timeout time.Duration
 	numLost := 0
+	clockResolution := rc.snd.ep.stack.ClockResolution()
 	for seg := rc.snd.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
 		if rc.snd.ep.scoreboard.IsSACKED(seg.sackBlock()) {
 			continue
@@ -374,13 +391,27 @@ func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
 		}
 
 		endSeq := seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize()))
-		if seg.xmitTime.Before(rc.XmitTime) || (seg.xmitTime == rc.XmitTime && rc.EndSequence.LessThan(endSeq)) {
-			timeRemaining := seg.xmitTime.Sub(rcvTime) + rc.RTT + rc.ReoWnd
-			if timeRemaining <= 0 {
+		if seg.xmitTime.Before(rc.XmitTime) || (seg.xmitTime == rc.XmitTime && endSeq.LessThan(rc.EndSequence)) {
+			// Timestamp quantization can make two events less than one clock tick
+			// apart appear a full tick apart. Keep that uncertainty separate from
+			// the network reordering window, which RACK may intentionally reduce to
+			// zero during recovery.
+			timeRemaining := seg.xmitTime.Sub(rcvTime) + rc.RTT + rc.ReoWnd + clockResolution
+			if timeRemaining < 0 || (timeRemaining == 0 && clockResolution == 0) {
 				seg.lost = true
 				numLost++
-			} else if timeRemaining > timeout {
-				timeout = timeRemaining
+			} else {
+				// Arm the timer through the uncertainty boundary, so that a timer
+				// target re-evaluation is strictly negative and loss is declared on
+				// the first expiry. Arming only to timeRemaining would make the
+				// expiry a no-op at equality that re-arms a second timer.
+				timeWait := timeRemaining
+				if clockResolution > 0 {
+					timeWait += clockResolution
+				}
+				if timeWait > timeout {
+					timeout = timeWait
+				}
 			}
 		}
 	}
@@ -395,12 +426,23 @@ func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
 // before the reorder timer expired.
 //
 // +checklocks:rc.snd.ep.mu
+// +checklocksexclude:rc.snd.rtt.rttMutex
 func (rc *rackControl) reorderTimerExpired() tcpip.Error {
 	if rc.snd.reorderTimer.isUninitialized() || !rc.snd.reorderTimer.checkExpiration() {
 		return nil
 	}
 
-	numLost := rc.detectLoss(rc.snd.ep.stack.Clock().NowMonotonic())
+	// Evaluate loss as of the time the reorder timer was scheduled to fire (its
+	// target), not the current clock. The timer is armed for the instant a
+	// segment's reorder window elapses, but the timer callback itself can run
+	// arbitrarily late under load (the processor goroutine is busy, or the
+	// endpoint lock is held while a Write flushes a window). Using the
+	// (possibly much later) processing time would make timeRemaining strongly
+	// negative and mark not-yet-lost segments as lost, triggering spurious
+	// retransmits and recovery on a path with little or no real loss
+	// (gvisor#9707/#9778). detectLoss arms the timer from rcvdTime-derived
+	// values, so evaluating it at the timer target keeps the two consistent.
+	numLost := rc.detectLoss(rc.snd.reorderTimer.target)
 	if numLost == 0 {
 		return nil
 	}
@@ -419,6 +461,7 @@ func (rc *rackControl) reorderTimerExpired() tcpip.Error {
 // DoRecovery implements lossRecovery.DoRecovery.
 //
 // +checklocks:rc.snd.ep.mu
+// +checklocksexclude:rc.snd.rtt.rttMutex
 func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 	snd := rc.snd
 	if fastRetransmit {

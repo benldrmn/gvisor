@@ -173,7 +173,7 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 				Errorno: int64(ExtractErrno(err, int(sysno))),
 			},
 		}
-		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallRawEnter, sysno))
+		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallRawExit, sysno))
 		if !fields.Context.Empty() {
 			info.ContextData = &pb.ContextData{}
 			LoadSeccheckData(t, fields.Context, info.ContextData)
@@ -235,13 +235,17 @@ func (t *Task) doSyscall() taskRunState {
 
 	// Check seccomp filters. The nil check is for performance (as seccomp use
 	// is rare), not needed for correctness.
-	if t.seccomp.Load() != nil {
+	if t.seccomp.Load() != nil && !t.consumeSeccompRestartSyscallBypass(sysno) {
 		switch r := t.checkSeccompSyscall(int32(sysno), args, hostarch.Addr(t.Arch().IP())); r {
 		case linux.SECCOMP_RET_ERRNO, linux.SECCOMP_RET_TRAP:
 			t.Debugf("Syscall %d: denied by seccomp", sysno)
 			return (*runSyscallExit)(nil)
 		case linux.SECCOMP_RET_ALLOW:
 			// ok
+		case linux.SECCOMP_RET_KILL_PROCESS:
+			t.Debugf("Syscall %d: killed by seccomp (process)", sysno)
+			t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGSYS))
+			return (*runExit)(nil)
 		case linux.SECCOMP_RET_KILL_THREAD:
 			t.Debugf("Syscall %d: killed by seccomp", sysno)
 			t.PrepareExit(linux.WaitStatusTerminationSignal(linux.SIGSYS))
@@ -289,7 +293,7 @@ type runSyscallAfterSyscallEnterStop struct{}
 func (*runSyscallAfterSyscallEnterStop) execute(t *Task) taskRunState {
 	if sig := linux.Signal(t.ptraceCode); sig.IsValid() {
 		t.tg.signalHandlers.mu.Lock()
-		t.sendSignalLocked(SignalInfoPriv(sig), false /* group */)
+		t.sendForcedSignalLocked(SignalInfoPriv(sig), false /* group */)
 		t.tg.signalHandlers.mu.Unlock()
 	}
 	if t.killed() {
@@ -310,7 +314,7 @@ type runSyscallAfterSysemuStop struct{}
 func (*runSyscallAfterSysemuStop) execute(t *Task) taskRunState {
 	if sig := linux.Signal(t.ptraceCode); sig.IsValid() {
 		t.tg.signalHandlers.mu.Lock()
-		t.sendSignalLocked(SignalInfoPriv(sig), false /* group */)
+		t.sendForcedSignalLocked(SignalInfoPriv(sig), false /* group */)
 		t.tg.signalHandlers.mu.Unlock()
 	}
 	if t.killed() {
@@ -389,7 +393,7 @@ func (t *Task) doVsyscall(addr hostarch.Addr, sysno uintptr) taskRunState {
 	// to syscall ABI because they both use RDI, RSI, and RDX for the first three
 	// arguments and none of the vsyscalls uses more than two arguments.
 	args := t.Arch().SyscallArgs()
-	if t.seccomp.Load() != nil {
+	if t.seccomp.Load() != nil && !t.consumeSeccompRestartSyscallBypass(sysno) {
 		switch r := t.checkSeccompSyscall(int32(sysno), args, addr); r {
 		case linux.SECCOMP_RET_ERRNO, linux.SECCOMP_RET_TRAP:
 			t.Debugf("vsyscall %d, caller %x: denied by seccomp", sysno, t.Arch().Value(caller))
@@ -399,6 +403,10 @@ func (t *Task) doVsyscall(addr hostarch.Addr, sysno uintptr) taskRunState {
 		case linux.SECCOMP_RET_TRACE:
 			t.Debugf("vsyscall %d, caller %x: stopping for PTRACE_EVENT_SECCOMP", sysno, t.Arch().Value(caller))
 			return &runVsyscallAfterPtraceEventSeccomp{addr, sysno, caller}
+		case linux.SECCOMP_RET_KILL_PROCESS:
+			t.Debugf("vsyscall %d: killed by seccomp (process)", sysno)
+			t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGSYS))
+			return (*runExit)(nil)
 		case linux.SECCOMP_RET_KILL_THREAD:
 			t.Debugf("vsyscall %d: killed by seccomp", sysno)
 			t.PrepareExit(linux.WaitStatusTerminationSignal(linux.SIGSYS))

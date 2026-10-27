@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
@@ -92,6 +93,9 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 // cudaProcs returns a list of all CUDA processes in the sandbox. It selects
 // them by collecting processes whose FD table has an open file descriptor to
 // any CUDA device.
+//
+// Callers must not hold any thread-group leader's Task.mu in k.
+// checklocks cannot name the leader mutexes selected by ForEachThreadGroup.
 func cudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, nvidiaDriverVersionMajor int) []*kernel.ThreadGroup {
 	var procs []*kernel.ThreadGroup
 	k.TaskSet().ForEachThreadGroup(func(tg *kernel.ThreadGroup, tgLeader *kernel.Task) {
@@ -192,20 +196,21 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 		mntns.DecRef(ctx)
 	})
 	args := &ExecArgs{
-		Filename: cudaCheckpointPath,
-		Argv: []string{
-			"cuda-checkpoint",
-			opFlag,
-			"--pid",
-			strconv.FormatInt(int64(pid), 10),
+		ExecArgs: controlapi.ExecArgs{
+			Filename: cudaCheckpointPath,
+			Argv: []string{
+				"cuda-checkpoint",
+				opFlag,
+				"--pid",
+				strconv.FormatInt(int64(pid), 10),
+			},
+			ContainerID: contID,
 		},
-		ContainerID:    contID,
 		MountNamespace: mntns,
 		PIDNamespace:   leader.PIDNamespace(),
 	}
 	// Provision environment variables from leader's container spec.
-	contName := k.ContainerName(contID)
-	args.Envv = k.Saver().SpecEnviron(contName)
+	args.Envv = k.SpecEnviron(contID)
 
 	// Provide standard streams to cuda-checkpoint. Use /dev/null as stdin
 	// and direct cuda-checkpoint's stdout/stderr to a pipe.

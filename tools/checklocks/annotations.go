@@ -16,7 +16,6 @@ package checklocks
 
 import (
 	"fmt"
-
 	"go/token"
 	"slices"
 	"strings"
@@ -25,6 +24,7 @@ import (
 const (
 	checkLocksAnnotation     = "// +checklocks:"
 	checkLocksAnnotationRead = "// +checklocksread:"
+	checkLocksReadAny        = "// +checklocksreadany"
 	checkLocksAcquires       = "// +checklocksacquire:"
 	checkLocksAcquiresRead   = "// +checklocksacquireread:"
 	checkLocksReleases       = "// +checklocksrelease:"

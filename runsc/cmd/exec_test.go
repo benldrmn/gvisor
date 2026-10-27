@@ -15,14 +15,16 @@
 package cmd
 
 import (
+	"errors"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
@@ -30,28 +32,29 @@ func TestUser(t *testing.T) {
 	testCases := []struct {
 		input   string
 		want    user
-		wantErr bool
+		wantErr error
 	}{
 		{input: "0", want: user{kuid: 0, kuidSet: true, kgid: 0, kgidSet: false}},
 		{input: "7", want: user{kuid: 7, kuidSet: true, kgid: 0, kgidSet: false}},
 		{input: "49:343", want: user{kuid: 49, kuidSet: true, kgid: 343, kgidSet: true}},
 		{input: "0:2401", want: user{kuid: 0, kuidSet: true, kgid: 2401, kgidSet: true}},
-		{input: "", wantErr: true},
-		{input: "foo", wantErr: true},
-		{input: ":123", wantErr: true},
-		{input: "1:2:3", wantErr: true},
+		{input: "4294967294:4294967294", want: user{kuid: 4294967294, kuidSet: true, kgid: 4294967294, kgidSet: true}},
+		{input: "-1", wantErr: strconv.ErrSyntax},
+		{input: "0:-1", wantErr: strconv.ErrSyntax},
+		{input: "4294967296", wantErr: strconv.ErrRange},
+		{input: "0:4294967296", wantErr: strconv.ErrRange},
+		{input: "", wantErr: strconv.ErrSyntax},
+		{input: "foo", wantErr: strconv.ErrSyntax},
+		{input: ":123", wantErr: strconv.ErrSyntax},
+		{input: "1:2:3", wantErr: strconv.ErrSyntax},
 	}
 
 	for _, tc := range testCases {
 		var u user
-		if err := u.Set(tc.input); err != nil && tc.wantErr {
-			// We got an error and wanted one.
-			continue
-		} else if err == nil && tc.wantErr {
-			t.Errorf("user.Set(%s): got no error, but wanted one", tc.input)
-		} else if err != nil && !tc.wantErr {
-			t.Errorf("user.Set(%s): got error %v, but wanted none", tc.input, err)
-		} else if u != tc.want {
+		err := u.Set(tc.input)
+		if !errors.Is(err, tc.wantErr) {
+			t.Errorf("user.Set(%q): got error %v, want %v", tc.input, err, tc.wantErr)
+		} else if err == nil && u != tc.want {
 			t.Errorf("user.Set(%s): got %+v, but wanted %+v", tc.input, u, tc.want)
 		}
 	}
@@ -63,7 +66,8 @@ func TestCLIArgs(t *testing.T) {
 		ex       Exec
 		spec     specs.Process
 		argv     []string
-		expected control.ExecArgs
+		expected controlapi.ExecArgs
+		wantErr  error
 	}{
 		{
 			name: "spec used by default",
@@ -75,7 +79,7 @@ func TestCLIArgs(t *testing.T) {
 				Env:          []string{"FOO=bar"},
 			},
 			argv: []string{"ls", "/"},
-			expected: control.ExecArgs{
+			expected: controlapi.ExecArgs{
 				Argv:             []string{"ls", "/"},
 				Envv:             []string{"FOO=bar"},
 				WorkingDirectory: "/foo/bar",
@@ -94,7 +98,7 @@ func TestCLIArgs(t *testing.T) {
 			ex: Exec{
 				cwd:        "/baz",
 				user:       user{kuid: 4, kuidSet: true, kgid: 4, kgidSet: true},
-				extraKGIDs: []string{"4", "5", "6"},
+				extraKGIDs: []string{"4", "5", "6", "4294967294"},
 				caps:       []string{"CAP_DAC_READ_SEARCH"},
 				env:        []string{"BAZ=new", "XYZ=xyz,BAZ=new"},
 			},
@@ -105,13 +109,13 @@ func TestCLIArgs(t *testing.T) {
 				Env:          []string{"FOO=bar"},
 			},
 			argv: []string{"ls", "/"},
-			expected: control.ExecArgs{
+			expected: controlapi.ExecArgs{
 				Argv:             []string{"ls", "/"},
 				Envv:             []string{"FOO=bar", "BAZ=new", "XYZ=xyz,BAZ=new"},
 				WorkingDirectory: "/baz",
 				KUID:             4,
 				KGID:             4,
-				ExtraKGIDs:       []auth.KGID{1, 2, 3, 4, 5, 6},
+				ExtraKGIDs:       []auth.KGID{1, 2, 3, 4, 5, 6, 4294967294},
 				Capabilities: &auth.TaskCapabilities{
 					BoundingCaps:    auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_OVERRIDE, linux.CAP_DAC_READ_SEARCH}),
 					EffectiveCaps:   auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_READ_SEARCH}),
@@ -122,13 +126,25 @@ func TestCLIArgs(t *testing.T) {
 				SupportTTYs: true,
 			},
 		},
+		{
+			name:    "negative supplementary GID",
+			ex:      Exec{extraKGIDs: []string{"-1"}},
+			wantErr: strconv.ErrSyntax,
+		},
+		{
+			name:    "supplementary GID exceeds uint32",
+			ex:      Exec{extraKGIDs: []string{"4294967296"}},
+			wantErr: strconv.ErrRange,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			e, err := tc.ex.argsFromCLI(&tc.spec, tc.argv, true)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("argsFromCLI(%+v): got error %v, want %v", tc.ex, err, tc.wantErr)
+			}
 			if err != nil {
-				t.Errorf("argsFromCLI(%+v): got error: %+v", tc.ex, err)
 				return
 			}
 			if diff := cmp.Diff(*e, tc.expected, cmpopts.IgnoreUnexported(os.File{})); diff != "" {
@@ -144,7 +160,7 @@ func TestJSONArgs(t *testing.T) {
 		ex       Exec
 		spec     specs.Process
 		p        specs.Process
-		expected control.ExecArgs
+		expected controlapi.ExecArgs
 	}{
 		{
 			name: "flags overridden by process file",
@@ -169,7 +185,7 @@ func TestJSONArgs(t *testing.T) {
 					Permitted:   []string{"CAP_DAC_OVERRIDE"},
 				},
 			},
-			expected: control.ExecArgs{
+			expected: controlapi.ExecArgs{
 				Argv:             []string{"ls", "/"},
 				WorkingDirectory: "/foo/bar",
 				KUID:             0,
@@ -197,7 +213,7 @@ func TestJSONArgs(t *testing.T) {
 				Cwd:  "/foo/bar",
 				// Does not specify capabilities.
 			},
-			expected: control.ExecArgs{
+			expected: controlapi.ExecArgs{
 				Argv:             []string{"ls", "/"},
 				WorkingDirectory: "/foo/bar",
 				KUID:             0,

@@ -20,17 +20,24 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
+#include <functional>
 #include <string>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/strings/str_cat.h"
 #include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -307,12 +314,17 @@ TEST(FsConfigTest, FsConfigReconfigureSucceeds) {
   EXPECT_THAT(fsconfig(fsfd, FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0),
               SyscallSucceeds());
 
-  // TODO(gvisor.dev/issues/13450): once reconfiguration is properly supported
-  // on underlying filesystems, this test should be updated.
   struct statfs st;
   ASSERT_THAT(fstatfs(mntfd, &st), SyscallSucceeds());
-  EXPECT_NE(st.f_files, 12345);
-  EXPECT_NE(st.f_flags & ST_RDONLY, ST_RDONLY);
+  if (IsRunningOnGvisor()) {
+    // TODO(gvisor.dev/issues/13450): expect the requested options once
+    // reconfiguration is passed through to the underlying filesystem.
+    EXPECT_NE(st.f_files, 12345);
+    EXPECT_NE(st.f_flags & ST_RDONLY, ST_RDONLY);
+  } else {
+    EXPECT_EQ(st.f_files, 12345);
+    EXPECT_EQ(st.f_flags & ST_RDONLY, ST_RDONLY);
+  }
 }
 
 TEST(FsConfigTest, FsConfigUnsupportedTypes) {
@@ -950,6 +962,215 @@ TEST(OpenTreeTest, OpenTreeCloneRecursiveOnDetached) {
   auto cleanup_tree = Cleanup([&]() { close(treefd); });
 
   EXPECT_THAT(faccessat(treefd, "sub/marker_sub", F_OK, 0), SyscallSucceeds());
+}
+
+// The root of a detached mount, such as an open_tree(2) clone, can be an
+// overlay layer. See https://github.com/torvalds/linux/commit/db04662e2f4f,
+// which first appears in Linux 6.15.
+TEST(OpenTreeTest, OpenTreeCloneAsOverlayLowerdir) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 6 || (version.major == 6 && version.minor < 15));
+  }
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  ASSERT_THAT(mount("", dir.path().c_str(), kTmpfs, 0, ""), SyscallSucceeds());
+  auto cleanup_umount =
+      Cleanup([&]() { umount2(dir.path().c_str(), MNT_DETACH); });
+  const std::string lower = JoinPath(dir.path(), "lower");
+  const std::string other = JoinPath(dir.path(), "other");
+  const std::string merged = JoinPath(dir.path(), "merged");
+  for (const std::string& path : {lower, other, merged}) {
+    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
+  }
+
+  int treefd =
+      open_tree(AT_FDCWD, lower.c_str(), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  const std::string opts =
+      "lowerdir=/proc/self/fd/" + std::to_string(treefd) + ":" + other;
+  ASSERT_THAT(mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()),
+              SyscallSucceeds());
+  EXPECT_THAT(umount2(merged.c_str(), 0), SyscallSucceeds());
+}
+
+// A detached mount cloned in a more privileged user namespace cannot be an
+// overlay layer. See
+// https://github.com/torvalds/linux/commit/c28f922c9dce, which first appears
+// in Linux 6.16.
+TEST(OpenTreeTest, OpenTreeCloneFromAnotherUserNamespaceAsOverlayLowerdir) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 6 || (version.major == 6 && version.minor < 16));
+  }
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  ASSERT_THAT(mount("", dir.path().c_str(), kTmpfs, 0, ""), SyscallSucceeds());
+  auto cleanup_umount =
+      Cleanup([&]() { umount2(dir.path().c_str(), MNT_DETACH); });
+  const std::string lower = JoinPath(dir.path(), "lower");
+  const std::string hidden = JoinPath(lower, "hidden");
+  const std::string other = JoinPath(dir.path(), "other");
+  const std::string merged = JoinPath(dir.path(), "merged");
+  for (const std::string& path : {lower, hidden, other, merged}) {
+    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
+  }
+  ASSERT_THAT(mount("", hidden.c_str(), kTmpfs, 0, ""), SyscallSucceeds());
+  auto cleanup_hidden = Cleanup([&]() { umount2(hidden.c_str(), MNT_DETACH); });
+
+  int treefd = open_tree(AT_FDCWD, lower.c_str(),
+                         OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  const std::string opts =
+      "lowerdir=/proc/self/fd/" + std::to_string(treefd) + ":" + other;
+  const std::function<void()> child = [&] {
+    TEST_CHECK_ERRNO(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()), EPERM);
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// open_tree(2) and move_mount(2) on non-directories. Linux resolves both paths
+// without LOOKUP_DIRECTORY; do_move_mount() only requires that source and
+// target are both directories or both non-directories.
+
+TEST(OpenTreeTest, OpenTreeCloneFile) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const file = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "contents", 0644));
+
+  int treefd = open_tree(AT_FDCWD, file.path().c_str(),
+                         OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  struct stat st;
+  ASSERT_THAT(fstat(treefd, &st), SyscallSucceeds());
+  EXPECT_TRUE(S_ISREG(st.st_mode));
+}
+
+TEST(MoveMountTest, MoveMountClonedFileOntoFile) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const src = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "source", 0644));
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "target", 0644));
+
+  int treefd = open_tree(AT_FDCWD, src.path().c_str(),
+                         OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  ASSERT_THAT(move_mount(treefd, "", AT_FDCWD, dst.path().c_str(),
+                         MOVE_MOUNT_F_EMPTY_PATH),
+              SyscallSucceeds());
+  // An open mount fd keeps the attached mount busy.
+  cleanup_tree.Release()();
+  auto cleanup_umount = Cleanup([&]() { umount(dst.path().c_str()); });
+
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(dst.path())), "source");
+
+  // Writes through the bind mount reach the source file.
+  ASSERT_NO_ERRNO(SetContents(dst.path(), "written"));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(src.path())), "written");
+
+  cleanup_umount.Release();
+  ASSERT_THAT(umount(dst.path().c_str()), SyscallSucceeds());
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(dst.path())), "target");
+}
+
+// Clone the source through a /proc/self/fd magic link, which open_tree(2)
+// follows unless AT_SYMLINK_NOFOLLOW is set.
+TEST(MoveMountTest, MoveMountClonedProcFdFileOntoFile) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const src = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "source", 0644));
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "target", 0644));
+  auto const srcfd = ASSERT_NO_ERRNO_AND_VALUE(Open(src.path(), O_PATH));
+
+  int treefd =
+      open_tree(AT_FDCWD, absl::StrCat("/proc/self/fd/", srcfd.get()).c_str(),
+                OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  ASSERT_THAT(move_mount(treefd, "", AT_FDCWD, dst.path().c_str(),
+                         MOVE_MOUNT_F_EMPTY_PATH),
+              SyscallSucceeds());
+  cleanup_tree.Release()();
+  auto cleanup_umount = Cleanup([&]() { umount(dst.path().c_str()); });
+
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(dst.path())), "source");
+}
+
+TEST(MoveMountTest, MoveMountAttachedFileOntoFile) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const src = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "source", 0644));
+  auto const mid = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "middle", 0644));
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "target", 0644));
+
+  ASSERT_THAT(
+      mount(src.path().c_str(), mid.path().c_str(), nullptr, MS_BIND, nullptr),
+      SyscallSucceeds());
+  auto cleanup_mid = Cleanup([&]() { umount(mid.path().c_str()); });
+
+  ASSERT_THAT(
+      move_mount(AT_FDCWD, mid.path().c_str(), AT_FDCWD, dst.path().c_str(), 0),
+      SyscallSucceeds());
+  cleanup_mid.Release();
+  auto cleanup_dst = Cleanup([&]() { umount(dst.path().c_str()); });
+
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(mid.path())), "middle");
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(dst.path())), "source");
+}
+
+TEST(MoveMountTest, MoveMountFileOntoDirFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const src = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "source", 0644));
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int treefd = open_tree(AT_FDCWD, src.path().c_str(),
+                         OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  EXPECT_THAT(move_mount(treefd, "", AT_FDCWD, dir.path().c_str(),
+                         MOVE_MOUNT_F_EMPTY_PATH),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(MoveMountTest, MoveMountDirOntoFileFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "target", 0644));
+
+  int treefd = open_tree(AT_FDCWD, dir.path().c_str(),
+                         OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  EXPECT_THAT(move_mount(treefd, "", AT_FDCWD, dst.path().c_str(),
+                         MOVE_MOUNT_F_EMPTY_PATH),
+              SyscallFailsWithErrno(EINVAL));
 }
 
 }  // namespace

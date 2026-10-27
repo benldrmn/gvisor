@@ -15,6 +15,8 @@ go_library(
         "basics.go",
         "branches.go",
         "closures.go",
+        "cyclic.go",
+        "declarations.go",
         "defer.go",
         "generics.go",
         "globals.go",
@@ -23,13 +25,17 @@ go_library(
         "locker.go",
         "methods.go",
         "parameters.go",
+        "private_globals.go",
         "return.go",
         "rwmutex.go",
         "test.go",
     ],
-    # This ensures that there are no dependencies, since we want to explicitly
-    # control expected failures for analysis.
+    # Disable generated marshal/state sources so they do not add unexpected
+    # diagnostics to this fixture.
     marshal = False,
     stateify = False,
-    deps = ["//tools/checklocks/test/crosspkg"],
+    deps = [
+        "//pkg/atomicbitops",
+        "//tools/checklocks/test/crosspkg",
+    ],
 )

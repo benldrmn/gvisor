@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -58,6 +59,19 @@ var nameToID = map[string]stack.TableID{
 	mangleTable: stack.MangleID,
 	filterTable: stack.FilterID,
 	rawTable:    stack.RawID,
+}
+
+// errTableNotFound is returned when a requested table doesn't exist.
+// It is translated to `ENOENT`.
+var errTableNotFound = errors.New("table not found")
+
+// tableLookupError converts an error from convertNetstackToBinary{4,6} into a
+// syserr.Error.
+func tableLookupError(err error) *syserr.Error {
+	if errors.Is(err, errTableNotFound) {
+		return syserr.ErrNoFileOrDir
+	}
+	return syserr.ErrInvalidArgument
 }
 
 // DefaultLinuxTables returns the rules of stack.DefaultTables() wrapped for
@@ -103,7 +117,7 @@ func GetInfo(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, ipv6 bool
 	}
 	if err != nil {
 		nflog("couldn't convert iptables: %v", err)
-		return linux.IPTGetinfo{}, syserr.ErrInvalidArgument
+		return linux.IPTGetinfo{}, tableLookupError(err)
 	}
 
 	nflog("returning info: %+v", info)
@@ -119,12 +133,16 @@ func GetEntries4(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLe
 		return linux.KernelIPTGetEntries{}, syserr.FromError(err)
 	}
 
+	if outLen != userEntries.SizeBytes()+int(userEntries.Size) {
+		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
+	}
+
 	// Convert netstack's iptables rules to something that the iptables
 	// tool can understand.
 	entries, _, err := convertNetstackToBinary4(stack, userEntries.Name)
 	if err != nil {
 		nflog("couldn't read entries: %v", err)
-		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
+		return linux.KernelIPTGetEntries{}, tableLookupError(err)
 	}
 	if entries.SizeBytes() > outLen {
 		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
@@ -144,12 +162,16 @@ func GetEntries6(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLe
 		return linux.KernelIP6TGetEntries{}, syserr.FromError(err)
 	}
 
+	if outLen != userEntries.SizeBytes()+int(userEntries.Size) {
+		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
+	}
+
 	// Convert netstack's iptables rules to something that the iptables
 	// tool can understand.
 	entries, _, err := convertNetstackToBinary6(stack, userEntries.Name)
 	if err != nil {
 		nflog("couldn't read entries: %v", err)
-		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
+		return linux.KernelIP6TGetEntries{}, tableLookupError(err)
 	}
 	if entries.SizeBytes() > outLen {
 		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
@@ -196,6 +218,8 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 		table = stack.EmptyFilterTable()
 	case natTable:
 		table = stack.EmptyNATTable()
+	case mangleTable:
+		table = stack.EmptyMangleTable()
 	case rawTable:
 		table = stack.EmptyRawTable()
 	default:
@@ -205,10 +229,11 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 
 	var err *syserr.Error
 	var offsets map[uint32]int
+	var targets map[int][]byte
 	if ipv6 {
-		offsets, err = modifyEntries6(mapper, stk, optVal, &replace, &table)
+		offsets, targets, err = modifyEntries6(mapper, optVal, &replace, &table)
 	} else {
-		offsets, err = modifyEntries4(mapper, stk, optVal, &replace, &table)
+		offsets, targets, err = modifyEntries4(mapper, optVal, &replace, &table)
 	}
 	if err != nil {
 		return err
@@ -223,6 +248,10 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 			table.Underflows[hk] = stack.HookUnset
 			for offset, ruleIdx := range offsets {
 				if offset == replace.HookEntry[hook] {
+					if isUserChainTarget(table.Rules[ruleIdx].Target) || isErrorTarget(table.Rules[ruleIdx].Target) {
+						nflog("builtin hook %d cannot point to ErrorTarget or UserChainTarget: %T", hook, table.Rules[ruleIdx].Target)
+						return syserr.ErrInvalidArgument
+					}
 					table.BuiltinChains[hk] = ruleIdx
 				}
 				if offset == replace.Underflow[hook] {
@@ -246,7 +275,7 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 
 	// Check the user chains.
 	for ruleIdx, rule := range table.Rules {
-		if _, ok := rule.Target.(*stack.UserChainTarget); !ok {
+		if !isUserChainTarget(rule.Target) {
 			continue
 		}
 
@@ -278,15 +307,29 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 			nflog("failed to find a rule to jump to")
 			return syserr.ErrInvalidArgument
 		}
+		// jumpTo points to the first rule inside the chain, so to find
+		// out whether target is a UserChain we need to look at the
+		// preceding header.
+		if jumpTo == 0 || !isUserChainTarget(table.Rules[jumpTo-1].Target) {
+			nflog("jump target at rule %d jumps to rule %d which is not preceded by a UserChainTarget", ruleIdx, jumpTo)
+			return syserr.ErrInvalidArgument
+		}
 		jump.RuleNum = jumpTo
 		rule.Target = jump
 		table.Rules[ruleIdx] = rule
 	}
 
-	// TODO(gvisor.dev/issue/6167): Check the following conditions:
-	//	- There are no loops.
-	//	- There are no chains without an unconditional final rule.
-	//	- There are no chains without an unconditional underflow rule.
+	if err := checkLoopsAndChains(table, ipv6); err != nil {
+		return err
+	}
+
+	if err := parseTargets(stk, table.Rules, targets, ipv6, replace.Name.String()); err != nil {
+		return err
+	}
+
+	if err := checkTargetHooks(table, ipv6); err != nil {
+		return err
+	}
 
 	stk.IPTables().ReplaceTable(nameToID[replace.Name.String()], table, ipv6)
 	return nil
@@ -380,6 +423,24 @@ func unmarshalMatcherRevs(mapper IDMapper, match *linux.XTEntryMatch, filter sta
 	return matcher, err
 }
 
+func isUserChainTarget(t stack.Target) bool {
+	switch t.(type) {
+	case *userChainTarget, *stack.UserChainTarget:
+		return true
+	default:
+		return false
+	}
+}
+
+func isErrorTarget(t stack.Target) bool {
+	switch t.(type) {
+	case *errorTarget, *stack.ErrorTarget:
+		return true
+	default:
+		return false
+	}
+}
+
 func validUnderflow(rule stack.Rule, ipv6 bool) bool {
 	if len(rule.Matchers) != 0 {
 		return false
@@ -401,6 +462,202 @@ func isUnconditionalAccept(rule stack.Rule, ipv6 bool) bool {
 	}
 	_, ok := rule.Target.(*acceptTarget)
 	return ok
+}
+
+func isUnconditionalFinalRule(rule stack.Rule, ipv6 bool) bool {
+	if len(rule.Matchers) != 0 {
+		return false
+	}
+	if (ipv6 && rule.Filter != emptyIPv6Filter) || (!ipv6 && rule.Filter != emptyIPv4Filter) {
+		return false
+	}
+	switch rule.Target.(type) {
+	case *acceptTarget, *dropTarget, *returnTarget, *errorTarget:
+		return true
+	default:
+		return false
+	}
+}
+
+type visitState uint8
+
+const (
+	unvisited visitState = iota
+	visiting
+	visited
+)
+
+func checkChainDFS(table stack.Table, ruleIdx int, state []visitState, ipv6 bool) *syserr.Error {
+	if state[ruleIdx] == visiting {
+		nflog("jump loop detected at rule %d", ruleIdx)
+		return syserr.ErrLinkLoop
+	}
+	if state[ruleIdx] == visited {
+		return nil
+	}
+	state[ruleIdx] = visiting
+
+	rule := table.Rules[ruleIdx]
+	if jump, ok := rule.Target.(*JumpTarget); ok {
+		jumpTo := jump.RuleNum
+		if jumpTo <= 0 || jumpTo >= len(table.Rules) {
+			nflog("jump to out-of-bounds rule %d", jumpTo)
+			return syserr.ErrInvalidArgument
+		}
+		if !isUserChainTarget(table.Rules[jumpTo-1].Target) {
+			nflog("jump target %d is not a user chain (rule %d-1 target is %T)", jumpTo, jumpTo, table.Rules[jumpTo-1].Target)
+			return syserr.ErrInvalidArgument
+		}
+		if err := checkChainDFS(table, jumpTo, state, ipv6); err != nil {
+			return err
+		}
+	}
+
+	if isUnconditionalFinalRule(rule, ipv6) {
+		state[ruleIdx] = visited
+		return nil
+	}
+
+	nextIdx := ruleIdx + 1
+	if nextIdx >= len(table.Rules) {
+		nflog("chain fell off the end of table without an unconditional final rule at rule %d", ruleIdx)
+		return syserr.ErrInvalidArgument
+	}
+	if isUserChainTarget(table.Rules[nextIdx].Target) {
+		nflog("chain fell through into a user chain without an unconditional final rule at rule %d (next target is %T)", ruleIdx, table.Rules[nextIdx].Target)
+		return syserr.ErrInvalidArgument
+	}
+	if err := checkChainDFS(table, nextIdx, state, ipv6); err != nil {
+		return err
+	}
+	state[ruleIdx] = visited
+	return nil
+}
+
+func checkLoopsAndChains(table stack.Table, ipv6 bool) *syserr.Error {
+	state := make([]visitState, len(table.Rules))
+
+	for hook, ruleIdx := range table.BuiltinChains {
+		if table.ValidHooks()&(1<<hook) != 0 {
+			if err := checkChainDFS(table, ruleIdx, state, ipv6); err != nil {
+				return err
+			}
+		}
+	}
+
+	for ruleIdx, rule := range table.Rules {
+		if isUserChainTarget(rule.Target) && ruleIdx+1 < len(table.Rules) {
+			if err := checkChainDFS(table, ruleIdx+1, state, ipv6); err != nil {
+				return syserr.ErrInvalidArgument
+			}
+		}
+	}
+
+	return nil
+}
+
+func parseTargets(stk *stack.Stack, rules []stack.Rule, targets map[int][]byte, ipv6 bool, tableName string) *syserr.Error {
+	for ruleIdx := range rules {
+		optVal, ok := targets[ruleIdx]
+		if !ok {
+			continue
+		}
+		target, err := parseTarget(rules[ruleIdx].Filter, optVal, ipv6, tableName)
+		if err != nil {
+			nflog("failed to parse target: %v", err)
+			return err
+		}
+		// Set the handler for REJECT targets.
+		switch rejectTarget := target.(type) {
+		case *rejectIPv4Target:
+			netProto := stk.NetworkProtocolInstance(header.IPv4ProtocolNumber)
+			handler, ok := netProto.(stack.RejectIPv4WithHandler)
+			if !ok {
+				nflog("parseTargets: expected %T to implement stack.RejectIPv4WithHandler", netProto)
+				return syserr.ErrInvalidArgument
+			}
+			rejectTarget.Handler = handler
+		case *rejectIPv6Target:
+			netProto := stk.NetworkProtocolInstance(header.IPv6ProtocolNumber)
+			handler, ok := netProto.(stack.RejectIPv6WithHandler)
+			if !ok {
+				nflog("parseTargets: expected %T to implement stack.RejectIPv6WithHandler", netProto)
+				return syserr.ErrInvalidArgument
+			}
+			rejectTarget.Handler = handler
+		}
+		rules[ruleIdx].Target = target
+	}
+	return nil
+}
+
+func targetTable(name string) string {
+	switch name {
+	case RedirectTargetName, DNATTargetName, SNATTargetName, MasqueradeTargetName:
+		return natTable
+	case RejectTargetName:
+		return filterTable
+	case CTTargetName:
+		return rawTable
+	default:
+		return ""
+	}
+}
+
+func targetSupportsHook(target stack.Target, hook stack.Hook) bool {
+	switch target.(type) {
+	case *redirectTarget, *dnatTarget:
+		return hook == stack.Prerouting || hook == stack.Output
+	case *snatTarget:
+		return hook == stack.Input || hook == stack.Postrouting
+	case *masqueradeTarget:
+		return hook == stack.Postrouting
+	case *rejectIPv4Target, *rejectIPv6Target:
+		return hook == stack.Input || hook == stack.Forward || hook == stack.Output
+	default:
+		return true
+	}
+}
+
+func checkChainTargets(table stack.Table, ruleIdx int, hook stack.Hook, visited []bool, ipv6 bool) *syserr.Error {
+	for ruleIdx < len(table.Rules) && !visited[ruleIdx] {
+		visited[ruleIdx] = true
+
+		rule := table.Rules[ruleIdx]
+		if !targetSupportsHook(rule.Target, hook) {
+			nflog("target %T at rule %d does not support hook %v", rule.Target, ruleIdx, hook)
+			return syserr.ErrInvalidArgument
+		}
+
+		if jump, ok := rule.Target.(*JumpTarget); ok {
+			if err := checkChainTargets(table, jump.RuleNum, hook, visited, ipv6); err != nil {
+				return err
+			}
+		}
+
+		if isUnconditionalFinalRule(rule, ipv6) {
+			return nil
+		}
+
+		ruleIdx++
+	}
+
+	return nil
+}
+
+func checkTargetHooks(table stack.Table, ipv6 bool) *syserr.Error {
+	for hook, ruleIdx := range table.BuiltinChains {
+		if table.ValidHooks()&(1<<hook) == 0 {
+			continue
+		}
+
+		visited := make([]bool, len(table.Rules))
+		if err := checkChainTargets(table, ruleIdx, stack.Hook(hook), visited, ipv6); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func hookFromLinux(hook int) stack.Hook {

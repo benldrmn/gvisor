@@ -11,8 +11,10 @@ go_library(
         "config.go",
         "plugin.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/socket/plugin",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/atomicbitops",
         "//pkg/seccomp",
         "//pkg/sentry/inet",
         "//pkg/waiter",

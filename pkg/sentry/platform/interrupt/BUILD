@@ -11,12 +11,13 @@ go_library(
         "interrupt.go",
     ],
     visibility = ["//pkg/sentry:internal"],
-    deps = ["//pkg/sync"],
+    deps = ["//pkg/atomicbitops"],
 )
 
 go_test(
     name = "interrupt_test",
     size = "small",
     srcs = ["interrupt_test.go"],
-    library = ":interrupt",
+    embed = [":interrupt"],
+    deps = ["//pkg/atomicbitops"],
 )

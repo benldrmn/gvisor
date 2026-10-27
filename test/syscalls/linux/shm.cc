@@ -12,17 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <errno.h>
+#include <linux/capability.h>
 #include <stdio.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include <csignal>
+#include <cstdint>
+#include <ctime>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/flags/flag.h"
 #include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+ABSL_FLAG(int32_t, scratch_uid, 65534, "scratch UID");
+ABSL_FLAG(int32_t, scratch_gid, 65534, "scratch GID");
 
 namespace gvisor {
 namespace testing {
@@ -234,7 +253,7 @@ TEST(ShmTest, ShmStat) {
   // This test relies on the segment we create to be the first one on the
   // system, causing it to occupy slot 1. We can't reasonably expect this on a
   // general Linux host.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
 
   const ShmSegment shm = ASSERT_NO_ERRNO_AND_VALUE(
       Shmget(IPC_PRIVATE, kAllocSize, IPC_CREAT | 0777));
@@ -503,6 +522,81 @@ TEST(ShmTest, NoDestructionOfAttachedSegmentWithMultipleRmid) {
   // detached.
   addr2[0] = 'x';
   ASSERT_NO_ERRNO(Shmdt(addr2));
+}
+
+TEST(ShmTest, MprotectWriteOnReadonlySegmentFails) {
+  const ShmSegment shm = ASSERT_NO_ERRNO_AND_VALUE(
+      Shmget(IPC_PRIVATE, kAllocSize, IPC_CREAT | 0777));
+  char* addr = ASSERT_NO_ERRNO_AND_VALUE(Shmat(shm.id(), nullptr, SHM_RDONLY));
+
+  // Try to mprotect to write. This should fail with EACCES.
+  EXPECT_THAT(mprotect(addr, kAllocSize, PROT_READ | PROT_WRITE),
+              SyscallFailsWithErrno(EACCES));
+
+  ASSERT_NO_ERRNO(Shmdt(addr));
+}
+
+TEST(ShmTest, MprotectWriteOnWritableSegmentSucceeds) {
+  const ShmSegment shm = ASSERT_NO_ERRNO_AND_VALUE(
+      Shmget(IPC_PRIVATE, kAllocSize, IPC_CREAT | 0777));
+  char* addr = ASSERT_NO_ERRNO_AND_VALUE(Shmat(shm.id(), nullptr, 0));
+
+  // Downgrade to read-only.
+  ASSERT_THAT(mprotect(addr, kAllocSize, PROT_READ), SyscallSucceeds());
+
+  // Upgrade back to writable. This should succeed because it was originally
+  // attached writable.
+  EXPECT_THAT(mprotect(addr, kAllocSize, PROT_READ | PROT_WRITE),
+              SyscallSucceeds());
+
+  // Writing succeeds now.
+  addr[0] = 'y';
+  EXPECT_EQ(addr[0], 'y');
+
+  ASSERT_NO_ERRNO(Shmdt(addr));
+}
+
+TEST(ShmTest, RmidOwnershipPermissionDenied) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  const uid_t scratch_uid = absl::GetFlag(FLAGS_scratch_uid);
+  const gid_t scratch_gid = absl::GetFlag(FLAGS_scratch_gid);
+
+  ShmSegment shm = ASSERT_NO_ERRNO_AND_VALUE(
+      Shmget(IPC_PRIVATE, kAllocSize, IPC_CREAT | 0600));
+
+  // Drop privileges and change IDs in a separate thread so the test runner's
+  // main thread credentials remain unaffected. AutoCapability must stay in
+  // scope for the shmctl body.
+  auto drop_privs = [&](auto&& body) {
+    AutoCapability cap(CAP_SYS_ADMIN, false);
+    EXPECT_THAT(syscall(SYS_setresgid, -1, scratch_gid, -1), SyscallSucceeds());
+    EXPECT_THAT(syscall(SYS_setresuid, -1, scratch_uid, -1), SyscallSucceeds());
+    body();
+  };
+
+  ScopedThread([&] {
+    drop_privs([&] {
+      EXPECT_THAT(Shmctl<void>(shm.id(), IPC_RMID, nullptr),
+                  PosixErrorIs(EPERM, _));
+    });
+  }).Join();
+
+  // Verify that the segment was not destroyed and remains valid.
+  struct shmid_ds attr;
+  ASSERT_NO_ERRNO(Shmctl(shm.id(), IPC_STAT, &attr));
+  EXPECT_EQ(attr.shm_perm.mode & 0777, 0600);
+  EXPECT_FALSE(attr.shm_perm.mode & SHM_DEST);
+
+  // Transfer ownership to the scratch user via IPC_SET.
+  attr.shm_perm.uid = scratch_uid;
+  ASSERT_NO_ERRNO(Shmctl(shm.id(), IPC_SET, &attr));
+
+  // In the same dropped-privilege thread (now the owner), IPC_RMID
+  // should succeed.
+  ScopedThread([&] {
+    drop_privs([&] { EXPECT_NO_ERRNO(shm.Rmid()); });
+  }).Join();
 }
 
 }  // namespace

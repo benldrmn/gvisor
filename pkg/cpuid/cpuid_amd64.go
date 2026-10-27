@@ -323,6 +323,19 @@ func (fs FeatureSet) HasFeature(feature Feature) bool {
 	return feature.check(fs)
 }
 
+// x86Family returns the CPU family printed in /proc/cpuinfo from a CPUID
+// leaf 1 EAX signature.
+//
+// This matches Linux arch/x86/lib/cpu.c:x86_family(). When the 4-bit
+// family ID is 0xf, the 8-bit extended family is added.
+func x86Family(sig uint32) uint32 {
+	family := (sig >> 8) & 0xf
+	if family == 0xf {
+		family += (sig >> 20) & 0xff
+	}
+	return family
+}
+
 // WriteCPUInfoTo is to generate a section of one cpu in /proc/cpuinfo. This is
 // a minimal /proc/cpuinfo, it is missing some fields like "microcode" that are
 // not always printed in Linux. Several fields are simply made up.
@@ -330,11 +343,11 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 	// Avoid many redundant calls here, since this can occasionally appear
 	// in the hot path. Read all basic information up front, see above.
 	ax, _, _, _ := fs.query(featureInfo)
-	ef, em, _, f, m, _ := signatureSplit(ax)
+	_, em, _, _, m, _ := signatureSplit(ax)
 	vendor := fs.VendorID()
 	fmt.Fprintf(w, "processor\t: %d\n", cpu)
 	fmt.Fprintf(w, "vendor_id\t: %s\n", string(vendor[:]))
-	fmt.Fprintf(w, "cpu family\t: %d\n", ((ef<<4)&0xff)|f)
+	fmt.Fprintf(w, "cpu family\t: %d\n", x86Family(ax))
 	fmt.Fprintf(w, "model\t\t: %d\n", ((em<<4)&0xff)|m)
 	fmt.Fprintf(w, "model name\t: %s\n", "unknown") // Unknown for now.
 	fmt.Fprintf(w, "stepping\t: %s\n", "unknown")   // Unknown for now.
@@ -384,6 +397,13 @@ func (fs FeatureSet) Intel() bool {
 	return fs.VendorID() == genuineIntel
 }
 
+// AMX state component numbers, which are both the XCR0 bits that enable
+// them and the leaf 0xD subleaves that describe them.
+const (
+	amxTileCfgComponent  = 17
+	amxTileDataComponent = 18
+)
+
 // Leaf 0 of xsaveinfo function returns the size for currently
 // enabled xsave features in ebx, the maximum size if all valid
 // features are saved with xsave in ecx, and valid XCR0 bits in
@@ -394,8 +414,8 @@ func (fs FeatureSet) Intel() bool {
 var (
 	xsaveSize       = native(In{Eax: uint32(xSaveInfo)}).Ebx
 	maxXsaveSize    = native(In{Eax: uint32(xSaveInfo)}).Ecx
-	amxTileCfgSize  = native(In{Eax: uint32(xSaveInfo), Ecx: 17}).Eax
-	amxTileDataSize = native(In{Eax: uint32(xSaveInfo), Ecx: 18}).Eax
+	amxTileCfgSize  = native(In{Eax: uint32(xSaveInfo), Ecx: amxTileCfgComponent}).Eax
+	amxTileDataSize = native(In{Eax: uint32(xSaveInfo), Ecx: amxTileDataComponent}).Eax
 )
 
 const (
@@ -404,11 +424,11 @@ const (
 	//
 	// See Intel® 64 and IA-32 Architectures Software Developer’s Manual Vol.1
 	// section 13.3 for details.
-	XCR0AmxCfgMask = uint64(1 << 17)
+	XCR0AmxCfgMask = uint64(1 << amxTileCfgComponent)
 
 	// XCR0AmxDataMask is the bits that enable xsave to operate on
 	// AMX TILEDATA.
-	XCR0AmxDataMask = uint64(1 << 18)
+	XCR0AmxDataMask = uint64(1 << amxTileDataComponent)
 )
 
 // ExtendedStateSize returns the number of bytes needed to save the "extended
@@ -513,4 +533,15 @@ func (fs FeatureSet) AllowedHWCap1() uint64 {
 func (fs FeatureSet) AllowedHWCap2() uint64 {
 	// HWCAPS are not supported on amd64.
 	return 0
+}
+
+// UnsetFSGSBASE unsets features that should not be exposed to the guest workload.
+func (fs FeatureSet) UnsetFSGSBASE() FeatureSet {
+	s := fs.ToStatic()
+	// Disable FSGSBASE for guest processes. If userspace uses WRGSBASE without the Sentry's
+	// knowledge, it would corrupt the GS register used by Systrap for syscall patching.
+	X86FeatureFSGSBase.Unset(s)
+	sfs := s.ToFeatureSet()
+	sfs.hwCap = fs.hwCap
+	return sfs
 }

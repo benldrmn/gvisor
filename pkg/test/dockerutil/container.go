@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -31,7 +32,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/checkpoint"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
@@ -55,7 +55,6 @@ type Container struct {
 	id       string
 	mounts   []mount.Mount
 	links    []string
-	copyErr  error
 	cleanups []func()
 
 	// profile is the profiling hook associated with this container.
@@ -95,6 +94,10 @@ type RunOpts struct {
 	// Privileged enables privileged mode.
 	Privileged bool
 
+	Init bool
+
+	CgroupnsMode string
+
 	// Sets network mode for the container. See container.NetworkMode for types. Several options will
 	// not work w/ gVisor. For example, you can't set the "sandbox" network option for gVisor using
 	// this handle.
@@ -132,6 +135,21 @@ type RunOpts struct {
 	Annotations map[string]string
 }
 
+func ensureShouldRun(logger testutil.Logger) {
+	// Only apply sharding to test loggers (*testing.T / *testing.B) that support Skipf.
+	// Non-test loggers (like testutil.DefaultLogger used by test/runtimes/runner/lib/lib.go)
+	// launch shared containers and manage their own sharding, so they must not be skipped or panicked.
+	s, ok := logger.(interface {
+		Skipf(format string, args ...any)
+	})
+	if !ok {
+		return
+	}
+	if !testutil.ShouldRun(logger.Name()) {
+		s.Skipf("Skipping test %q for shard %d of %d", logger.Name(), testutil.Partition(), testutil.TotalPartitions())
+	}
+}
+
 func makeContainer(ctx context.Context, logger testutil.Logger, runtime string) *Container {
 	// Slashes and pluses are not allowed in container names.
 	name := testutil.RandomID(logger.Name())
@@ -156,12 +174,14 @@ func makeContainer(ctx context.Context, logger testutil.Logger, runtime string) 
 //
 // Containers will check flags for profiling requests.
 func MakeContainer(ctx context.Context, logger testutil.Logger) *Container {
+	ensureShouldRun(logger)
 	return makeContainer(ctx, logger, *runtime)
 }
 
 // MakeContainerWithRuntime is like MakeContainer, but allows for a runtime
 // to be specified by suffix.
 func MakeContainerWithRuntime(ctx context.Context, logger testutil.Logger, suffix string) *Container {
+	ensureShouldRun(logger)
 	return makeContainer(ctx, logger, *runtime+suffix)
 }
 
@@ -171,6 +191,7 @@ func MakeContainerWithRuntime(ctx context.Context, logger testutil.Logger, suffi
 //
 // Native containers aren't profiled.
 func MakeNativeContainer(ctx context.Context, logger testutil.Logger) *Container {
+	ensureShouldRun(logger)
 	unsandboxedRuntime := "runc"
 	if override, found := os.LookupEnv("UNSANDBOXED_RUNTIME"); found {
 		unsandboxedRuntime = override
@@ -323,7 +344,7 @@ func (c *Container) config(ctx context.Context, r RunOpts, args []string) (*cont
 		if len(entrypoint) == 0 || len(args) == 0 {
 			// Need to look up the image's default entrypoint/args so we can prepend to them.
 			// If we don't, then we will end up overwriting them.
-			imageInfo, _, err := c.client.ImageInspectWithRaw(ctx, image)
+			imageInfo, err := c.client.ImageInspect(ctx, image)
 			if err != nil {
 				return nil, fmt.Errorf("cannot inspect image %q: %w", image, err)
 			}
@@ -354,7 +375,7 @@ func (c *Container) config(ctx context.Context, r RunOpts, args []string) (*cont
 func (c *Container) hostConfig(r RunOpts) *container.HostConfig {
 	c.mounts = append(c.mounts, r.Mounts...)
 
-	return &container.HostConfig{
+	hc := &container.HostConfig{
 		Runtime:         c.runtime,
 		Mounts:          c.mounts,
 		Tmpfs:           r.Tmpfs,
@@ -366,6 +387,7 @@ func (c *Container) hostConfig(r RunOpts) *container.HostConfig {
 		SecurityOpt:     r.SecurityOpts,
 		ReadonlyRootfs:  r.ReadOnly,
 		NetworkMode:     container.NetworkMode(r.NetworkMode),
+		CgroupnsMode:    container.CgroupnsMode(r.CgroupnsMode),
 		Resources: container.Resources{
 			Memory:         int64(r.Memory), // In bytes.
 			CpusetCpus:     r.CpusetCpus,
@@ -374,6 +396,11 @@ func (c *Container) hostConfig(r RunOpts) *container.HostConfig {
 		},
 		Annotations: r.Annotations,
 	}
+	if r.Init {
+		init := true
+		hc.Init = &init
+	}
+	return hc
 }
 
 // Start is analogous to 'docker start'.
@@ -462,6 +489,30 @@ func (c *Container) logs(ctx context.Context, stdout, stderr *bytes.Buffer) erro
 	return err
 }
 
+// StreamLogs streams the container's combined stdout and stderr to the given writer.
+func (c *Container) StreamLogs(ctx context.Context, w io.Writer) error {
+	opts := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true}
+	reader, err := c.client.ContainerLogs(ctx, c.id, opts)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	_, err = stdcopy.StdCopy(w, w, reader)
+	return err
+}
+
+// StreamOutput streams stdout and stderr to the given writers.
+func (c *Container) StreamOutput(ctx context.Context, stdout, stderr io.Writer) error {
+	opts := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true}
+	reader, err := c.client.ContainerLogs(ctx, c.id, opts)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	_, err = stdcopy.StdCopy(stdout, stderr, reader)
+	return err
+}
+
 // ID returns the container id.
 func (c *Container) ID() string {
 	return c.id
@@ -493,6 +544,17 @@ func (c *Container) SandboxPid(ctx context.Context) (int, error) {
 		return -1, err
 	}
 	return resp.ContainerJSONBase.State.Pid, nil
+}
+
+// NetworkSandboxKey returns the path of the network namespace Docker created
+// for the container, e.g. "/var/run/docker/netns/<key>". It is empty for a
+// container that shares the host's network namespace.
+func (c *Container) NetworkSandboxKey(ctx context.Context) (string, error) {
+	resp, err := c.client.ContainerInspect(ctx, c.id)
+	if err != nil {
+		return "", err
+	}
+	return resp.NetworkSettings.SandboxKey, nil
 }
 
 // ErrNoIP indicates that no IP address is available.
@@ -538,31 +600,29 @@ func (c *Container) FindPort(ctx context.Context, sandboxPort int) (int, error) 
 	return port, nil
 }
 
-// CopyFiles copies in and mounts the given files. They are always ReadOnly.
-func (c *Container) CopyFiles(opts *RunOpts, target string, sources ...string) {
+// CopyFiles copies the named files to a temporary directory and adds a bind
+// mount at target to opts. Call it before creating the container so the mount
+// is included in the container configuration.
+func (c *Container) CopyFiles(opts *RunOpts, target string, sources ...string) error {
 	dir, err := os.MkdirTemp("", c.Name)
 	if err != nil {
-		c.copyErr = fmt.Errorf("os.MkdirTemp failed: %v", err)
-		return
+		return fmt.Errorf("os.MkdirTemp failed: %w", err)
 	}
 	c.cleanups = append(c.cleanups, func() { os.RemoveAll(dir) })
 	if err := os.Chmod(dir, 0755); err != nil {
-		c.copyErr = fmt.Errorf("os.Chmod(%q, 0755) failed: %v", dir, err)
-		return
+		return fmt.Errorf("os.Chmod(%q, 0755) failed: %w", dir, err)
 	}
 	for _, name := range sources {
 		src := name
 		if !filepath.IsAbs(src) {
 			src, err = testutil.FindFile(name)
 			if err != nil {
-				c.copyErr = fmt.Errorf("testutil.FindFile(%q) failed: %w", name, err)
-				return
+				return fmt.Errorf("testutil.FindFile(%q) failed: %w", name, err)
 			}
 		}
 		dst := path.Join(dir, path.Base(name))
 		if err := testutil.Copy(src, dst); err != nil {
-			c.copyErr = fmt.Errorf("testutil.Copy(%q, %q) failed: %v", src, dst, err)
-			return
+			return fmt.Errorf("testutil.Copy(%q, %q) failed: %w", src, dst, err)
 		}
 		c.logger.Logf("copy: %s -> %s", src, dst)
 	}
@@ -572,6 +632,7 @@ func (c *Container) CopyFiles(opts *RunOpts, target string, sources ...string) {
 		Target:   target,
 		ReadOnly: false,
 	})
+	return nil
 }
 
 // Stats returns a snapshot of container stats similar to `docker stats`.
@@ -589,10 +650,10 @@ func (c *Container) Stats(ctx context.Context) (*container.StatsResponse, error)
 }
 
 // Status inspects the container returns its status.
-func (c *Container) Status(ctx context.Context) (types.ContainerState, error) {
+func (c *Container) Status(ctx context.Context) (container.State, error) {
 	resp, err := c.client.ContainerInspect(ctx, c.id)
 	if err != nil {
-		return types.ContainerState{}, err
+		return container.State{}, err
 	}
 	return *resp.State, err
 }

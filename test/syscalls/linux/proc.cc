@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <dirent.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/capability.h>
+#include <linux/limits.h>
 #include <linux/magic.h>
+#include <linux/prctl.h>
 #include <sched.h>
 #include <signal.h>
 #include <stddef.h>
@@ -26,31 +30,38 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/statvfs.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <ctime>
 #include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <ostream>
-#include <regex>
+#include <regex>  // NOLINT
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/algorithm/container.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_set.h"
@@ -67,18 +78,20 @@
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
 #include "test/util/epoll_util.h"
 #include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
 #include "test/util/memory_util.h"
 #include "test/util/mount_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/proc_util.h"
+#include "test/util/save_util.h"
+#include "test/util/signal_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -89,7 +102,6 @@
 // way to get it tested on both gVisor, PTrace and Linux.
 
 using ::testing::AllOf;
-using ::testing::AnyOf;
 using ::testing::ContainerEq;
 using ::testing::Contains;
 using ::testing::ContainsRegex;
@@ -438,6 +450,147 @@ TEST(ProcTest, NotFoundInRoot) {
   EXPECT_THAT(stat("/proc/foobar", &s), SyscallFailsWithErrno(ENOENT));
 }
 
+TEST(ProcTest, Create) {
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/null", O_RDONLY));
+  const auto check = [&] {
+    for (const char* parent :
+         {"/proc", "/proc/self", "/proc/thread-self", "/proc/self/task",
+          "/proc/self/fd", "/proc/self/fdinfo", "/proc/sys", "/proc/sys/kernel",
+          "/proc/fs"}) {
+      SCOPED_TRACE(parent);
+      for (const std::string& name : {std::string("nonexistent-create"),
+                                      std::string(NAME_MAX + 1, 'x')}) {
+        SCOPED_TRACE(name);
+        const std::string missing = JoinPath(parent, name);
+        EXPECT_THAT(mkdir(missing.c_str(), 0700),
+                    SyscallFailsWithErrno(ENOENT));
+        EXPECT_THAT(symlink("target", missing.c_str()),
+                    SyscallFailsWithErrno(ENOENT));
+        EXPECT_THAT(mknod(missing.c_str(), S_IFIFO | 0600, 0),
+                    SyscallFailsWithErrno(ENOENT));
+        EXPECT_THAT(Open(missing, O_CREAT | O_RDONLY, 0600),
+                    PosixErrorIs(ENOENT));
+        EXPECT_THAT(Open(missing, O_RDONLY), PosixErrorIs(ENOENT));
+        EXPECT_THAT(mkdir(absl::StrCat(missing, "/").c_str(), 0700),
+                    SyscallFailsWithErrno(ENOENT));
+        EXPECT_THAT(mkdir(JoinPath(missing, "child").c_str(), 0700),
+                    SyscallFailsWithErrno(ENOENT));
+      }
+      EXPECT_THAT(mkdir(JoinPath(parent, ".").c_str(), 0700),
+                  SyscallFailsWithErrno(EEXIST));
+      EXPECT_THAT(mkdir(JoinPath(parent, "..").c_str(), 0700),
+                  SyscallFailsWithErrno(EEXIST));
+    }
+    // Existing directories, files, and symlinks fail with EEXIST, whether or
+    // not they have already been looked up or the path has a trailing slash.
+    for (const std::string& existing :
+         {std::string("/proc/self"), std::string("/proc/version"),
+          std::string("/proc/self/status"), std::string("/proc/self/exe"),
+          absl::StrCat("/proc/self/task/", getpid()),
+          absl::StrCat("/proc/self/fd/", fd.get()),
+          absl::StrCat("/proc/self/fdinfo/", fd.get())}) {
+      SCOPED_TRACE(existing);
+      EXPECT_THAT(mkdir(existing.c_str(), 0700), SyscallFailsWithErrno(EEXIST));
+      EXPECT_THAT(symlink("target", existing.c_str()),
+                  SyscallFailsWithErrno(EEXIST));
+      EXPECT_THAT(mknod(existing.c_str(), S_IFIFO | 0600, 0),
+                  SyscallFailsWithErrno(EEXIST));
+      EXPECT_THAT(Open(existing, O_CREAT | O_EXCL | O_RDONLY, 0600),
+                  PosixErrorIs(EEXIST));
+      EXPECT_THAT(mkdir(absl::StrCat(existing, "/").c_str(), 0700),
+                  SyscallFailsWithErrno(EEXIST));
+    }
+  };
+  check();
+  // O_CREAT without O_EXCL still opens an existing file.
+  EXPECT_NO_ERRNO(Open("/proc/version", O_CREAT | O_RDONLY, 0600));
+  // A missing procfs child fails lookup before the parent's write permissions
+  // are checked.
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+  SCOPED_TRACE("without DAC capabilities");
+  check();
+}
+
+TEST(ProcTest, LinkDestinationLookup) {
+  const auto outside = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const std::string missing = "/proc/nonexistent-create";
+
+  // The source exists but cannot be linked: it is either on a different
+  // mount or a directory. Linux still reports the destination lookup first.
+  for (const std::string& source :
+       {outside.path(), std::string("/proc/self/task")}) {
+    SCOPED_TRACE(source);
+    EXPECT_THAT(link(source.c_str(), missing.c_str()),
+                SyscallFailsWithErrno(ENOENT));
+    EXPECT_THAT(link(source.c_str(), "/proc/version"),
+                SyscallFailsWithErrno(EEXIST));
+  }
+}
+
+TEST(ProcTest, LinkAndRenameMissing) {
+  struct statvfs st;
+  ASSERT_THAT(statvfs("/proc", &st), SyscallSucceeds());
+  SKIP_IF(st.f_flag & ST_RDONLY);  // rename checks for a writable mount first.
+  const std::string source = "/proc/self/status";
+
+  // Even without write access to the directory, the missing destination
+  // fails lookup before link or rename can modify it.
+  AutoCapability cap(CAP_DAC_OVERRIDE, false);
+  for (const std::string& name :
+       {std::string("nonexistent-create"), std::string(NAME_MAX + 1, 'x')}) {
+    SCOPED_TRACE(name);
+    const std::string missing = JoinPath("/proc", name);
+    EXPECT_THAT(link(source.c_str(), missing.c_str()),
+                SyscallFailsWithErrno(ENOENT));
+    EXPECT_THAT(rename(source.c_str(), missing.c_str()),
+                SyscallFailsWithErrno(ENOENT));
+  }
+
+  // RENAME_NOREPLACE rejects an existing destination before write checks.
+  const std::string version = "/proc/version";
+  EXPECT_THAT(renameat2(AT_FDCWD, source.c_str(), AT_FDCWD, version.c_str(),
+                        RENAME_NOREPLACE),
+              SyscallFailsWithErrno(EEXIST));
+  EXPECT_THAT(rename(source.c_str(), source.c_str()), SyscallSucceeds());
+  // The proc root denies removal of version before the destination's
+  // immutable PID directory would reject a write.
+  EXPECT_THAT(rename(version.c_str(), source.c_str()),
+              SyscallFailsWithErrno(EACCES));
+}
+
+TEST(ProcTest, CreateReadOnly) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // Bind a proc directory so this also works in a user namespace that
+  // does not own the current PID namespace and cannot mount a new procfs.
+  const auto bind = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("/proc/self", dir.path(), "", MS_BIND, "", 0));
+  ASSERT_THAT(
+      mount(nullptr, dir.path().c_str(), nullptr,
+            MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+            nullptr),
+      SyscallSucceeds());
+
+  for (const auto& [name, err] :
+       {std::pair{"nonexistent-create", ENOENT}, std::pair{"status", EEXIST}}) {
+    SCOPED_TRACE(name);
+    const std::string path = JoinPath(dir.path(), name);
+    EXPECT_THAT(mkdir(path.c_str(), 0700), SyscallFailsWithErrno(err));
+    EXPECT_THAT(symlink("target", path.c_str()), SyscallFailsWithErrno(err));
+    EXPECT_THAT(mknod(path.c_str(), S_IFIFO | 0600, 0),
+                SyscallFailsWithErrno(err));
+    EXPECT_THAT(Open(path, O_CREAT | O_EXCL | O_RDONLY, 0600),
+                PosixErrorIs(err));
+  }
+
+  // Unlike creation, rename needs a writable mount before final lookup.
+  EXPECT_THAT(rename(JoinPath(dir.path(), "status").c_str(),
+                     JoinPath(dir.path(), "nonexistent-create").c_str()),
+              SyscallFailsWithErrno(EROFS));
+}
+
 TEST(ProcSelfTest, IsThreadGroupLeader) {
   ScopedThread([] {
     const pid_t tgid = getpid();
@@ -528,9 +681,24 @@ TEST(ProcSelfAuxv, EntryPresence) {
   EXPECT_EQ(auxv_entries.count(AT_SECURE), 1);
   EXPECT_EQ(auxv_entries.count(AT_CLKTCK), 1);
   EXPECT_EQ(auxv_entries.count(AT_RANDOM), 1);
+  EXPECT_EQ(auxv_entries.count(AT_PLATFORM), 1);
   EXPECT_EQ(auxv_entries.count(AT_EXECFN), 1);
   EXPECT_EQ(auxv_entries.count(AT_PAGESZ), 1);
   EXPECT_EQ(auxv_entries.count(AT_SYSINFO_EHDR), 1);
+}
+
+TEST(ProcSelfAuxv, Platform) {
+  auto auxv_entries = ASSERT_NO_ERRNO_AND_VALUE(ReadProcSelfAuxv());
+  ASSERT_EQ(auxv_entries.count(AT_PLATFORM), 1);
+  const char* platform =
+      reinterpret_cast<const char*>(auxv_entries[AT_PLATFORM]);
+#if defined(__x86_64__)
+  EXPECT_STREQ(platform, "x86_64");
+#elif defined(__aarch64__)
+  EXPECT_STREQ(platform, "aarch64");
+#else
+  FAIL() << "unknown architecture";
+#endif
 }
 
 TEST(ProcSelfAuxv, EntryValues) {
@@ -1004,7 +1172,7 @@ TEST(ProcSelfMaps, Basic) {
   std::vector<std::string> stacks;
   // Make sure there's a stack in there.
   for (const auto& str : strings) {
-    if (str.find("[stack]") != std::string::npos) {
+    if (absl::StrContains(str, "[stack]")) {
       stacks.push_back(str);
     }
   }
@@ -1107,7 +1275,7 @@ TEST(ProcSelfMaps, MapUnmap) {
 TEST(ProcSelfMaps, Mprotect) {
   // FIXME(jamieliu): Linux's mprotect() sometimes fails to merge VMAs in this
   // case.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
 
   // Reserve 5 pages of address space.
   Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
@@ -1318,6 +1486,21 @@ TEST(ProcSelfFd, GetdentsDuplicates) {
 // This is a regression test for gvisor.dev/issues/3894
 TEST(ProcSelfFdInfo, GetdentsDuplicates) {
   CheckFdDirGetdentsDuplicates("/proc/self/fdinfo");
+}
+
+TEST(ProcSelfFd, NoncanonicalNames) {
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/null", O_RDONLY));
+  for (const char* dir : {"/proc/self/fd/", "/proc/self/fdinfo/"}) {
+    struct stat st;
+    ASSERT_THAT(lstat(absl::StrCat(dir, fd.get()).c_str(), &st),
+                SyscallSucceeds());
+    for (const char* prefix : {"0", "+"}) {
+      const std::string path = absl::StrCat(dir, prefix, fd.get());
+      SCOPED_TRACE(path);
+      EXPECT_THAT(lstat(path.c_str(), &st), SyscallFailsWithErrno(ENOENT));
+    }
+  }
 }
 
 TEST(ProcSelfFdInfo, CorrectFds) {
@@ -1656,15 +1839,20 @@ TEST(ProcLoadavg, Fields) {
   EXPECT_EQ(fields.size(), 6) << proc_loadvg;
 
   double val;
-  uint64_t val2;
   // First three fields are floating point numbers.
   EXPECT_TRUE(absl::SimpleAtod(fields[0], &val)) << proc_loadvg;
   EXPECT_TRUE(absl::SimpleAtod(fields[1], &val)) << proc_loadvg;
   EXPECT_TRUE(absl::SimpleAtod(fields[2], &val)) << proc_loadvg;
   // Rest of the fields are valid base 10 numbers.
-  EXPECT_TRUE(absl::SimpleAtoi(fields[3], &val2)) << proc_loadvg;
-  EXPECT_TRUE(absl::SimpleAtoi(fields[4], &val2)) << proc_loadvg;
-  EXPECT_TRUE(absl::SimpleAtoi(fields[5], &val2)) << proc_loadvg;
+  uint64_t running_tasks = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[3], &running_tasks)) << proc_loadvg;
+  EXPECT_GE(running_tasks, 1) << proc_loadvg;
+  uint64_t total_tasks = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[4], &total_tasks)) << proc_loadvg;
+  EXPECT_GE(total_tasks, running_tasks) << proc_loadvg;
+  uint64_t last_tid = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[5], &last_tid)) << proc_loadvg;
+  EXPECT_GE(last_tid, 1) << proc_loadvg;
 }
 
 // NOTE: Tests in priority.cc also check certain priority related fields in
@@ -1727,6 +1915,45 @@ TEST_P(ProcPidStatTest, HasBasicFields) {
 
 INSTANTIATE_TEST_SUITE_P(SelfAndNumericPid, ProcPidStatTest,
                          ::testing::Values("self", absl::StrCat(getpid())));
+
+// PF_EXITING from include/linux/sched.h.
+constexpr uint64_t kPFExiting = 0x4;
+
+TEST(ProcPidStatTest, SelfIsNotExiting) {
+  std::string proc_pid_stat =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/stat"));
+  std::vector<std::string> fields =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcPidStat(proc_pid_stat));
+  ASSERT_GE(fields.size(), 9);
+  uint64_t flags;
+  ASSERT_TRUE(absl::SimpleAtoi(fields[8], &flags));
+  EXPECT_EQ(flags & kPFExiting, 0);
+}
+
+TEST(ProcPidStatTest, ZombieIsExiting) {
+  pid_t child = fork();
+  if (child == 0) {
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  auto reap = Cleanup([child] {
+    EXPECT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+  siginfo_t info = {};
+  ASSERT_THAT(RetryEINTR(waitid)(P_PID, child, &info, WEXITED | WNOWAIT),
+              SyscallSucceeds());
+
+  std::string proc_pid_stat = ASSERT_NO_ERRNO_AND_VALUE(
+      GetContents(absl::StrCat("/proc/", child, "/stat")));
+  std::vector<std::string> fields =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcPidStat(proc_pid_stat));
+  ASSERT_GE(fields.size(), 9);
+  EXPECT_EQ("Z", fields[2]);
+  uint64_t flags;
+  ASSERT_TRUE(absl::SimpleAtoi(fields[8], &flags));
+  EXPECT_NE(flags & kPFExiting, 0);
+}
 
 using ProcPidStatmTest = ::testing::TestWithParam<std::string>;
 
@@ -1890,6 +2117,27 @@ TEST(ParseProcStatusTest, DetectsMissingTabs) {
                                                           Pair("Pid: 1", ""))));
 }
 
+// Returns the 64-bit signal mask rendered in the given /proc/[pid]/status
+// field.
+PosixErrorOr<uint64_t> ProcStatusSignalMask(
+    const absl::btree_map<std::string, std::string>& status,
+    const std::string& field) {
+  auto it = status.find(field);
+  if (it == status.end()) {
+    return PosixError(EINVAL, absl::StrCat("no \"", field, "\" line"));
+  }
+  if (it->second.size() != 16) {
+    return PosixError(EINVAL, absl::StrCat(field, " value \"", it->second,
+                                           "\" is not a 16-digit hex mask"));
+  }
+  uint64_t mask;
+  if (!absl::SimpleHexAtoi(it->second, &mask)) {
+    return PosixError(EINVAL, absl::StrCat("failed to parse ", field,
+                                           " value \"", it->second, "\""));
+  }
+  return mask;
+}
+
 TEST(ProcPidStatusTest, HasBasicFields) {
   // Do this on a separate thread since we want tgid != tid.
   ScopedThread([] {
@@ -1935,6 +2183,120 @@ TEST(ProcPidStatusTest, HasBasicFields) {
             Pair("Groups", StartsWith(absl::StrJoin(supplementary_gids, " "))),
         }));
   });
+}
+
+TEST(ProcPidStatusTest, InvalidCloseDoesNotGrowFDTable) {
+  // Restoring a checkpoint may change the FD table's capacity.
+  const DisableSave disable_save;
+  const std::string before_str =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/status"));
+  const auto before = ASSERT_NO_ERRNO_AND_VALUE(ParseProcStatus(before_str));
+  const auto fd_size = before.find("FDSize");
+  ASSERT_NE(fd_size, before.end());
+
+  EXPECT_THAT(close(INT_MAX), SyscallFailsWithErrno(EBADF));
+
+  const std::string after_str =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/status"));
+  EXPECT_THAT(
+      ParseProcStatus(after_str),
+      IsPosixErrorOkAndHolds(Contains(Pair("FDSize", fd_size->second))));
+}
+
+TEST(ProcPidStatusTest, NoNewPrivs) {
+  // no_new_privs is per-thread and cannot be cleared once set, so exercise it
+  // on a scratch thread to avoid contaminating the main thread.
+  ScopedThread([] {
+    const pid_t tid = syscall(SYS_gettid);
+
+    // The NoNewPrivs line must reflect prctl(PR_GET_NO_NEW_PRIVS).
+    int nnp;
+    ASSERT_THAT(nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0),
+                SyscallSucceeds());
+    std::string status_str = ASSERT_NO_ERRNO_AND_VALUE(
+        GetContents(absl::StrCat("/proc/", tid, "/status")));
+    EXPECT_THAT(ParseProcStatus(status_str),
+                IsPosixErrorOkAndHolds(
+                    Contains(Pair("NoNewPrivs", absl::StrCat(nnp)))));
+
+    // Setting the bit must be reflected in this thread's status file.
+    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
+    status_str = ASSERT_NO_ERRNO_AND_VALUE(
+        GetContents(absl::StrCat("/proc/", tid, "/status")));
+    EXPECT_THAT(ParseProcStatus(status_str),
+                IsPosixErrorOkAndHolds(Contains(Pair("NoNewPrivs", "1"))));
+  });
+}
+
+TEST(ProcPidStatusTest, SignalMasks) {
+  const uint64_t kHup = 1ULL << (SIGHUP - 1);
+  const uint64_t kUsr1 = 1ULL << (SIGUSR1 - 1);
+  const uint64_t kUsr2 = 1ULL << (SIGUSR2 - 1);
+  const uint64_t kTerm = 1ULL << (SIGTERM - 1);
+  const uint64_t kWinch = 1ULL << (SIGWINCH - 1);
+
+  // Signal handlers are process-wide, so restore them when done.
+  struct sigaction sa = {};
+  sa.sa_handler = +[](int signo) {};
+  const auto term_cleanup =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGTERM, sa));
+  const auto hup_cleanup =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGHUP, sa));
+  const auto usr1_cleanup =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGUSR1, sa));
+  sa.sa_handler = SIG_IGN;
+  const auto usr2_cleanup =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGUSR2, sa));
+  sa.sa_handler = SIG_DFL;
+  const auto winch_cleanup =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGWINCH, sa));
+
+  // Block SIGUSR1 and SIGHUP, then queue a thread-directed SIGUSR1 and a
+  // process-directed SIGHUP, so that each shows up only in its own pending
+  // mask.
+  sigset_t blocked;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGUSR1);
+  sigaddset(&blocked, SIGHUP);
+  const auto mask_cleanup =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSignalMask(SIG_BLOCK, blocked));
+  const pid_t pid = getpid();
+  const pid_t tid = syscall(SYS_gettid);
+  ASSERT_THAT(tgkill(pid, tid, SIGUSR1), SyscallSucceeds());
+  ASSERT_THAT(kill(pid, SIGHUP), SyscallSucceeds());
+
+  const std::string status_str = ASSERT_NO_ERRNO_AND_VALUE(
+      GetContents(absl::StrCat("/proc/", tid, "/status")));
+  const auto status = ASSERT_NO_ERRNO_AND_VALUE(ParseProcStatus(status_str));
+  const uint64_t sig_pnd =
+      ASSERT_NO_ERRNO_AND_VALUE(ProcStatusSignalMask(status, "SigPnd"));
+  const uint64_t shd_pnd =
+      ASSERT_NO_ERRNO_AND_VALUE(ProcStatusSignalMask(status, "ShdPnd"));
+  const uint64_t sig_blk =
+      ASSERT_NO_ERRNO_AND_VALUE(ProcStatusSignalMask(status, "SigBlk"));
+  const uint64_t sig_ign =
+      ASSERT_NO_ERRNO_AND_VALUE(ProcStatusSignalMask(status, "SigIgn"));
+  const uint64_t sig_cgt =
+      ASSERT_NO_ERRNO_AND_VALUE(ProcStatusSignalMask(status, "SigCgt"));
+
+  EXPECT_EQ(sig_pnd & (kUsr1 | kHup), kUsr1);
+  EXPECT_EQ(shd_pnd & (kUsr1 | kHup), kHup);
+  EXPECT_EQ(sig_blk & (kUsr1 | kHup), kUsr1 | kHup);
+  EXPECT_EQ(sig_ign & (kUsr1 | kUsr2 | kHup | kTerm | kWinch), kUsr2);
+  EXPECT_EQ(sig_cgt & (kUsr1 | kUsr2 | kHup | kTerm | kWinch),
+            kUsr1 | kHup | kTerm);
+
+  // Consume both queued signals before the mask is restored.
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  const struct timespec zero = {0, 0};
+  EXPECT_THAT(sigtimedwait(&set, nullptr, &zero),
+              SyscallSucceedsWithValue(SIGUSR1));
+  sigemptyset(&set);
+  sigaddset(&set, SIGHUP);
+  EXPECT_THAT(sigtimedwait(&set, nullptr, &zero),
+              SyscallSucceedsWithValue(SIGHUP));
 }
 
 TEST(ProcPidStatusTest, StateRunning) {
@@ -2069,6 +2431,84 @@ TEST(ProcPidStatTest, VmStats) {
   EXPECT_TRUE(IsDigits(data_str.substr(0, data_str.length() - 3))) << data_str;
   // ... which is not 0.
   EXPECT_NE('0', data_str[0]);
+}
+
+// Hold /proc/[pid]/stat open across reap; a successful read must not start
+// with pid 0.
+TEST(ProcPidStatTest, ReapedTaskNeverReportsPIDZero) {
+  const DisableSave ds;  // Too many syscalls.
+
+  std::atomic<bool> stop = false;
+  std::atomic<bool> reported_zero = false;
+  std::atomic<pid_t> current = 0;
+  auto scan = [&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      pid_t pid = current.load(std::memory_order_relaxed);
+      if (pid <= 0) {
+        continue;
+      }
+      auto contents = GetContents(absl::StrCat("/proc/", pid, "/stat"));
+      if (!contents.ok()) {
+        continue;
+      }
+      if (absl::StartsWith(contents.ValueOrDie(), "0 ")) {
+        reported_zero.store(true, std::memory_order_relaxed);
+      }
+    }
+  };
+  ScopedThread reader1(scan);
+  ScopedThread reader2(scan);
+  ScopedThread reader3(scan);
+  ScopedThread reader4(scan);
+  // Stop the readers before they are joined, including on a failed assertion.
+  auto stop_readers =
+      Cleanup([&] { stop.store(true, std::memory_order_relaxed); });
+
+  constexpr int kChildrenPerBatch = 64;
+  for (int batch = 0; batch < 32; ++batch) {
+    std::vector<pid_t> children;
+    std::vector<FileDescriptor> fds;
+    children.reserve(kChildrenPerBatch);
+    for (int i = 0; i < kChildrenPerBatch; ++i) {
+      pid_t child = fork();
+      if (child == 0) {
+        _exit(0);
+      }
+      ASSERT_THAT(child, SyscallSucceeds());
+      children.push_back(child);
+      current.store(child, std::memory_order_relaxed);
+      auto fd = Open(absl::StrCat("/proc/", child, "/stat"), O_RDONLY);
+      if (fd.ok()) {
+        fds.push_back(std::move(fd).ValueOrDie());
+      }
+    }
+    for (pid_t child : children) {
+      siginfo_t info = {};
+      ASSERT_THAT(RetryEINTR(waitid)(P_PID, child, &info, WEXITED | WNOWAIT),
+                  SyscallSucceeds());
+    }
+    for (pid_t child : children) {
+      ASSERT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                  SyscallSucceedsWithValue(child));
+    }
+    char buf[256];
+    for (auto& live : fds) {
+      const ssize_t n = pread(live.get(), buf, sizeof(buf) - 1, 0);
+      if (n < 0) {
+        EXPECT_TRUE(errno == ESRCH || errno == ENOENT) << errno;
+        continue;
+      }
+      buf[n] = '\0';
+      EXPECT_FALSE(absl::StartsWith(buf, "0 ")) << buf;
+    }
+  }
+
+  stop_readers.Release()();
+  reader1.Join();
+  reader2.Join();
+  reader3.Join();
+  reader4.Join();
+  EXPECT_FALSE(reported_zero.load(std::memory_order_relaxed));
 }
 
 // Parse an array of NUL-terminated char* arrays, returning a vector of
@@ -2466,6 +2906,24 @@ TEST(ProcTask, Basic) {
       DirContains("/proc/self/task", {".", "..", absl::StrCat(getpid())}, {}));
 }
 
+TEST(ProcTask, InvalidTaskNames) {
+  const std::string invalid_names[] = {
+      absl::StrCat("0", getpid()),
+      absl::StrCat((uint64_t{1} << 32) + getpid()),
+      "2147483648",
+      "4294967295",
+      "18446744073709551616",
+  };
+  for (const std::string& name : invalid_names) {
+    for (const char* dir : {"/proc/", "/proc/self/task/"}) {
+      const std::string path = absl::StrCat(dir, name);
+      SCOPED_TRACE(path);
+      struct stat st;
+      EXPECT_THAT(stat(path.c_str(), &st), SyscallFailsWithErrno(ENOENT));
+    }
+  }
+}
+
 // Helper class for creating a new task in the current thread group.
 class BlockingChild {
  public:
@@ -2619,6 +3077,128 @@ TEST(ProcTask, VerifyTaskChildren) {
     expectedContent = absl::StrCat(pid2, " ", pid1, " ");
   }
   EXPECT_EQ(expectedContent, proc_children_file);
+}
+
+// A child reaped while this file is generated must be omitted, never TID 0.
+TEST(ProcTask, VerifyTaskChildrenNeverReportsZeroTID) {
+  const DisableSave ds;  // Too many syscalls.
+  const std::string path = JoinPath("/proc", absl::StrCat(getpid()), "task",
+                                    absl::StrCat(gettid()), "children");
+
+  std::atomic<bool> stop = false;
+  std::atomic<bool> reported_zero = false;
+  auto scan = [&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      auto contents = GetContents(path);
+      if (!contents.ok()) {
+        continue;
+      }
+      for (absl::string_view tid :
+           absl::StrSplit(contents.ValueOrDie(), ' ', absl::SkipWhitespace())) {
+        if (tid == "0") {
+          reported_zero.store(true, std::memory_order_relaxed);
+        }
+      }
+    }
+  };
+  ScopedThread reader1(scan);
+  ScopedThread reader2(scan);
+  ScopedThread reader3(scan);
+  ScopedThread reader4(scan);
+  // Stop the readers before they are joined, including on a failed assertion.
+  auto stop_readers =
+      Cleanup([&] { stop.store(true, std::memory_order_relaxed); });
+
+  constexpr int kChildrenPerBatch = 64;
+  for (int batch = 0; batch < 32; ++batch) {
+    std::vector<pid_t> children;
+    children.reserve(kChildrenPerBatch);
+    for (int i = 0; i < kChildrenPerBatch; ++i) {
+      pid_t child = fork();
+      if (child == 0) {
+        _exit(0);
+      }
+      ASSERT_THAT(child, SyscallSucceeds());
+      children.push_back(child);
+    }
+
+    // Ensure all children are zombies, then reap the whole batch while readers
+    // repeatedly snapshot children and resolve each snapshot's TID.
+    for (pid_t child : children) {
+      siginfo_t info = {};
+      ASSERT_THAT(RetryEINTR(waitid)(P_PID, child, &info, WEXITED | WNOWAIT),
+                  SyscallSucceeds());
+    }
+    for (pid_t child : children) {
+      ASSERT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                  SyscallSucceedsWithValue(child));
+    }
+  }
+
+  stop_readers.Release()();
+  reader1.Join();
+  reader2.Join();
+  reader3.Join();
+  reader4.Join();
+  EXPECT_FALSE(reported_zero.load(std::memory_order_relaxed));
+}
+
+// Concurrent readdir(/proc) while reaping must never list a "0" dirent.
+TEST(ProcTask, ProcRootNeverListsZeroTID) {
+  const DisableSave ds;  // Too many syscalls.
+
+  std::atomic<bool> stop = false;
+  std::atomic<bool> listed_zero = false;
+  auto scan = [&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      auto contents = ListDir("/proc", false);
+      if (!contents.ok()) {
+        continue;
+      }
+      for (const auto& name : contents.ValueOrDie()) {
+        if (name == "0") {
+          listed_zero.store(true, std::memory_order_relaxed);
+        }
+      }
+    }
+  };
+  ScopedThread reader1(scan);
+  ScopedThread reader2(scan);
+  ScopedThread reader3(scan);
+  ScopedThread reader4(scan);
+  // Stop the readers before they are joined, including on a failed assertion.
+  auto stop_readers =
+      Cleanup([&] { stop.store(true, std::memory_order_relaxed); });
+
+  constexpr int kChildrenPerBatch = 64;
+  for (int batch = 0; batch < 32; ++batch) {
+    std::vector<pid_t> children;
+    children.reserve(kChildrenPerBatch);
+    for (int i = 0; i < kChildrenPerBatch; ++i) {
+      pid_t child = fork();
+      if (child == 0) {
+        _exit(0);
+      }
+      ASSERT_THAT(child, SyscallSucceeds());
+      children.push_back(child);
+    }
+    for (pid_t child : children) {
+      siginfo_t info = {};
+      ASSERT_THAT(RetryEINTR(waitid)(P_PID, child, &info, WEXITED | WNOWAIT),
+                  SyscallSucceeds());
+    }
+    for (pid_t child : children) {
+      ASSERT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                  SyscallSucceedsWithValue(child));
+    }
+  }
+
+  stop_readers.Release()();
+  reader1.Join();
+  reader2.Join();
+  reader3.Join();
+  reader4.Join();
+  EXPECT_FALSE(listed_zero.load(std::memory_order_relaxed));
 }
 
 TEST(ProcTask, TaskDirCannotBeDeleted) {
@@ -2879,6 +3459,337 @@ TEST(ProcSysKernelRandomUuid, DifferentEveryTime) {
   EXPECT_NE(uuid1, uuid2);
 }
 
+constexpr char kMaxUserNamespaces[] = "/proc/sys/user/max_user_namespaces";
+
+// Writes the whole of data to path, aborting the process on failure.
+void WriteFileOrDie(const char* path, const char* data, size_t len) {
+  int fd = open(path, O_WRONLY);
+  TEST_PCHECK(fd >= 0);
+  TEST_PCHECK(write(fd, data, len) == static_cast<ssize_t>(len));
+  TEST_PCHECK(close(fd) == 0);
+}
+
+// Sets the max_user_namespaces limit of the calling process's own user
+// namespace to `limit`.
+void SetMaxUserNamespacesOrDie(const char* limit) {
+  WriteFileOrDie(kMaxUserNamespaces, limit, strlen(limit));
+}
+
+// Installs uid/gid maps for the user namespace of the process whose /proc
+// directory is `proc_dir` (e.g. "/proc/self").
+void MapUserNamespaceOrDie(const char* proc_dir, const char* uid_map,
+                           const char* gid_map) {
+  char path[64];
+  snprintf(path, sizeof(path), "%s/uid_map", proc_dir);
+  WriteFileOrDie(path, uid_map, strlen(uid_map));
+  snprintf(path, sizeof(path), "%s/setgroups", proc_dir);
+  WriteFileOrDie(path, "deny", 4);
+  snprintf(path, sizeof(path), "%s/gid_map", proc_dir);
+  WriteFileOrDie(path, gid_map, strlen(gid_map));
+}
+
+// Forks a child that enters a new user namespace, maps that namespace from
+// the calling process (in the parent namespace), then runs fn in the child.
+// Returns the child's pid.
+template <typename F>
+pid_t ForkInMappedUserNamespace(const char* uid_map, const char* gid_map,
+                                F fn) {
+  int ready[2], go[2];
+  TEST_PCHECK(pipe(ready) == 0);
+  TEST_PCHECK(pipe(go) == 0);
+  pid_t child = fork();
+  TEST_PCHECK(child >= 0);
+  if (child == 0) {
+    TEST_PCHECK(close(ready[0]) == 0);
+    TEST_PCHECK(close(go[1]) == 0);
+    TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+    TEST_PCHECK(close(ready[1]) == 0);  // namespace created
+    char x;
+    RetryEINTR(read)(go[0], &x, 1);  // wait until mapped
+    TEST_PCHECK(close(go[0]) == 0);
+    fn();
+    _exit(0);
+  }
+  TEST_PCHECK(close(ready[1]) == 0);
+  TEST_PCHECK(close(go[0]) == 0);
+  char c;
+  TEST_PCHECK(RetryEINTR(read)(ready[0], &c, 1) == 0);
+  TEST_PCHECK(close(ready[0]) == 0);
+
+  char proc_dir[32];
+  snprintf(proc_dir, sizeof(proc_dir), "/proc/%d", child);
+  MapUserNamespaceOrDie(proc_dir, uid_map, gid_map);
+
+  TEST_PCHECK(close(go[1]) == 0);  // release child
+  return child;
+}
+
+// Waits for child and aborts unless it exited with status 0.
+void WaitForSuccessOrDie(pid_t child) {
+  int status;
+  TEST_PCHECK(RetryEINTR(waitpid)(child, &status, 0) == child);
+  TEST_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+TEST(ProcSysUserMaxUserNamespaces, Exists) {
+  EXPECT_THAT(open(kMaxUserNamespaces, O_RDONLY), SyscallSucceeds());
+}
+
+TEST(ProcSysUserMaxUserNamespaces, HasNumericValue) {
+  const std::string val_str =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kMaxUserNamespaces));
+  int64_t val;
+  EXPECT_TRUE(absl::SimpleAtoi(val_str, &val))
+      << "/proc/sys/user/max_user_namespaces does not contain a numeric value: "
+      << val_str;
+  EXPECT_GT(val, 0);
+}
+
+// The file advertises 0644.
+TEST(ProcSysUserMaxUserNamespaces, HasRegularFileMode) {
+  struct stat st;
+  ASSERT_THAT(stat(kMaxUserNamespaces, &st), SyscallSucceeds());
+  EXPECT_TRUE(S_ISREG(st.st_mode));
+  EXPECT_EQ(st.st_mode & 07777, static_cast<mode_t>(0644));
+
+  EXPECT_THAT(access(kMaxUserNamespaces, R_OK), SyscallSucceeds());
+  EXPECT_THAT(access(kMaxUserNamespaces, X_OK), SyscallFailsWithErrno(EACCES));
+}
+
+// Writing the limit in a fresh user namespace reads back unchanged.
+TEST(ProcSysUserMaxUserNamespaces, WriteUpdatesValue) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                MaybeSave();
+
+                SetMaxUserNamespacesOrDie("42");
+
+                int rfd = open(kMaxUserNamespaces, O_RDONLY);
+                TEST_PCHECK(rfd >= 0);
+                char buf[32] = {};
+                TEST_PCHECK(read(rfd, buf, sizeof(buf) - 1) >= 2);
+                TEST_PCHECK(close(rfd) == 0);
+                TEST_PCHECK(buf[0] == '4' && buf[1] == '2');
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// A negative limit is rejected.
+TEST(ProcSysUserMaxUserNamespaces, RejectsNegativeValue) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                MaybeSave();
+
+                int fd = open(kMaxUserNamespaces, O_WRONLY);
+                TEST_PCHECK(fd >= 0);
+                TEST_CHECK_ERRNO(write(fd, "-1", 2), EINVAL);
+                TEST_PCHECK(close(fd) == 0);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// The limit belongs to a user namespace rather than to the file.
+TEST(ProcSysUserMaxUserNamespaces, WriteRequiresCapSysResource) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                MaybeSave();
+
+                int fd = open(kMaxUserNamespaces, O_WRONLY);
+                TEST_PCHECK(fd >= 0);
+                TEST_PCHECK(close(fd) == 0);
+
+                TEST_CHECK_NO_ERRNO(DropPermittedCapability(CAP_SYS_RESOURCE));
+
+                TEST_CHECK_ERRNO(open(kMaxUserNamespaces, O_WRONLY), EACCES);
+                TEST_CHECK_ERRNO(open(kMaxUserNamespaces, O_RDWR), EACCES);
+
+                // Reading needs no capability.
+                fd = open(kMaxUserNamespaces, O_RDONLY);
+                TEST_PCHECK(fd >= 0);
+                TEST_PCHECK(close(fd) == 0);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// Every user namespace carries its own limit, so setting it in a child
+// namespace leaves the parent alone.
+TEST(ProcSysUserMaxUserNamespaces, WriteDoesNotAffectParentNamespace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  const std::string before =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kMaxUserNamespaces));
+
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                MaybeSave();
+                SetMaxUserNamespacesOrDie("7");
+              }),
+              IsPosixErrorOkAndHolds(0));
+
+  const std::string after =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kMaxUserNamespaces));
+  EXPECT_EQ(after, before);
+}
+
+// With the limit at zero, creating a nested user namespace must fail.
+TEST(ProcSysUserMaxUserNamespaces, LimitBlocksNestedUserNamespace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  const std::string uid_map = absl::StrFormat("0 %u 1", getuid());
+  const std::string gid_map = absl::StrFormat("0 %u 1", getgid());
+
+  EXPECT_THAT(InForkedProcess([&uid_map, &gid_map] {
+                WaitForSuccessOrDie(ForkInMappedUserNamespace(
+                    uid_map.c_str(), gid_map.c_str(), [] {
+                      // Forbid descendants, then the next unshare must be
+                      // ENOSPC.
+                      SetMaxUserNamespacesOrDie("0");
+                      TEST_CHECK_ERRNO(unshare(CLONE_NEWUSER), ENOSPC);
+                    }));
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// A parent namespace with a limit of one still blocks a grandchild namespace.
+TEST(ProcSysUserMaxUserNamespaces, RecursiveLimitBlocksGrandchild) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  const std::string uid_map = absl::StrFormat("0 %u 1", getuid());
+  const std::string gid_map = absl::StrFormat("0 %u 1", getgid());
+
+  EXPECT_THAT(
+      InForkedProcess([&uid_map, &gid_map] {
+        // Parent namespace A, mapped, allowing exactly one descendant.
+        TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+        MapUserNamespaceOrDie("/proc/self", uid_map.c_str(), gid_map.c_str());
+        SetMaxUserNamespacesOrDie("1");
+
+        // Child namespace B succeeds and consumes A's budget. The
+        // mapped uid in A is now 0, so map it to itself.
+        WaitForSuccessOrDie(ForkInMappedUserNamespace("0 0 1", "0 0 1", [] {
+          // The grandchild is still charged to A, whose budget is
+          // gone, so the unshare must fail with ENOSPC rather than
+          // succeeding.
+          TEST_CHECK_ERRNO(unshare(CLONE_NEWUSER), ENOSPC);
+        }));
+      }),
+      IsPosixErrorOkAndHolds(0));
+}
+
+// A namespace holds its charge against its ancestors, so the budget becomes
+// spendable again once it is gone.
+TEST(ProcSysUserMaxUserNamespaces, ExitedNamespaceReleasesCharge) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  const std::string uid_map = absl::StrFormat("0 %u 1", getuid());
+  const std::string gid_map = absl::StrFormat("0 %u 1", getgid());
+
+  EXPECT_THAT(InForkedProcess([&uid_map, &gid_map] {
+                // Namespace A, mapped, with room for a single descendant.
+                TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                MapUserNamespaceOrDie("/proc/self", uid_map.c_str(),
+                                      gid_map.c_str());
+                SetMaxUserNamespacesOrDie("1");
+
+                // Spend A's budget on a namespace that immediately goes away
+                // again.
+                int status;
+                pid_t child = fork();
+                TEST_PCHECK(child >= 0);
+                if (child == 0) {
+                  TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                  _exit(0);
+                }
+                TEST_PCHECK(RetryEINTR(waitpid)(child, &status, 0) == child);
+                TEST_PCHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+                // A namespace can outlive the last task in it: Linux frees it
+                // from a workqueue once an RCU grace period has passed, so need
+                // to poll.
+                bool reused = false;
+                for (int i = 0; i < 500 && !reused; i++) {
+                  pid_t retry = fork();
+                  TEST_PCHECK(retry >= 0);
+                  if (retry == 0) {
+                    if (unshare(CLONE_NEWUSER) == 0) {
+                      _exit(0);
+                    }
+                    _exit(errno == ENOSPC ? 1 : 2);
+                  }
+                  TEST_PCHECK(RetryEINTR(waitpid)(retry, &status, 0) == retry);
+                  TEST_PCHECK(WIFEXITED(status));
+                  TEST_CHECK_MSG(WEXITSTATUS(status) != 2,
+                                 "unshare failed, not ENOSPC");
+                  reused = WEXITSTATUS(status) == 0;
+                  if (!reused) {
+                    struct timespec ten_ms = {0, 10 * 1000 * 1000};
+                    nanosleep(&ten_ms, nullptr);
+                  }
+                }
+                TEST_CHECK(reused);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// An unshare refused because an ancestor is out of budget must not leave
+// behind the charges it took on the way to finding that out.
+TEST(ProcSysUserMaxUserNamespaces, RefusedNestingReleasesPartialCharge) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  const std::string uid_map = absl::StrFormat("0 %u 1", getuid());
+  const std::string gid_map = absl::StrFormat("0 %u 1", getgid());
+
+  EXPECT_THAT(InForkedProcess([&uid_map, &gid_map] {
+                // Namespace A, mapped, allowing exactly one descendant.
+                TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                MapUserNamespaceOrDie("/proc/self", uid_map.c_str(),
+                                      gid_map.c_str());
+                SetMaxUserNamespacesOrDie("1");
+
+                int ready[2], go[2];
+                TEST_PCHECK(pipe(ready) == 0);
+                TEST_PCHECK(pipe(go) == 0);
+                // Namespace B is A's one permitted descendant.
+                pid_t child =
+                    ForkInMappedUserNamespace("0 0 1", "0 0 1", [&ready, &go] {
+                      TEST_PCHECK(close(ready[0]) == 0);
+                      TEST_PCHECK(close(go[1]) == 0);
+
+                      // B has room of its own, so each attempt below is
+                      // charged to B before A is reached and refuses it.
+                      SetMaxUserNamespacesOrDie("2");
+                      TEST_CHECK_ERRNO(unshare(CLONE_NEWUSER), ENOSPC);
+                      TEST_CHECK_ERRNO(unshare(CLONE_NEWUSER), ENOSPC);
+
+                      TEST_PCHECK(close(ready[1]) == 0);  // ask A for room
+                      char x;
+                      RetryEINTR(read)(go[0], &x, 1);
+
+                      // Both refused attempts must have been refunded to B;
+                      // otherwise B sits at its own limit of two and this
+                      // fails with ENOSPC.
+                      TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                    });
+                TEST_PCHECK(close(ready[1]) == 0);
+                TEST_PCHECK(close(go[0]) == 0);
+                char c;
+                TEST_PCHECK(RetryEINTR(read)(ready[0], &c, 1) == 0);
+
+                // Make room in A for a descendant of B.
+                SetMaxUserNamespacesOrDie("3");
+
+                TEST_PCHECK(close(go[1]) == 0);  // release child
+                WaitForSuccessOrDie(child);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
 TEST(ProcSysVmMaxmapCount, HasNumericValue) {
   const std::string val_str =
       ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/vm/max_map_count"));
@@ -3074,47 +3985,102 @@ TEST(Proc, NoDuplicates) { CheckDuplicatesRecursively("/proc"); }
 
 // Most /proc/PID files are owned by the task user with SUID_DUMP_USER.
 TEST(ProcPid, UserDumpableOwner) {
-  int before;
-  ASSERT_THAT(before = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
-  auto cleanup = Cleanup([before] {
-    ASSERT_THAT(prctl(PR_SET_DUMPABLE, before), SyscallSucceeds());
-  });
+  // A child leaves the parent's dumpability intact even when it is
+  // SUID_DUMP_ROOT, which PR_SET_DUMPABLE cannot restore.
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER) == 0);
 
-  EXPECT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER), SyscallSucceeds());
+                // This applies to the task directory itself and files inside.
+                struct stat st;
+                TEST_PCHECK(stat("/proc/self/", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
 
-  // This applies to the task directory itself and files inside.
-  struct stat st;
-  ASSERT_THAT(stat("/proc/self/", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
-
-  ASSERT_THAT(stat("/proc/self/stat", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
+                TEST_PCHECK(stat("/proc/self/stat", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
+              }),
+              IsPosixErrorOkAndHolds(0));
 }
 
 // /proc/PID files are owned by root with SUID_DUMP_DISABLE.
 TEST(ProcPid, RootDumpableOwner) {
-  int before;
-  ASSERT_THAT(before = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
-  auto cleanup = Cleanup([before] {
-    ASSERT_THAT(prctl(PR_SET_DUMPABLE, before), SyscallSucceeds());
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_DISABLE) == 0);
+
+                // This does not apply to the task directory itself (or other
+                // 0555 directories), but does to files inside.
+                struct stat st;
+                TEST_PCHECK(stat("/proc/self/", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
+
+                // Also allow nobody in a userns without root mapped.
+                TEST_PCHECK(stat("/proc/self/stat", &st) == 0);
+                TEST_CHECK(st.st_uid == 0 || st.st_uid == 65534);
+                TEST_CHECK(st.st_gid == 0 || st.st_gid == 65534);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// Regression test for gvisor.dev/issues/15504.
+TEST(Proc, GetdentsPartialBufferSparsePids) {
+  const DisableSave ds;  // Keep the process IDs stable throughout the scan.
+  std::map<pid_t, int> children;
+  auto cleanup = Cleanup([&] {
+    for (const auto& child : children) {
+      EXPECT_THAT(RetryEINTR(waitpid)(child.first, nullptr, 0),
+                  SyscallSucceedsWithValue(child.first));
+    }
   });
 
-  EXPECT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_DISABLE), SyscallSucceeds());
+  for (int i = 0; i < 8; ++i) {
+    // Leave a gap before each child that remains visible in /proc.
+    pid_t gap = fork();
+    if (gap == 0) {
+      _exit(0);
+    }
+    ASSERT_THAT(gap, SyscallSucceeds());
+    ASSERT_THAT(RetryEINTR(waitpid)(gap, nullptr, 0),
+                SyscallSucceedsWithValue(gap));
 
-  // This *does not* applies to the task directory itself (or other 0555
-  // directories), but does to files inside.
-  struct stat st;
-  ASSERT_THAT(stat("/proc/self/", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
+    pid_t child = fork();
+    if (child == 0) {
+      _exit(0);
+    }
+    ASSERT_THAT(child, SyscallSucceeds());
+    // Retain the child, including after it becomes a zombie, until the scan
+    // finishes. Only check these PIDs, since unrelated processes may churn.
+    children.emplace(child, 0);
+  }
 
-  // This file is owned by root. Also allow nobody in case this test is running
-  // in a userns without root mapped.
-  ASSERT_THAT(stat("/proc/self/stat", &st), SyscallSucceeds());
-  EXPECT_THAT(st.st_uid, AnyOf(Eq(0), Eq(65534)));
-  EXPECT_THAT(st.st_gid, AnyOf(Eq(0), Eq(65534)));
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc", O_RDONLY | O_DIRECTORY));
+  // Force continuation across calls even with a small number of processes.
+  alignas(struct dirent) char buf[64];
+  while (true) {
+    int n;
+    ASSERT_THAT(
+        n = RetryEINTR(syscall)(SYS_getdents64, fd.get(), buf, sizeof(buf)),
+        SyscallSucceeds());
+    if (n == 0) {
+      break;
+    }
+    for (int pos = 0; pos < n;) {
+      const auto* d = reinterpret_cast<const struct dirent*>(buf + pos);
+      pid_t pid;
+      if (absl::SimpleAtoi(d->d_name, &pid)) {
+        auto child = children.find(pid);
+        if (child != children.end()) {
+          ASSERT_EQ(++child->second, 1) << "Repeated PID " << pid;
+        }
+      }
+      pos += d->d_reclen;
+    }
+  }
+  for (const auto& child : children) {
+    EXPECT_EQ(child.second, 1) << "Missing PID " << child.first;
+  }
 }
 
 TEST(Proc, GetdentsEnoent) {
@@ -3319,35 +4285,6 @@ TEST(ProcFilesystems, OverflowID) {
   EXPECT_EQ(overflowUid, defaultOverflowID);
 }
 
-TEST(ProcSysKernelKeysMax, Exists) {
-  auto maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/keys/maxkeys"));
-  int32_t mk;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &mk));
-  EXPECT_EQ(mk, 200);
-}
-
-TEST(ProcSysKernelKeysMax, InvalidMaxKeysValue) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  ASSERT_THAT(SetContents("/proc/sys/kernel/keys/maxkeys", "-1"),
-              PosixErrorIs(EINVAL));
-  auto maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/keys/maxkeys"));
-  int32_t mk;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &mk));
-  EXPECT_EQ(mk, 200);
-}
-
-TEST(ProcSysKernelKeysMax, SetMaxKeys) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  ASSERT_NO_ERRNO(SetContents("/proc/sys/kernel/keys/maxkeys", "100"));
-  auto maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/keys/maxkeys"));
-  int32_t mk;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &mk));
-  EXPECT_EQ(mk, 100);
-}
-
 TEST(ProcSysKernel, RandomizeVaSpace) {
   std::string val = ASSERT_NO_ERRNO_AND_VALUE(
       GetContents("/proc/sys/kernel/randomize_va_space"));
@@ -3360,6 +4297,60 @@ TEST(ProcSysKernel, RandomizeVaSpace) {
     // gVisor always uses full ASLR, so expect 2.
     EXPECT_EQ(randomize_va, 2);
   }
+}
+
+// Parses /proc/sys/fs/file-nr into its three fields.
+PosixErrorOr<std::vector<int64_t>> ReadFileNr() {
+  ASSIGN_OR_RETURN_ERRNO(std::string contents,
+                         GetContents("/proc/sys/fs/file-nr"));
+  std::vector<int64_t> fields;
+  for (absl::string_view f :
+       absl::StrSplit(absl::StripAsciiWhitespace(contents),
+                      absl::ByAnyChar(" \t"), absl::SkipEmpty())) {
+    int64_t v;
+    if (!absl::SimpleAtoi(f, &v)) {
+      return PosixError(EINVAL, absl::StrCat("bad file-nr field: ", f));
+    }
+    fields.push_back(v);
+  }
+  return fields;
+}
+
+TEST(ProcSysFsFileNr, TracksOpenFiles) {
+  constexpr int kNumFiles = 200;
+
+  std::vector<int64_t> before = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(before.size(), 3);
+  EXPECT_GT(before[0], 0);
+  EXPECT_EQ(before[1], 0);
+
+  std::vector<FileDescriptor> fds;
+  fds.reserve(kNumFiles);
+  for (int i = 0; i < kNumFiles; i++) {
+    fds.push_back(ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/null", O_RDONLY)));
+  }
+  std::vector<int64_t> during = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(during.size(), 3);
+  // Other processes on a shared host may open and close files concurrently,
+  // so only require that most of the new files are visible.
+  EXPECT_GE(during[0], before[0] + kNumFiles / 2);
+  EXPECT_EQ(during[1], 0);
+
+  fds.clear();
+  std::vector<int64_t> after = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(after.size(), 3);
+  EXPECT_LE(after[0], during[0] - kNumFiles / 2);
+  EXPECT_EQ(after[1], 0);
+}
+
+TEST(ProcSysFsFileNr, MaxMatchesFileMax) {
+  std::vector<int64_t> fields = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(fields.size(), 3);
+  std::string file_max =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/fs/file-max"));
+  int64_t max;
+  ASSERT_TRUE(absl::SimpleAtoi(absl::StripAsciiWhitespace(file_max), &max));
+  EXPECT_EQ(fields[2], max);
 }
 
 }  // namespace

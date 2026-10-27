@@ -15,17 +15,26 @@
 #include "test/util/test_util.h"
 
 #include <limits.h>
+#ifdef __linux__
+#include <linux/limits.h>
+#endif  // __linux__
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <ctime>
 #include <iostream>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/attributes.h"
@@ -34,8 +43,10 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "test/util/fs_util.h"
+#include "test/util/logging.h"
 #include "test/util/posix_error.h"
 
 namespace gvisor {
@@ -44,7 +55,13 @@ namespace testing {
 constexpr char kGvisorNetwork[] = "GVISOR_NETWORK";
 constexpr char kIOUringEnabled[] = "IOURING_ENABLED";
 
-bool IsRunningOnGvisor() { return GvisorPlatform() != Platform::kNative; }
+bool IsRunningOnGvisor() {
+  auto platform = GvisorPlatform();
+  if (platform == Platform::kNative || platform == Platform::kStarnix) {
+    return false;
+  }
+  return true;
+}
 
 const std::string GvisorPlatform() {
   // Set by runner.go.
@@ -124,6 +141,14 @@ PosixErrorOr<KernelVersion> GetKernelVersion() {
   utsname buf;
   RETURN_ERROR_IF_SYSCALL_FAIL(uname(&buf));
   return ParseKernelVersion(buf.release);
+}
+
+PosixErrorOr<KernelVersion> GetHostKernelVersion() {
+  const char* version_str = getenv("GVISOR_HOST_KERNEL_VERSION");
+  if (version_str && strlen(version_str) > 0) {
+    return ParseKernelVersion(version_str);
+  }
+  return GetKernelVersion();
 }
 
 std::string CPUSetToString(const cpu_set_t& set, size_t cpus) {

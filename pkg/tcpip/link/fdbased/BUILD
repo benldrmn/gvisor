@@ -46,6 +46,7 @@ go_library(
     deps = [
         "//pkg/atomicbitops",
         "//pkg/buffer",
+        "//pkg/gomaxprocs",
         "//pkg/rand",
         "//pkg/rawfile",
         "//pkg/sleep",
@@ -64,8 +65,11 @@ go_library(
 go_test(
     name = "fdbased_test",
     size = "small",
-    srcs = ["endpoint_test.go"],
-    library = ":fdbased",
+    srcs = [
+        "endpoint_test.go",
+        "processors_test.go",
+    ],
+    embed = [":fdbased"],
     deps = [
         "//pkg/buffer",
         "//pkg/rand",

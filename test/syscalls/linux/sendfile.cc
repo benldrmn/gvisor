@@ -13,25 +13,26 @@
 // limitations under the License.
 
 #include <fcntl.h>
-#include <linux/unistd.h>
 #include <sys/eventfd.h>
 #include <sys/sendfile.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 
-#include <string_view>
+#include <cerrno>
+#include <cstddef>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
-#include "test/util/signal_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
-#include "test/util/timer_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -76,7 +77,7 @@ TEST(SendFileTest, InvalidOffset) {
 }
 
 int memfd_create(const std::string& name, unsigned int flags) {
-  return syscall(__NR_memfd_create, name.c_str(), flags);
+  return syscall(SYS_memfd_create, name.c_str(), flags);
 }
 
 TEST(SendFileTest, Overflow) {
@@ -477,7 +478,7 @@ TEST(SendFileTest, SendToNotARegularFile) {
 
 TEST(SendFileTest, SendPipeWouldBlock) {
   // This test fails on Linux, likely due to a Linux bug.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   // Create temp file.
   constexpr char kData[] =
       "The fool doth think he is wise, but the wise man knows himself to be a "
@@ -525,7 +526,7 @@ TEST(SendFileTest, SendPipeEOF) {
 
 TEST(SendFileTest, SendToFullPipeReturnsEAGAIN) {
   // This test fails on Linux, likely due to a Linux bug.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   // Create and open an empty input file.
   const TempPath in_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const FileDescriptor in_fd =

@@ -24,6 +24,329 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+func newTestCubic(t *testing.T, clock *faketime.ManualClock, rtt time.Duration) *cubicState {
+	t.Helper()
+	s := stack.New(stack.Options{Clock: clock})
+	t.Cleanup(func() {
+		s.Close()
+		s.Wait()
+	})
+	snd := &sender{
+		ep: &Endpoint{stack: s},
+		TCPSenderState: TCPSenderState{
+			SndCwnd:  InitialCwnd,
+			Ssthresh: InitialSsthresh,
+		},
+	}
+	snd.ep.mu.Lock()
+	defer snd.ep.mu.Unlock()
+	snd.rtt.Lock()
+	snd.rtt.TCPRTTState.SRTT = rtt
+	snd.rtt.Unlock()
+	c := newCubicCC(snd)
+	snd.cc = c
+	return c
+}
+
+func TestCubicCongestionAvoidanceLimitsGrowth(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		pendingSegments int
+		maxGrowth       int
+	}{
+		{name: "new_credit", pendingSegments: 0, maxGrowth: 1},
+		{name: "retained_credit", pendingSegments: 4, maxGrowth: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			const rtt = 100 * time.Millisecond
+			c := newTestCubic(t, clock, rtt)
+			c.s.ep.mu.Lock()
+			defer c.s.ep.mu.Unlock()
+			c.HandleLossDetected()
+			c.s.leaveRecovery()
+			windowAfterLoss := c.s.SndCwnd
+
+			// The retained-credit case acknowledges four segments at the slow
+			// post-loss growth rate. At the later maximum rate, those credits
+			// could buy two segments, so they distinguish a stale-credit burst
+			// from the permitted one-segment increase.
+			clock.Advance(rtt)
+			c.Update(test.pendingSegments, rtt, clock.NowMonotonic())
+			// Make the time-based target much larger than the actual window.
+			// Two newly acknowledged segments may add at most one segment
+			// (RFC 9438 section 4.2). Earlier credit may add one more segment,
+			// but must not all become immediately spendable at the new rate.
+			clock.Advance(time.Minute)
+			c.Update(2, rtt, clock.NowMonotonic())
+			if got, want := c.s.SndCwnd, windowAfterLoss+test.maxGrowth; got > want {
+				t.Fatalf("2 newly acknowledged segments with %d pending credits grew cwnd from %d to %d, want <= %d", test.pendingSegments, windowAfterLoss, got, want)
+			}
+		})
+	}
+}
+
+func TestCubicCongestionAvoidanceNeedsAcknowledgments(t *testing.T) {
+	clock := faketime.NewManualClock()
+	const rtt = 100 * time.Millisecond
+	c := newTestCubic(t, clock, rtt)
+	c.s.ep.mu.Lock()
+	defer c.s.ep.mu.Unlock()
+	c.HandleLossDetected()
+	c.s.leaveRecovery()
+	clock.Advance(rtt)
+	c.Update(3, rtt, clock.NowMonotonic())
+	windowBeforeZeroACK := c.s.SndCwnd
+	creditBeforeZeroACK := c.s.SndCAAckCount
+	estimateBeforeZeroACK := c.WEst
+
+	// Advancing time raises the target, but without new ACKs neither the
+	// actual window nor the saved credit may change.
+	clock.Advance(time.Minute)
+	c.Update(0, rtt, clock.NowMonotonic())
+	if got, want := c.s.SndCwnd, windowBeforeZeroACK; got != want {
+		t.Errorf("no newly acknowledged segments: cwnd=%d, want unchanged %d", got, want)
+	}
+	if got, want := c.s.SndCAAckCount, creditBeforeZeroACK; got != want {
+		t.Errorf("no newly acknowledged segments: credit=%d, want unchanged %d", got, want)
+	}
+	if got, want := c.WEst, estimateBeforeZeroACK; got != want {
+		t.Errorf("no newly acknowledged segments: Reno estimate=%f, want unchanged %f", got, want)
+	}
+}
+
+func TestCubicRecoveryDiscardsACKCredit(t *testing.T) {
+	clock := faketime.NewManualClock()
+	const rtt = 100 * time.Millisecond
+	c := newTestCubic(t, clock, rtt)
+	c.s.ep.mu.Lock()
+	defer c.s.ep.mu.Unlock()
+	c.HandleLossDetected()
+	c.s.leaveRecovery()
+	clock.Advance(rtt)
+	c.Update(3, rtt, clock.NowMonotonic())
+	if got, want := c.s.SndCAAckCount, 0; got <= want {
+		t.Fatalf("cubic growth credit = %d, want > %d", got, want)
+	}
+
+	c.HandleLossDetected()
+	c.s.leaveRecovery()
+	windowAfterSecondLoss := c.s.SndCwnd
+	clock.Advance(time.Minute)
+	// One newly acknowledged segment cannot buy a segment even at the maximum growth rate.
+	// Retaining the three pre-recovery credits would incorrectly allow growth.
+	c.Update(1, rtt, clock.NowMonotonic())
+	if got, want := c.s.SndCwnd, windowAfterSecondLoss; got != want {
+		t.Fatalf("first acknowledged segment after recovery grew cwnd from %d to %d", want, got)
+	}
+}
+
+func TestCubicHyStartInitializesCongestionAvoidance(t *testing.T) {
+	clock := faketime.NewManualClock()
+	const rtt = 100 * time.Millisecond
+	c := newTestCubic(t, clock, rtt)
+	c.s.ep.mu.Lock()
+	defer c.s.ep.mu.Unlock()
+	// The next delayed RTT sample completes HyStart's sample window.
+	// Enter through Update so the test covers the transition into avoidance.
+	c.LastRTT = rtt
+	c.CurrRTT = 2 * rtt
+	c.SampleCount = nRTTSample - 1
+	clock.Advance(rtt)
+	c.Update(1, 2*rtt, clock.NowMonotonic())
+	if got, want := c.s.Ssthresh, c.s.SndCwnd; got != want {
+		t.Fatalf("HyStart threshold = %d, want current window %d", got, want)
+	}
+	if got, want := c.WMax, float64(c.s.SndCwnd); got != want {
+		t.Errorf("initial congestion-avoidance maximum = %f, want %f", got, want)
+	}
+	if got, want := c.WLastMax, float64(c.s.SndCwnd); got != want {
+		t.Errorf("initial prior window = %f, want %f", got, want)
+	}
+	if got, want := clock.NowMonotonic().Sub(c.T), time.Duration(0); got != want {
+		t.Errorf("initial congestion-avoidance epoch age = %s, want %s", got, want)
+	}
+}
+
+func TestCubicFriendlyEstimateUsesACKs(t *testing.T) {
+	estimate := func(elapsed time.Duration, packetsAcked int) float64 {
+		clock := faketime.NewManualClock()
+		const rtt = 100 * time.Millisecond
+		c := newTestCubic(t, clock, rtt)
+		c.s.ep.mu.Lock()
+		defer c.s.ep.mu.Unlock()
+		c.HandleLossDetected()
+		c.s.leaveRecovery()
+		clock.Advance(elapsed)
+		c.Update(packetsAcked, rtt, clock.NowMonotonic())
+		return c.WEst
+	}
+	first := estimate(0, 1)
+	if got, want := estimate(time.Second, 1), first; got != want {
+		t.Errorf("delayed Reno estimate = %f, want immediate estimate %f", got, want)
+	}
+	if got, want := estimate(0, 2), first; got <= want {
+		t.Errorf("Reno estimate after two acknowledged segments = %f, want > estimate after one segment %f", got, want)
+	}
+}
+
+func TestCubicFriendlyEstimateAbovePriorWindow(t *testing.T) {
+	clock := faketime.NewManualClock()
+	const rtt = 100 * time.Millisecond
+	c := newTestCubic(t, clock, rtt)
+	c.s.ep.mu.Lock()
+	defer c.s.ep.mu.Unlock()
+	c.s.SndCwnd = 10
+	c.HandleLossDetected()
+	c.s.leaveRecovery()
+	// Loss reduced the window from 10 to 7. Six acknowledged windows
+	// regain the three lost segments at the initial Reno-friendly rate.
+	for range 6 {
+		c.Update(c.s.SndCwnd, rtt, clock.NowMonotonic())
+	}
+	if got, want := c.WEst, c.WLastMax; got < want {
+		t.Fatalf("Reno estimate = %f, want >= pre-loss window %f", got, want)
+	}
+	previous := c.WEst
+	c.Update(c.s.SndCwnd, rtt, clock.NowMonotonic())
+	if got, want := c.WEst-previous, float64(1); got != want {
+		t.Fatalf("estimate increase above the prior window = %f, want %f", got, want)
+	}
+}
+
+func TestCubicFriendlyRegionConsumesOldCredit(t *testing.T) {
+	clock := faketime.NewManualClock()
+	const rtt = time.Millisecond
+	c := newTestCubic(t, clock, rtt)
+	c.s.ep.mu.Lock()
+	defer c.s.ep.mu.Unlock()
+	c.HandleLossDetected()
+	c.s.leaveRecovery()
+	// Raise the cubic curve above the estimate so these ACKs first earn
+	// cubic credit. A full window of ACKs then crosses into the friendly region.
+	clock.Advance(100 * time.Millisecond)
+	c.Update(3, rtt, clock.NowMonotonic())
+	if got, want := c.s.SndCAAckCount, 0; got <= want {
+		t.Fatalf("cubic growth credit = %d, want > %d", got, want)
+	}
+	c.Update(c.s.SndCwnd, rtt, clock.NowMonotonic())
+	if got, want := c.WC, c.WEst; got >= want {
+		t.Fatalf("cubic window = %f, want < Reno-friendly estimate %f", got, want)
+	}
+	initial := c.s.SndCwnd
+	clock.Advance(time.Minute)
+	c.Update(1, rtt, clock.NowMonotonic())
+	if got, want := c.s.SndCwnd, initial; got != want {
+		t.Fatalf("returning to the cubic region reused ACK credit: window=%d, want %d", got, want)
+	}
+}
+
+func TestCubicFastConvergenceStartsAtCurrentWindow(t *testing.T) {
+	clock := faketime.NewManualClock()
+	c := newTestCubic(t, clock, 100*time.Millisecond)
+	c.s.ep.mu.Lock()
+	defer c.s.ep.mu.Unlock()
+	// Two losses reduce 100 segments to 70 and then 49.
+	c.s.SndCwnd = 100
+	for range 2 {
+		c.HandleLossDetected()
+		c.s.leaveRecovery()
+	}
+	// Fast convergence changes the remembered maximum. The next epoch
+	// must still begin at the window the sender actually retained.
+	if got, want := c.cubicCwnd(-c.K), float64(c.s.SndCwnd); got < want-1 || got > want+1 {
+		t.Fatalf("epoch curve starts at %f segments, want within one segment of %f", got, want)
+	}
+}
+
+func TestCubicSlowStartPreservesExcessACKs(t *testing.T) {
+	stateAfter := func(acks ...int) (int, float64) {
+		clock := faketime.NewManualClock()
+		const rtt = 100 * time.Millisecond
+		c := newTestCubic(t, clock, rtt)
+		c.s.ep.mu.Lock()
+		defer c.s.ep.mu.Unlock()
+		c.s.Ssthresh = c.s.SndCwnd + 1
+		for _, n := range acks {
+			c.Update(n, rtt, clock.NowMonotonic())
+		}
+		return c.s.SndCwnd, c.WEst
+	}
+	// Crossing ssthresh in one ACK must preserve the same credit as
+	// acknowledging the slow-start and congestion-avoidance data separately.
+	gotWindow, gotEstimate := stateAfter(2)
+	wantWindow, wantEstimate := stateAfter(1, 1)
+	if got, want := gotWindow, wantWindow; got != want {
+		t.Errorf("window after crossing ssthresh = %d, want split-ACK window %d", got, want)
+	}
+	if got, want := gotEstimate, wantEstimate; got != want {
+		t.Errorf("estimate after crossing ssthresh = %f, want split-ACK estimate %f", got, want)
+	}
+}
+
+func TestCubicRTOPreservesPriorWindow(t *testing.T) {
+	clock := faketime.NewManualClock()
+	const rtt = 100 * time.Millisecond
+	c := newTestCubic(t, clock, rtt)
+	c.s.ep.mu.Lock()
+	defer c.s.ep.mu.Unlock()
+	c.HandleLossDetected()
+	c.s.leaveRecovery()
+	prior := float64(c.s.SndCwnd)
+	c.HandleRTOExpired()
+	c.Update(c.s.Ssthresh-c.s.SndCwnd, rtt, clock.NowMonotonic())
+	if got, want := c.WLastMax, prior; got != want {
+		t.Fatalf("prior window after RTO slow start = %f, want %f", got, want)
+	}
+	if got, want := c.WEst, float64(c.s.SndCwnd); got != want {
+		t.Fatalf("Reno estimate at RTO slow-start exit = %f, want %f", got, want)
+	}
+}
+
+func TestCubicWindowRestartPreservesPeak(t *testing.T) {
+	for _, recovery := range []string{"fast", "timeout"} {
+		t.Run(recovery, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			const rtt = 100 * time.Millisecond
+			c := newTestCubic(t, clock, rtt)
+			c.s.ep.mu.Lock()
+			defer c.s.ep.mu.Unlock()
+			// Keep the remembered peak below InitialCwnd so restarting
+			// must use the actual window as the curve's origin.
+			c.s.SndCwnd = 7
+			if recovery == "timeout" {
+				c.HandleRTOExpired()
+				c.Update(c.s.Ssthresh-c.s.SndCwnd, rtt, clock.NowMonotonic())
+			} else {
+				c.HandleLossDetected()
+				c.s.leaveRecovery()
+			}
+			peak := c.WMax
+			clock.Advance(time.Minute)
+			for range 3 {
+				c.Update(c.s.SndCwnd, rtt, clock.NowMonotonic())
+			}
+			if got, want := c.s.SndCwnd, InitialCwnd; got <= want {
+				t.Fatalf("grown window = %d, want > restart window %d", got, want)
+			}
+			c.s.SndCwnd = InitialCwnd
+			c.HandleWindowRestart()
+			if got, want := c.WMax, peak; got != want {
+				t.Errorf("restart changed the remembered peak from %f to %f", want, got)
+			}
+			if got, want := c.cubicCwnd(-c.K), float64(InitialCwnd); got != want {
+				t.Errorf("restart curve origin = %f, want %f", got, want)
+			}
+			if got, want := c.WEst, float64(InitialCwnd); got != want {
+				t.Errorf("restart estimate = %f, want %f", got, want)
+			}
+			if got, want := c.s.SndCAAckCount, 0; got != want {
+				t.Errorf("restart ACK credit = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
 // TestHyStartAckTrainOK tests that HyStart triggers early exit from slow start
 // if ACKs come in the same round for longer than RTT/2.
 func TestHyStartAckTrainOK(t *testing.T) {
@@ -61,7 +384,7 @@ func TestHyStartAckTrainOK(t *testing.T) {
 	d0 := 4 * time.Millisecond
 	uut.s.ep.mu.Lock()
 	defer uut.s.ep.mu.Unlock()
-	uut.updateHyStart(d0)
+	uut.updateHyStart(d0, fClock.NowMonotonic())
 	if uut.CurrRTT != d0 {
 		t.Fatal()
 	}
@@ -76,7 +399,7 @@ func TestHyStartAckTrainOK(t *testing.T) {
 	r1ExpectedStart := fClock.NowMonotonic()
 
 	d1 := 5 * time.Millisecond
-	uut.updateHyStart(d1)
+	uut.updateHyStart(d1, fClock.NowMonotonic())
 	if uut.LastRTT != d0 {
 		t.Fatal()
 	}
@@ -92,7 +415,7 @@ func TestHyStartAckTrainOK(t *testing.T) {
 	// times.
 	for range 2 {
 		fClock.Advance(time.Millisecond)
-		uut.updateHyStart(d1)
+		uut.updateHyStart(d1, fClock.NowMonotonic())
 		if snd.Ssthresh != InitialSsthresh {
 			t.Fatal("HyStart should not be triggered")
 		}
@@ -103,7 +426,7 @@ func TestHyStartAckTrainOK(t *testing.T) {
 
 	// 3 ms---triggers HyStart setting Ssthresh
 	fClock.Advance(time.Millisecond)
-	uut.updateHyStart(d1)
+	uut.updateHyStart(d1, fClock.NowMonotonic())
 	if snd.Ssthresh == InitialSsthresh {
 		t.Fatal("HyStart SHOULD be triggered")
 	}
@@ -145,7 +468,7 @@ func TestHyStartAckTrainTooSpread(t *testing.T) {
 	d0 := 4 * time.Millisecond
 	uut.s.ep.mu.Lock()
 	defer uut.s.ep.mu.Unlock()
-	uut.updateHyStart(d0)
+	uut.updateHyStart(d0, fClock.NowMonotonic())
 	if uut.CurrRTT != d0 {
 		t.Fatal()
 	}
@@ -160,7 +483,7 @@ func TestHyStartAckTrainTooSpread(t *testing.T) {
 	r1ExpectedStart := fClock.NowMonotonic()
 
 	d1 := 5 * time.Millisecond
-	uut.updateHyStart(d1)
+	uut.updateHyStart(d1, fClock.NowMonotonic())
 	if uut.LastRTT != d0 {
 		t.Fatal()
 	}
@@ -173,7 +496,7 @@ func TestHyStartAckTrainTooSpread(t *testing.T) {
 
 	// HyStart will ignore ACKs spaced more than 2ms apart
 	fClock.Advance(3 * time.Millisecond)
-	uut.updateHyStart(d1)
+	uut.updateHyStart(d1, fClock.NowMonotonic())
 	if snd.Ssthresh != InitialSsthresh {
 		t.Fatal("HyStart should not be triggered")
 	}
@@ -212,7 +535,7 @@ func TestHyStartDelayOK(t *testing.T) {
 	d0 := 4 * time.Millisecond
 	uut.s.ep.mu.Lock()
 	defer uut.s.ep.mu.Unlock()
-	uut.updateHyStart(d0)
+	uut.updateHyStart(d0, fClock.NowMonotonic())
 
 	// Move SndNext and SndUna to advance to a new round.
 	snd.SndNxt = snd.SndNxt.Add(2000)
@@ -223,7 +546,7 @@ func TestHyStartDelayOK(t *testing.T) {
 
 	// Delay detection requires at least nRTTSample measurements.
 	for i := uint(1); i < nRTTSample; i++ {
-		uut.updateHyStart(d1)
+		uut.updateHyStart(d1, fClock.NowMonotonic())
 		if uut.SampleCount != i {
 			t.Fatal()
 		}
@@ -231,7 +554,7 @@ func TestHyStartDelayOK(t *testing.T) {
 	if snd.Ssthresh != InitialSsthresh {
 		t.Fatal("triggered with fewer than nRTTSample measurements")
 	}
-	uut.updateHyStart(d1)
+	uut.updateHyStart(d1, fClock.NowMonotonic())
 	if snd.Ssthresh == InitialSsthresh {
 		t.Fatal("didn't trigger SS exit")
 	}
@@ -267,7 +590,7 @@ func TestHyStartDelay_BelowThresh(t *testing.T) {
 	d0 := 4 * time.Millisecond
 	uut.s.ep.mu.Lock()
 	defer uut.s.ep.mu.Unlock()
-	uut.updateHyStart(d0)
+	uut.updateHyStart(d0, fClock.NowMonotonic())
 
 	// Move SndNext and SndUna to advance to a new round.
 	snd.SndNxt = snd.SndNxt.Add(2000)
@@ -278,7 +601,7 @@ func TestHyStartDelay_BelowThresh(t *testing.T) {
 
 	// Delay detection requires at least nRTTSample measurements.
 	for i := uint(1); i < nRTTSample; i++ {
-		uut.updateHyStart(d1)
+		uut.updateHyStart(d1, fClock.NowMonotonic())
 		if uut.SampleCount != i {
 			t.Fatal()
 		}
@@ -286,8 +609,105 @@ func TestHyStartDelay_BelowThresh(t *testing.T) {
 	if snd.Ssthresh != InitialSsthresh {
 		t.Fatal("triggered with fewer than nRTTSample measurements")
 	}
-	uut.updateHyStart(d1 - time.Millisecond)
+	uut.updateHyStart(d1-time.Millisecond, fClock.NowMonotonic())
 	if snd.Ssthresh != InitialSsthresh {
 		t.Fatal("triggered with a measurement under threshold")
+	}
+}
+
+// TestHyStartAckTrainUsesIngressTime verifies that HyStart's ACK-train detector
+// uses each ACK's ingress time (the ackTime argument) rather than the time the
+// ACK was processed. This is a regression test for the gvisor#9707/#9778 family:
+// if ACKs are delayed inside the stack and processed in a burst (so their
+// processing-clock timestamps cluster within ackDelta), measuring against
+// processing time would make widely-spaced ACKs look like a tight "train" and
+// could trip a premature exit from slow start, capping cwnd on a high-BDP path.
+//
+// Here the processing clock (fClock) is held essentially still across the ACKs
+// (simulating a burst drained after a lock release) while the ackTime arguments
+// reflect the ACKs' true arrival, spaced > ackDelta (2ms) apart. With the fix,
+// the ACK-train detector ignores them (they are not a train) and HyStart does
+// not fire. With the bug (processing-time), they would look like a train and
+// fire.
+func TestHyStartAckTrainUsesIngressTime(t *testing.T) {
+	fClock := faketime.NewManualClock()
+	stackOpts := stack.Options{
+		TransportProtocols: []stack.TransportProtocolFactory{NewProtocol},
+		Clock:              fClock,
+	}
+	s := stack.New(stackOpts)
+	ep := &Endpoint{
+		stack: s,
+		cc:    tcpip.CongestionControlOption("cubic"),
+	}
+	iss := seqnum.Value(0)
+	snd := &sender{
+		ep: ep,
+		TCPSenderState: TCPSenderState{
+			SndUna:   iss + 1,
+			SndNxt:   iss + 1,
+			Ssthresh: InitialSsthresh,
+		},
+	}
+	snd.ep.mu.Lock()
+	uut := newCubicCC(snd)
+	snd.ep.mu.Unlock()
+	snd.cc = uut
+
+	uut.s.ep.mu.Lock()
+	defer uut.s.ep.mu.Unlock()
+
+	// This mirrors TestHyStartAckTrainOK, which establishes a round and then
+	// shows that ACKs spaced 1ms apart (< ackDelta) trigger HyStart once the
+	// round has lasted > LastRTT/2. The only difference here: the PROCESSING
+	// clock is frozen during the burst (modeling ACKs drained together after a
+	// stack-internal delay), and the ACKs' true arrival times — supplied via
+	// ackTime — are spaced 3ms apart (> ackDelta), i.e. NOT a real train.
+	//
+	// With the fix (ackTime is used) the detector sees 3ms spacing and never
+	// fires. Without the fix (processing clock is used) the frozen clock makes
+	// every burst ACK look simultaneous (spacing 0 < ackDelta) while the round
+	// has aged past LastRTT/2, so HyStart fires spuriously.
+	d0 := 4 * time.Millisecond
+	uut.updateHyStart(d0, fClock.NowMonotonic())
+
+	// Begin the round under test (LastRTT = d0 = 4ms; RoundStart = 4ms).
+	snd.SndNxt = snd.SndNxt.Add(2000)
+	snd.SndUna = snd.SndUna.Add(1000)
+	fClock.Advance(d0)
+	roundStart := fClock.NowMonotonic() // t = 4ms
+	uut.updateHyStart(5*time.Millisecond, roundStart)
+
+	// Keep the train "warm": process two more ACKs ~1ms apart so LastAck tracks
+	// recent processing time. This is the normal in-round state right before a
+	// stack-internal delay/burst occurs.
+	fClock.Advance(time.Millisecond) // t = 5ms
+	uut.updateHyStart(5*time.Millisecond, fClock.NowMonotonic())
+	fClock.Advance(time.Millisecond) // t = 6ms; LastAck now 6ms
+	uut.updateHyStart(5*time.Millisecond, fClock.NowMonotonic())
+
+	// Now the burst: the processing clock jumps forward (the ACKs were delayed
+	// inside the stack) and is then frozen while several ACKs are drained
+	// together. Their TRUE arrival times, supplied via ackTime, are spaced 3ms
+	// apart (> ackDelta), so they are NOT a real train.
+	//
+	//   - Fix (ackTime): inter-ACK spacing seen as 3ms >= ackDelta, and after
+	//     the first ACK LastAck advances to the (spread) arrival time, so the
+	//     train branch is never taken -> HyStart does not fire.
+	//   - Bug (processing clock): the frozen processing time is within ackDelta
+	//     of the previous LastAck, and after the first burst ACK LastAck = that
+	//     frozen time, so every subsequent ACK has spacing 0 < ackDelta while
+	//     now - RoundStart (>> 2ms) exceeds LastRTT/2 -> HyStart fires.
+	fClock.Advance(time.Millisecond) // t = 7ms: within ackDelta of LastAck(6ms) and
+	// 3ms past RoundStart(4ms) > LastRTT/2(2ms); frozen below for the burst.
+	arrival := fClock.NowMonotonic()
+	for i := 0; i < 4; i++ {
+		arrival = arrival.Add(3 * time.Millisecond) // true arrivals 3ms apart
+		uut.updateHyStart(5*time.Millisecond, arrival)
+		if snd.Ssthresh != InitialSsthresh {
+			t.Fatalf("HyStart ACK-train fired on ACKs whose true arrivals are 3ms apart "+
+				"(> ackDelta); it measured clustered processing time instead of ingress "+
+				"time (iteration %d)", i)
+		}
 	}
 }

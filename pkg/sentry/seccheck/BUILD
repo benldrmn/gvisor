@@ -20,6 +20,7 @@ go_library(
     name = "seccheck",
     srcs = [
         "config.go",
+        "execve_hash_cache.go",
         "metadata.go",
         "metadata_amd64.go",
         "metadata_arm64.go",
@@ -29,8 +30,6 @@ go_library(
     ],
     visibility = ["//:sandbox"],
     deps = [
-        "//pkg/abi",
-        "//pkg/abi/linux",
         "//pkg/abi/sentry",
         "//pkg/atomicbitops",
         "//pkg/context",
@@ -38,8 +37,6 @@ go_library(
         "//pkg/gohacks",
         "//pkg/log",
         "//pkg/metric",
-        "//pkg/sentry/arch",
-        "//pkg/sentry/ktime",
         "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sync",
         "@org_golang_google_protobuf//proto:go_default_library",
@@ -51,13 +48,22 @@ go_test(
     size = "small",
     srcs = [
         "config_test.go",
+        "execve_hash_cache_test.go",
         "metadata_test.go",
         "seccheck_test.go",
     ],
-    library = ":seccheck",
+    embed = [":seccheck"],
     deps = [
         "//pkg/context",
         "//pkg/fd",
         "//pkg/sentry/seccheck/points:points_go_proto",
     ],
+)
+
+go_test(
+    name = "lazy_init_test",
+    size = "small",
+    srcs = ["lazy_init_test.go"],
+    embed = [":seccheck"],
+    deps = ["//pkg/fd"],
 )

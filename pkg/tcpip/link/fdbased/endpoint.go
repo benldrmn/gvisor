@@ -42,11 +42,11 @@ package fdbased
 
 import (
 	"fmt"
-	"runtime"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -60,6 +60,7 @@ type linkDispatcher interface {
 	Stop()
 	dispatch() (bool, tcpip.Error)
 	release()
+	close()
 }
 
 // PacketDispatchMode are the various supported methods of receiving and
@@ -326,7 +327,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 			}
 		}
 		if opts.ProcessorsPerChannel == 0 {
-			opts.ProcessorsPerChannel = max(1, runtime.GOMAXPROCS(0)/len(opts.FDs))
+			opts.ProcessorsPerChannel = max(1, gomaxprocs.Base()/len(opts.FDs))
 		}
 
 		var isPacket bool
@@ -367,32 +368,34 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 }
 
 func createInboundDispatcher(e *endpoint, fd int, isSocket bool, opts *Options) (linkDispatcher, error) {
+	if isSocket {
+		switch e.packetDispatchMode {
+		case PacketMMap:
+			inboundDispatcher, err := newPacketMMapDispatcher(fd, e, opts)
+			if err != nil {
+				return nil, fmt.Errorf("newPacketMMapDispatcher(%d, %+v) = %v", fd, e, err)
+			}
+			return inboundDispatcher, nil
+		case RecvMMsg:
+			// If the provided FD is a socket then we optimize
+			// packet reads by using recvmmsg() instead of read() to
+			// read packets in a batch.
+			inboundDispatcher, err := newRecvMMsgDispatcher(fd, e, opts)
+			if err != nil {
+				return nil, fmt.Errorf("newRecvMMsgDispatcher(%d, %+v) = %v", fd, e, err)
+			}
+			return inboundDispatcher, nil
+		case Readv:
+		default:
+			return nil, fmt.Errorf("unknown dispatch mode %d", e.packetDispatchMode)
+		}
+	}
+
 	// By default use the readv() dispatcher as it works with all kinds of
 	// FDs (tap/tun/unix domain sockets and af_packet).
 	inboundDispatcher, err := newReadVDispatcher(fd, e, opts)
 	if err != nil {
 		return nil, fmt.Errorf("newReadVDispatcher(%d, %+v) = %v", fd, e, err)
-	}
-
-	if isSocket {
-		switch e.packetDispatchMode {
-		case PacketMMap:
-			inboundDispatcher, err = newPacketMMapDispatcher(fd, e, opts)
-			if err != nil {
-				return nil, fmt.Errorf("newPacketMMapDispatcher(%d, %+v) = %v", fd, e, err)
-			}
-		case RecvMMsg:
-			// If the provided FD is a socket then we optimize
-			// packet reads by using recvmmsg() instead of read() to
-			// read packets in a batch.
-			inboundDispatcher, err = newRecvMMsgDispatcher(fd, e, opts)
-			if err != nil {
-				return nil, fmt.Errorf("newRecvMMsgDispatcher(%d, %+v) = %v", fd, e, err)
-			}
-		case Readv:
-		default:
-			return nil, fmt.Errorf("unknown dispatch mode %d", e.packetDispatchMode)
-		}
 	}
 	return inboundDispatcher, nil
 }
@@ -917,8 +920,16 @@ func (e *endpoint) ARPHardwareType() header.ARPHardwareType {
 	return header.ARPHardwareNone
 }
 
-// Close implements stack.LinkEndpoint.
-func (e *endpoint) Close() {}
+// Close implements stack.LinkEndpoint. The stack calls it after Attach(nil)
+// has stopped and waited for every dispatch goroutine, so nothing is polling
+// the dispatchers' stop eventfds any more.
+func (e *endpoint) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, d := range e.inboundDispatchers {
+		d.close()
+	}
+}
 
 // SetOnCloseAction implements stack.LinkEndpoint.
 func (*endpoint) SetOnCloseAction(func()) {}

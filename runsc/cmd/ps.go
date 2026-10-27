@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -55,7 +55,7 @@ func (ps *PS) SetFlags(f *flag.FlagSet) {
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (ps *PS) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := ps.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := ps.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -71,7 +71,7 @@ func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcomm
 
 	conf := args[0].(*config.Config)
 
-	c, err := ps.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := ps.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
@@ -82,9 +82,9 @@ func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcomm
 
 	switch ps.format {
 	case "table":
-		fmt.Println(control.ProcessListToTable(pList))
+		fmt.Println(controlapi.ProcessListToTable(pList))
 	case "json":
-		o, err := control.PrintPIDsJSON(pList)
+		o, err := controlapi.PrintPIDsJSON(pList)
 		if err != nil {
 			util.Fatalf("generating JSON: %v", err)
 		}

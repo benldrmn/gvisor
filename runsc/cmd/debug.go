@@ -28,7 +28,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -108,7 +108,7 @@ func (d *Debug) loadContainer(conf *config.Config, f *flag.FlagSet) (*container.
 			f.Usage()
 			return nil, fmt.Errorf("container ID should be provided when -pid is not set")
 		}
-		return d.containerLoader.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+		return d.containerLoader.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	}
 	// Fetch the container associated with the PID.
 	if f.NArg() != 0 {
@@ -121,7 +121,7 @@ func (d *Debug) loadContainer(conf *config.Config, f *flag.FlagSet) (*container.
 		return nil, fmt.Errorf("listing containers: %v", err)
 	}
 	for _, id := range ids {
-		candidate, err := container.Load(conf.RootDir, id, container.LoadOpts{Exact: true, SkipCheck: true})
+		candidate, err := container.Load(conf.RootDir, id, container.LoadOpts{Exact: true, SkipCheck: true, ReadOnly: true})
 		if err != nil {
 			log.Warningf("Skipping container %q: %v", id, err)
 			continue
@@ -150,8 +150,8 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		return util.Errorf("loading container: %v", err)
 	}
 
-	if !c.IsSandboxRunning() {
-		return util.Errorf("container sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return util.Errorf("container %v", err)
 	}
 	util.Infof("Found sandbox %q, PID: %d", c.Sandbox.ID, c.Sandbox.Getpid())
 
@@ -172,7 +172,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Infof("     *** Stack dump ***\n%s", stacks)
 	}
 	if d.strace != "" || len(d.logLevel) != 0 || len(d.logPackets) != 0 {
-		args := control.LoggingArgs{}
+		args := controlapi.LoggingArgs{}
 		switch strings.ToLower(d.strace) {
 		case "":
 			// strace not set, nothing to do here.
@@ -233,7 +233,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		if err != nil {
 			util.Fatalf("getting processes for container: %v", err)
 		}
-		o, err := control.ProcessListToJSON(pList)
+		o, err := controlapi.ProcessListToJSON(pList)
 		if err != nil {
 			util.Fatalf("generating JSON: %v", err)
 		}

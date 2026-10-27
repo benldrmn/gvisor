@@ -183,6 +183,17 @@ const (
 	IFLA_INFO_SLAVE_DATA = 5
 )
 
+// Interface operational states (RFC 2863), from uapi/linux/if_link.h.
+const (
+	IF_OPER_UNKNOWN        = 0
+	IF_OPER_NOTPRESENT     = 1
+	IF_OPER_DOWN           = 2
+	IF_OPER_LOWERLAYERDOWN = 3
+	IF_OPER_TESTING        = 4
+	IF_OPER_DORMANT        = 5
+	IF_OPER_UP             = 6
+)
+
 // Virtuall ethernet attributes, from uapi/linux/veth.h.
 const (
 	VETH_INFO_PEER = 1
@@ -261,7 +272,7 @@ const (
 
 	// RTN_ANYCAST represents a anycast route (Traffic is accepted locally as
 	// broadcast but sent as unicast).
-	RTN_ANYCAST = 6
+	RTN_ANYCAST = 4
 
 	// RTN_MULTICAST represents a multicast route.
 	RTN_MULTICAST = 5
@@ -320,6 +331,11 @@ const (
 	RTM_F_PREFIX       = 0x800
 	RTM_F_LOOKUP_TABLE = 0x1000
 	RTM_F_FIB_MATCH    = 0x2000
+)
+
+// Next hop flags, from uapi/linux/rtnetlink.h.
+const (
+	RTNH_F_ONLINK = 0x4
 )
 
 // Route tables, from uapi/linux/rtnetlink.h.

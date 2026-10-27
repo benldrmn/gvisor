@@ -48,22 +48,35 @@ var defaultSendBufSize = inet.TCPBufferSize{
 	Max:     4194304,
 }
 
-// Stack implements inet.Stack for host sockets.
+// Stack implements inet.Stack for host sockets. Most fields are derived from
+// the host network configuration.
+//
+// +stateify savable
 type Stack struct {
-	// Stack is immutable.
-	supportsIPv6   bool
-	tcpRecovery    inet.TCPLossRecovery
-	tcpRecvBufSize inet.TCPBufferSize
-	tcpSendBufSize inet.TCPBufferSize
-	tcpSACKEnabled bool
-	netDevFile     *os.File
-	netSNMPFile    *os.File
+	supportsIPv6    bool
+	tcpRecovery     inet.TCPLossRecovery
+	tcpRecvBufSize  inet.TCPBufferSize
+	tcpSendBufSize  inet.TCPBufferSize
+	tcpSACKEnabled  bool
+	portRange       [2]uint16
+	allowRawSockets bool
+	configured      bool     `state:"nosave"`
+	netDevFile      *os.File `state:"nosave"`
+	netSNMPFile     *os.File `state:"nosave"`
 	// allowedSocketTypes is the list of allowed socket types
-	allowedSocketTypes []AllowedSocketType
+	allowedSocketTypes []AllowedSocketType `state:"nosave"`
 }
 
 // Destroy implements inet.Stack.Destroy.
-func (*Stack) Destroy() {
+func (s *Stack) Destroy() {
+	if s.netDevFile != nil {
+		_ = s.netDevFile.Close()
+		s.netDevFile = nil
+	}
+	if s.netSNMPFile != nil {
+		_ = s.netSNMPFile.Close()
+		s.netSNMPFile = nil
+	}
 }
 
 // NewStack returns an empty Stack containing no configuration.
@@ -73,6 +86,10 @@ func NewStack() *Stack {
 
 // Configure sets up the stack using the current state of the host network.
 func (s *Stack) Configure(allowRawSockets bool) error {
+	if s.configured {
+		return nil
+	}
+	s.allowRawSockets = allowRawSockets
 	if _, err := os.Stat("/proc/net/if_inet6"); err == nil {
 		s.supportsIPv6 = true
 	}
@@ -90,6 +107,8 @@ func (s *Stack) Configure(allowRawSockets bool) error {
 	} else {
 		log.Warningf("Failed to read TCP send buffer size, using default values")
 	}
+
+	s.portRange = ReadPortRange()
 
 	// SACK is important for performance and even compatibility, assume it's
 	// enabled if we can't find the actual value.
@@ -117,6 +136,7 @@ func (s *Stack) Configure(allowRawSockets bool) error {
 		s.allowedSocketTypes = append(s.allowedSocketTypes, AllowedRawSocketTypes...)
 	}
 
+	s.configured = true
 	return nil
 }
 
@@ -135,6 +155,42 @@ func readTCPBufferSizeFile(filename string) (inet.TCPBufferSize, error) {
 		Default: int(fields[1]),
 		Max:     int(fields[2]),
 	}, nil
+}
+
+// ReadPortRange reads the host network namespace's ephemeral port range.
+// It must run before installing seccomp filters. If the range cannot be read,
+// it uses the defaults set by Linux's inet_init_net():
+// https://github.com/torvalds/linux/blob/e5f0a698b/net/ipv4/af_inet.c#L1785-L1790
+func ReadPortRange() [2]uint16 {
+	ports, err := readPortRangeFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		log.Warningf("Failed to read host ephemeral port range, using default values: %v", err)
+		return [2]uint16{32768, 60999}
+	}
+	return ports
+}
+
+func readPortRangeFile(filename string) ([2]uint16, error) {
+	contents, err := os.ReadFile(filename)
+	if err != nil {
+		return [2]uint16{}, err
+	}
+	fields := strings.Fields(string(contents))
+	if len(fields) != 2 {
+		return [2]uint16{}, fmt.Errorf("invalid port range in %s: %q", filename, contents)
+	}
+	var ports [2]uint16
+	for i, field := range fields {
+		port, err := strconv.ParseUint(field, 10, 16)
+		if err != nil {
+			return [2]uint16{}, fmt.Errorf("invalid port range in %s: %w", filename, err)
+		}
+		ports[i] = uint16(port)
+	}
+	if ports[0] > ports[1] {
+		return [2]uint16{}, fmt.Errorf("invalid port range in %s: %q", filename, contents)
+	}
+	return ports, nil
 }
 
 // Interfaces implements inet.Stack.Interfaces.
@@ -234,12 +290,12 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 }
 
 // AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
-func (*Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+func (*Stack) AddInterfaceAddr(_ context.Context, idx int32, addr inet.InterfaceAddr) error {
 	return addInterfaceAddr(idx, addr)
 }
 
 // RemoveInterfaceAddr implements inet.Stack.RemoveInterfaceAddr.
-func (*Stack) RemoveInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+func (*Stack) RemoveInterfaceAddr(_ context.Context, idx int32, addr inet.InterfaceAddr) error {
 	return removeInterfaceAddr(idx, addr)
 }
 
@@ -407,10 +463,32 @@ func (*Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
 func (*Stack) Pause() {}
 
 // Restore implements inet.Stack.Restore.
-func (*Stack) Restore() {}
+func (*Stack) Restore() {
+	restoreListeners()
+}
 
 // ResetConfig implements inet.Stack.ResetConfig.
-func (*Stack) ResetConfig() {}
+func (s *Stack) ResetConfig() {
+	s.allowedSocketTypes = AllowedSocketTypes
+	if s.allowRawSockets {
+		s.allowedSocketTypes = append(s.allowedSocketTypes, AllowedRawSocketTypes...)
+	}
+	s.configured = true
+}
+
+// SetHostConfig sets the destination host configuration after restore.
+// It takes ownership of the files.
+func (s *Stack) SetHostConfig(netDev, netSNMP *os.File, ports [2]uint16) {
+	if s.netDevFile != nil {
+		s.netDevFile.Close()
+	}
+	s.netDevFile = netDev
+	if s.netSNMPFile != nil {
+		s.netSNMPFile.Close()
+	}
+	s.netSNMPFile = netSNMP
+	s.portRange = ports
+}
 
 // Resume implements inet.Stack.Resume.
 func (*Stack) Resume() {}
@@ -429,10 +507,19 @@ func (*Stack) SetForwarding(tcpip.NetworkProtocolNumber, bool) error {
 	return linuxerr.EACCES
 }
 
+// GetAllowExternalLoopbackTraffic implements inet.Stack.GetAllowExternalLoopbackTraffic.
+func (*Stack) GetAllowExternalLoopbackTraffic(tcpip.NetworkProtocolNumber) (bool, error) {
+	return false, nil
+}
+
+// SetAllowExternalLoopbackTraffic implements inet.Stack.SetAllowExternalLoopbackTraffic.
+func (*Stack) SetAllowExternalLoopbackTraffic(tcpip.NetworkProtocolNumber, bool) error {
+	return linuxerr.EACCES
+}
+
 // PortRange implements inet.Stack.PortRange.
-func (*Stack) PortRange() (uint16, uint16) {
-	// Use the default Linux values per net/ipv4/af_inet.c:inet_init_net().
-	return 32768, 60999
+func (s *Stack) PortRange() (uint16, uint16) {
+	return s.portRange[0], s.portRange[1]
 }
 
 // SetPortRange implements inet.Stack.SetPortRange.

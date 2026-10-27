@@ -51,8 +51,8 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	dockerutil.EnsureSupportedDockerVersion()
 	flag.Parse()
+	dockerutil.EnsureSupportedDockerVersion()
 	os.Exit(m.Run())
 }
 
@@ -307,5 +307,24 @@ func TestOverlayCheckpointRestore(t *testing.T) {
 	}
 	if got, err := d.Exec(ctx, dockerutil.ExecOpts{}, "cat", "/submount/file"); err != nil || got != "submount\n" {
 		t.Errorf("cat /submount/file returned: output = %q, err = %v", got, err)
+	}
+}
+
+func TestPIDFDSelftests(t *testing.T) {
+	ctx := context.Background()
+	// pidfd_setns_test creates cgroup namespaces, which requires cgroup2fs to
+	// be mounted in the sandbox (--in-sandbox-cgroup=v2).
+	d := dockerutil.MakeContainerWithRuntime(ctx, t, "-cgroupv2")
+	defer d.CleanUp(ctx)
+
+	runOpts := dockerutil.RunOpts{
+		Image:      "basic/pidfd-tests",
+		Privileged: true,
+	}
+	out, err := d.Run(ctx, runOpts)
+	if err != nil {
+		t.Fatalf("docker run failed; output: %v, err: %v", out, err)
+	} else {
+		t.Logf("docker run succeeded; output: %v", out)
 	}
 }

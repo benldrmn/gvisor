@@ -11,6 +11,7 @@ go_library(
         "erofs.go",
         "erofs_unsafe.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/erofs",
     marshal = True,
     visibility = ["//visibility:public"],
     deps = [
@@ -21,7 +22,6 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/marshal",
-        "//pkg/safemem",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -30,5 +30,9 @@ go_test(
     name = "erofs_test",
     size = "small",
     srcs = ["erofs_test.go"],
-    library = ":erofs",
+    embed = [":erofs"],
+    deps = [
+        "//pkg/errors/linuxerr",
+        "//pkg/hostarch",
+    ],
 )

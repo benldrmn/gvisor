@@ -49,6 +49,7 @@ func frontendIoctlFilters(enabledCaps nvconf.DriverCaps) []seccomp.SyscallRule {
 		{seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_FREE_OS_EVENT, nvgpu.SizeofIoctlFreeOSEvent)), compUtil},
 		{seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_SYS_PARAMS, nvgpu.SizeofIoctlSysParams)), compUtil},
 		{seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_WAIT_OPEN_COMPLETE, nvgpu.SizeofIoctlWaitOpenComplete)), compUtil},
+		{seccomp.MaskedEqual(notIocSizeMask, frontendIoctlCmd(nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD, 0)), nvconf.CapRDMA},
 		{seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC_MEMORY, nvgpu.SizeofIoctlNVOS02ParametersWithFD)), compUtil | nvconf.CapGraphics},
 		{seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_FREE, nvgpu.SizeofNVOS00Parameters)), compUtil},
 		{seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_CONTROL, nvgpu.SizeofNVOS54Parameters)), compUtil},
@@ -113,6 +114,16 @@ func uvmIoctlFilters(enabledCaps nvconf.DriverCaps) []seccomp.SyscallRule {
 		{seccomp.EqualTo(nvgpu.UVM_ALLOC_SEMAPHORE_POOL), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_VALIDATE_VA_RANGE), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_CREATE_EXTERNAL_RANGE), compUtil},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_ENABLE_COUNTERS), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_DISABLE_COUNTERS), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_FLUSH_EVENTS), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_V2), nvconf.CapProfiling},
+		{seccomp.EqualTo(nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2), nvconf.CapProfiling},
 	} {
 		if uvmIoctl.caps&enabledCaps != 0 {
 			ioctlRules = append(ioctlRules, seccomp.PerArg{

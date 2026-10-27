@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
@@ -78,12 +78,21 @@ go_library(
         "stats.go",
         "types.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/state",
     marshal = False,
     stateify = False,
     visibility = [
         "//visibility:public",
     ],
     deps = [
+        "//pkg/gohacks",
         "//pkg/state/wire",
     ],
+)
+
+go_test(
+    name = "state_test",
+    size = "small",
+    srcs = ["types_test.go"],
+    embed = [":state"],
 )

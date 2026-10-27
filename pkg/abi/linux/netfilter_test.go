@@ -40,6 +40,10 @@ func TestSizes(t *testing.T) {
 		{IP6TIP{}, SizeOfIP6TIP},
 		{XTMultiport{}, SizeOfXTMultiport},
 		{XTMultiportV1{}, SizeOfXTMultiportV1},
+		{XTNATTargetV0{}, SizeOfXTNATTargetV0},
+		{XTNATTargetV1{}, SizeOfXTNATTargetV1},
+		{XTNATTargetV2{}, SizeOfXTNATTargetV2},
+		{XTMarkTarget{}, SizeOfXTMarkTarget},
 	}
 
 	for _, tc := range testCases {

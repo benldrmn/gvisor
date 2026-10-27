@@ -126,6 +126,16 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}); err != nil {
 		return nil, err
 	}
+	if opts.DriverCaps&nvconf.CapProfiling != 0 {
+		if err := vfsObj.RegisterDevice(vfs.CharDevice, uvmDevMajor, nvgpu.NVIDIA_UVM_TOOLS_MINOR_NUMBER, &uvmToolsDevice{
+			nvp: nvp,
+		}, &vfs.RegisterDeviceOptions{
+			GroupName: "nvidia-uvm",
+		}); err != nil {
+			return nil, err
+		}
+		nvp.devInfo.HaveUVMTools = true
+	}
 
 	if opts.DriverCaps&nvconf.CapFabricIMEXManagement != 0 {
 		if !opts.HostSettings.HaveFabricIMEXManagement {
@@ -146,6 +156,18 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		}
 		nvp.devInfo.HaveFabricIMEXManagement = true
 		nvp.devInfo.FabricIMEXManagementDevMinor = opts.HostSettings.FabricIMEXManagementDevMinor
+		if opts.HostSettings.HaveMNCCManagement {
+			if err := vfsObj.RegisterDevice(vfs.CharDevice, capsDevMajor, opts.HostSettings.MNCCManagementDevMinor, &openOnlyDevice{
+				nvp:     nvp,
+				relpath: fmt.Sprintf("nvidia-caps/nvidia-cap%d", opts.HostSettings.MNCCManagementDevMinor),
+			}, &vfs.RegisterDeviceOptions{
+				GroupName: "nvidia-caps",
+			}); err != nil {
+				return nil, err
+			}
+			nvp.devInfo.HaveMNCCManagement = true
+			nvp.devInfo.MNCCManagementDevMinor = opts.HostSettings.MNCCManagementDevMinor
+		}
 	}
 
 	if imexChannelCount := opts.HostSettings.IMEXChannelCount(); imexChannelCount != 0 {
@@ -184,6 +206,11 @@ type DeviceInfo struct {
 	HaveFabricIMEXManagement     bool
 	FabricIMEXManagementDevMinor uint32
 
+	// If HaveMNCCManagement is true, MNCCManagementDevMinor is the mncc-mgmt
+	// capability's device minor number, which matches the value on the host.
+	HaveMNCCManagement     bool
+	MNCCManagementDevMinor uint32
+
 	// CapsIMEXChannelsDevMajor is nvidia-caps-imex-channels's device major
 	// number. If CapsIMEXChannelsDevMajor is 0, nvidia-caps-imex-channels is
 	// not enabled.
@@ -192,6 +219,10 @@ type DeviceInfo struct {
 	// UVMDevMajor is nvidia-uvm's device major number. If UVMDevMajor is 0,
 	// nvidia-uvm is enabled.
 	UVMDevMajor uint32
+
+	// HaveUVMTools is true if nvidia-uvm-tools is enabled, with device major
+	// number UVMDevMajor.
+	HaveUVMTools bool
 }
 
 // DeviceInfoFromVFS returns device information for nvproxy devices registered

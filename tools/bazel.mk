@@ -42,6 +42,11 @@
 ##
 ##   To opt out of these wrappers, set DOCKER_BUILD=false.
 DOCKER_BUILD := true
+ifneq ($(MAKECMDGOALS),)
+ifeq ($(filter-out help,$(MAKECMDGOALS)),)
+DOCKER_BUILD := false
+endif
+endif
 ifeq ($(DOCKER_BUILD),true)
 -include bazel-server-inc
 endif
@@ -117,7 +122,7 @@ BAZEL              := bazel $(STARTUP_OPTIONS)
 BASE_OPTIONS       := --color=no --curses=no $(BAZEL_REMOTE_CACHE)
 BAZEL_TEST_OUTPUT  ?= errors
 TEST_OPTIONS       += $(BASE_OPTIONS) \
-  --incompatible_sandbox_hermetic_tmp=false \
+  --sandbox_add_mount_pair=/tmp \
   --test_output=$(BAZEL_TEST_OUTPUT) \
   --keep_going \
   --verbose_failures=true \
@@ -184,6 +189,11 @@ KERNEL_HEADERS_DIR_LINKED := $(dir $(shell $(REALPATH_M) $(KERNEL_HEADERS_DIR)/M
 DOCKER_RUN_OPTIONS += -v "$(KERNEL_HEADERS_DIR_LINKED):$(KERNEL_HEADERS_DIR_LINKED)"
 endif
 endif
+# If /etc/gitconfig is available, pass it through so in-container clones
+# respect host gitconfig (e.g. authentication)
+ifneq (,$(wildcard /etc/gitconfig))
+DOCKER_RUN_OPTIONS += -v "/etc/gitconfig:/etc/gitconfig:ro"
+endif
 
 # Add basic UID/GID options.
 #
@@ -213,11 +223,14 @@ endif
 DOCKER_RUN_OPTIONS += $(DOCKER_PRIVILEGED)
 DOCKER_RUN_OPTIONS += --cap-add SYS_MODULE
 DOCKER_EXEC_OPTIONS += $(DOCKER_PRIVILEGED)
+# Direct builds do not require a local Docker socket.
+ifneq (,$(wildcard $(DOCKER_SOCKET)))
 DOCKER_GROUP := $(shell $(STAT_G) $(DOCKER_SOCKET))
 ifneq ($(GID),$(DOCKER_GROUP))
 USERADD_OPTIONS += --groups $(DOCKER_GROUP)
 GROUPADD_DOCKER += groupadd --gid $(DOCKER_GROUP) --non-unique docker-$(HASH) &&
 DOCKER_RUN_OPTIONS += --group-add $(DOCKER_GROUP)
+endif
 endif
 endif
 
@@ -285,7 +298,8 @@ bazel-alias: ## Emits an alias that can be used within the shell.
 	@echo "alias bazel='$(call wrapper,$(BAZEL))'"
 .PHONY: bazel-alias
 
-bazel-image: load-default ## Ensures that the local builder exists.
+# A cached load only tags the image; executing the builder still needs QEMU.
+bazel-image: load-default register-cross ## Ensures that the local builder exists.
 	@$(call header,DOCKER BUILD)
 	@$(DOCKER_CLI_PATH) rm -f $(BUILDER_NAME) 2>/dev/null || true
 	@$(DOCKER_CLI_PATH) run --user 0:0 --entrypoint "" \
@@ -296,8 +310,8 @@ bazel-image: load-default ## Ensures that the local builder exists.
 	@$(DOCKER_CLI_PATH) commit $(BUILDER_NAME) gvisor.dev/images/builder >&2
 .PHONY: bazel-image
 
-ifneq (true,$(shell $(wrapper echo true)))
-bazel-server: bazel-image ## Ensures that the server exists.
+ifneq (true,$(shell $(call wrapper,echo true) 2>/dev/null))
+bazel-server: bazel-image ## Restart bazel server/container.
 ifneq (,$(PRE_BAZEL_INIT))
 	@$(call header,PRE_BAZEL_INIT)
 	@bash -euxo pipefail -c "$(PRE_BAZEL_INIT)"
@@ -332,25 +346,54 @@ endif
 # we make a non-phony version of bazel-server that can be included.
 bazel-server-inc: bazel-server
 
-# build_paths extracts the built binary from the bazel stderr output.
-#
-# The last line is used to prevent terminal shenanigans.
+ifneq (true,$(shell $(call wrapper,echo true) 2>/dev/null))
+ensure-bazel-server:  ## Ensures that the bazel server exists, else restart.
+	@$(DOCKER_CLI_PATH) inspect $(DOCKER_NAME) &>/dev/null || $(MAKE) bazel-server
+else
+ensure-bazel-server:
+	@
+endif
+.PHONY: ensure-bazel-server
+
+# target_query quotes target patterns as one cquery expression, preserving
+# build's ordered additions, exclusions and re-additions.
+target_query = "$$(query='set()'; \
+  for target in $(1); do \
+    case "$$target" in \
+      -*) query="$$query except"; target="$${target:1}" ;; \
+      *) query="$$query union" ;; \
+    esac; \
+    case "$$target" in \
+      *\"*) query="$$query '$$target'" ;; \
+      *) query="$$query \"$$target\"" ;; \
+    esac; \
+  done; \
+  printf '%s' "$$query")"
+
+# build_paths materializes selected outputs and passes cquery's path/destination
+# pairs to $(2). cquery also includes manual targets that build may exclude, so
+# filter missing paths before translating them from the build environment.
+# https://github.com/bazelbuild/bazel/blob/61aa5a57c/src/main/java/com/google/devtools/build/lib/runtime/commands/CqueryCommand.java#L90-L94
+# Host filtering also permits builds whose Docker cache volume is not mounted
+# on the host; callers that consume printed paths still require local outputs.
+# Optional $(3) supplies cquery arguments separately from build arguments $(1).
 build_paths = \
   (set -euo pipefail; \
-  $(call wrapper,$(BAZEL) build $(BASE_OPTIONS) $(BAZEL_OPTIONS) $(1)) && \
-  $(call wrapper,$(BAZEL) cquery $(BASE_OPTIONS) $(BAZEL_OPTIONS) --output=starlark --starlark:file=tools/show_paths.bzl $(1)) \
-  | $(call wrapper,xargs -r -I {} bash -c 'test -e "{}" || exit 0; $(REALPATH_M) "{}"') \
+  $(call wrapper,$(BAZEL) build $(BASE_OPTIONS) $(BAZEL_OPTIONS) --remote_download_outputs=toplevel $(1)) && \
+  $(call wrapper,$(BAZEL) cquery $(BASE_OPTIONS) $(BAZEL_OPTIONS) --output=starlark --starlark:file=tools/show_paths.bzl $(if $(3),$(3),$(1))) \
+  | $(call wrapper,xargs -r -n 2 bash -c 'set -euo pipefail; test -e "$$0" || exit 0; output_path="$$($(REALPATH_M) "$$0")"; printf "%s %s\n" "$$output_path" "$$1"') \
   | sed 's~^$(HOME)/\.cache/bazel/~$(patsubst %/,%,$(BAZEL_CACHE))/~' \
-  | xargs -r -I {} bash -c 'test -e "{}" || exit 0; $(REALPATH_M) "{}"' \
-  | xargs -r -I {} bash -c 'set -euo pipefail; $(2)')
+  | xargs -r -n 2 bash -c 'set -euo pipefail; test -e "$$0" || exit 0; output_path="$$($(REALPATH_M) "$$0")"; printf "%s %s\n" "$$output_path" "$$1"' \
+  | xargs -r -n 2 bash -c 'set -euo pipefail; $(2)')
 
 clean = $(call header,CLEAN) && $(call wrapper,$(BAZEL) clean)
-build = $(call header,BUILD $(1)) && $(call build_paths,$(1),echo {})
-copy  = $(call header,COPY $(1) $(2)) && $(call build_paths,$(1),cp -fa {} $(2))
-run   = $(call header,RUN $(1) $(2)) && $(call build_paths,$(1),{} $(2))
-sudo  = $(call header,SUDO $(1) $(2)) && $(call build_paths,$(1),sudo -E {} $(2))
+build = $(call header,BUILD $(1)) && $(call build_paths,$(1),echo "$$0",$(2))
+copy  = $(call header,COPY $(1) $(2)) && $(call build_paths,$(1),if test -d "$(2)"; then dest="$(2)/$$1"; else dest="$(2)"; fi; mkdir -p -m 0755 "$$(dirname "$${dest}")" && chmod a+rx "$$(dirname "$${dest}")" && cp -fa "$$0" "$${dest}" && if test -d "$$0"; then chmod -R u+w "$${dest}"; fi,$(3))
+run   = $(call header,RUN $(1) $(2)) && $(call build_paths,$(1),"$$0" $(2))
+sudo  = $(call header,SUDO $(1) $(2)) && $(call build_paths,$(1),sudo -E "$$0" $(2))
 test  = $(call header,TEST $(1)) && $(call wrapper,$(BAZEL) test --strip=never $(BAZEL_OPTIONS) $(TEST_OPTIONS) $(1))
 query = $(call wrapper,$(BAZEL) query $(BAZEL_OPTIONS) $(1))
+mod   = $(call wrapper,$(BAZEL) mod $(BASE_OPTIONS) $(BAZEL_OPTIONS) $(1))
 
 clean: ## Cleans the bazel cache.
 	@$(call clean)

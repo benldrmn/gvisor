@@ -24,7 +24,6 @@ go_library(
         "dockerutil.go",
         "exec.go",
         "gpu.go",
-        "network.go",
         "profile.go",
     ],
     embedsrcs = [
@@ -49,18 +48,24 @@ go_library(
 )
 
 go_test(
+    name = "exec_test",
+    size = "small",
+    srcs = ["exec_test.go"],
+    embed = [":dockerutil"],
+    deps = ["@com_github_docker_docker//client:go_default_library"],
+)
+
+go_test(
     name = "profile_test",
     size = "large",
     srcs = [
         "profile_test.go",
     ],
-    library = ":dockerutil",
+    embed = [":dockerutil"],
+    # Requires docker and runsc to be configured before test runs.
+    # Also requires the test to be run as root.
+    local = True,
     nogo = False,
-    tags = [
-        # Requires docker and runsc to be configured before test runs.
-        # Also requires the test to be run as root.
-        "local",
-        "manual",
-    ],
+    tags = ["manual"],
     visibility = ["//:sandbox"],
 )

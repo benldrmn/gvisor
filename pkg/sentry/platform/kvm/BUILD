@@ -1,3 +1,4 @@
+load("//pkg/seccomp/precompiledseccomp:defs.bzl", "precompiled_seccomp_rules")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
@@ -22,6 +23,14 @@ config_setting(
     values = {
         "compilation_mode": "dbg",
     },
+)
+
+precompiled_seccomp_rules(
+    name = "mmapfilter_precompiled",
+    out = "mmapfilter_precompiled.go",
+    out_package_name = "kvm",
+    programs_to_compile_go_import = "gvisor.dev/gvisor/pkg/sentry/platform/kvm/mmapfilter",
+    programs_to_compile_go_library = "//pkg/sentry/platform/kvm/mmapfilter",
 )
 
 go_library(
@@ -65,10 +74,17 @@ go_library(
         "machine_arm64_unsafe.go",
         "machine_cgo.go",
         "machine_unsafe.go",
+        "mmapfilter_precompiled.go",
         "physical_map.go",
         "physical_map_amd64.go",
         "physical_map_arm64.go",
         "seccomp_mmap_unsafe.go",
+        "vdso.go",
+        "vdso_amd64.go",
+        "vdso_arm64_unsafe.go",
+        "vdso_stub_amd64.go",
+        "vdso_stub_arm64.go",
+        "vdso_unsafe.go",
         "virtual_map.go",
     ],
     visibility = ["//pkg/sentry:internal"],
@@ -80,24 +96,30 @@ go_library(
         "//pkg/cpuid",
         "//pkg/eventfd",
         "//pkg/fd",
+        "//pkg/gomaxprocs",
         "//pkg/hostarch",
         "//pkg/hostos",
         "//pkg/hostsyscall",
         "//pkg/hosttid",
         "//pkg/log",
         "//pkg/metric",
+        "//pkg/pinring",
         "//pkg/ring0",
         "//pkg/ring0/pagetables",
         "//pkg/seccomp",
+        "//pkg/seccomp/precompiledseccomp",
         "//pkg/sentry/arch",
         "//pkg/sentry/arch/fpu",
+        "//pkg/sentry/hostmm",
         "//pkg/sentry/memmap",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/interrupt",
+        "//pkg/sentry/platform/kvm/mmapfilter",
         "//pkg/sentry/time",
         "//pkg/sigframe",
         "//pkg/sighandling",
         "//pkg/sync",
+        "//pkg/timing",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -112,7 +134,7 @@ go_test(
         "kvm_test.go",
         "virtual_map_test.go",
     ],
-    library = ":kvm",
+    embed = [":kvm"],
     # FIXME(gvisor.dev/issue/3374): Not working with all build systems.
     nogo = False,
     pure = True,
@@ -126,6 +148,7 @@ go_test(
         "//pkg/cpuid",
         "//pkg/eventfd",
         "//pkg/hostarch",
+        "//pkg/hostsyscall",
         "//pkg/memutil",
         "//pkg/ring0",
         "//pkg/ring0/pagetables",
@@ -134,9 +157,28 @@ go_test(
         "//pkg/sentry/arch/fpu",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/kvm/testutil",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sentry/time",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+# The shadow [vdso] patcher is pure byte manipulation and needs no KVM, so its
+# tests are kept separate from kvm_test to run wherever the package builds.
+go_test(
+    name = "vdso_test",
+    srcs = [
+        "vdso_amd64_test.go",
+        "vdso_arm64_test.go",
+        "vdso_stub_amd64_test.go",
+        "vdso_stub_arm64_test.go",
+        "vdso_stub_test.go",
+        "vdso_test.go",
+    ],
+    embed = [":kvm"],
+    nogo = False,
+    pure = True,
+    tags = ["nogotsan"],
 )
 
 go_test(
@@ -149,7 +191,7 @@ go_test(
         "kvm_test.go",
         "virtual_map_test.go",
     ],
-    library = ":kvm",
+    embed = [":kvm"],
     # FIXME(gvisor.dev/issue/3374): Not working with all build systems.
     nogo = False,
     tags = [
@@ -161,6 +203,7 @@ go_test(
         "//pkg/cpuid",
         "//pkg/eventfd",
         "//pkg/hostarch",
+        "//pkg/hostsyscall",
         "//pkg/memutil",
         "//pkg/ring0",
         "//pkg/ring0/pagetables",
@@ -169,6 +212,7 @@ go_test(
         "//pkg/sentry/arch/fpu",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/kvm/testutil",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sentry/time",
         "@org_golang_x_sys//unix:go_default_library",
     ],

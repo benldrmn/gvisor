@@ -24,10 +24,20 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/logging.h"
 #include "test/util/posix_error.h"
 #include "test/util/socket_util.h"
 #include "test/util/temp_path.h"
@@ -383,11 +393,13 @@ TEST_F(PartialBadBufferTest, SendMsgTCP) {
   ASSERT_THAT(RetryEINTR(sendmsg)(send_socket.get(), &hdr, 0),
               SyscallSucceedsWithValue(kPageSize));
   // Read all the data out so that we drain the socket SND_BUF on the sender.
+  // A single read may return less than kPageSize if kPageSize exceeds the
+  // initial receive window (e.g. with 64K pages), so use ReadFd.
   std::vector<char> buffer(kPageSize);
-  ASSERT_THAT(RetryEINTR(read)(recv_socket.get(), buffer.data(), kPageSize),
+  ASSERT_THAT(ReadFd(recv_socket.get(), buffer.data(), kPageSize),
               SyscallSucceedsWithValue(kPageSize));
 
-  // Sleep for a shortwhile to ensure that we have time to process the
+  // Sleep for a short while to ensure that we have time to process the
   // ACKs. This is not strictly required unless running under gotsan which is a
   // lot slower and can result in the next write to write only 1 byte instead of
   // our intended kPageSize + 1.

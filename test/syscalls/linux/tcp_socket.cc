@@ -14,34 +14,51 @@
 
 #include <fcntl.h>
 
-#include <cstdint>
-#include <memory>
-
 #ifdef __linux__
+#include <linux/capability.h>
 #include <linux/filter.h>
 #include <sys/epoll.h>
+#include <sys/types.h>
 #endif  // __linux__
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <iterator>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <thread>  // NOLINT
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
+#include "test/util/timer_util.h"
 
 using ::testing::AnyOf;
 
@@ -899,45 +916,60 @@ TEST_P(TcpSocketTest, TcpSCMPriority) {
       setsockopt(accepted_.get(), SOL_SOCKET, SO_TIMESTAMP, &val, sizeof(val)),
       SyscallSucceedsWithValue(0));
 
-  char buf[1024];
-  ASSERT_THAT(RetryEINTR(write)(connected_.get(), buf, sizeof(buf)),
-              SyscallSucceedsWithValue(sizeof(buf)));
+  // With CONFIG_JUMP_LABEL, Linux schedules netstamp_work to enable packet
+  // timestamps, so setsockopt may return before activation:
+  // https://github.com/torvalds/linux/blob/fd73f4a66/net/core/dev.c#L2395-L2424
+  const auto deadline =
+      Now(CLOCK_MONOTONIC) + absl::Milliseconds(kTimeoutMillis);
+  for (;;) {
+    char buf[1024] = {};
+    ASSERT_THAT(RetryEINTR(write)(connected_.get(), buf, sizeof(buf)),
+                SyscallSucceedsWithValue(sizeof(buf)));
 
-  struct msghdr msg = {};
-  std::vector<char> control(CMSG_SPACE(sizeof(struct timeval)) +
-                            CMSG_SPACE(sizeof(int)));
-  struct iovec iov;
-  msg.msg_control = &control[0];
-  msg.msg_controllen = control.size();
+    struct msghdr msg = {};
+    std::vector<char> control(CMSG_SPACE(sizeof(struct timeval)) +
+                              CMSG_SPACE(sizeof(int)));
+    struct iovec iov = {};
+    msg.msg_control = control.data();
+    msg.msg_controllen = control.size();
+    iov.iov_base = buf;
+    iov.iov_len = sizeof(buf);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    // Consume the entire write before sending another payload.
+    ASSERT_THAT(RetryEINTR(recvmsg)(accepted_.get(), &msg, 0),
+                SyscallSucceedsWithValue(sizeof(buf)));
+    ASSERT_EQ(msg.msg_flags, 0);
 
-  iov.iov_base = buf;
-  iov.iov_len = sizeof(buf);
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  ASSERT_THAT(RetryEINTR(recvmsg)(accepted_.get(), &msg, 0),
-              SyscallSucceedsWithValue(sizeof(buf)));
-
-  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-  ASSERT_NE(cmsg, nullptr);
-  // TODO(b/78348848): SO_TIMESTAMP isn't implemented for TCP sockets.
-  if (!IsRunningOnGvisor() || cmsg->cmsg_level == SOL_SOCKET) {
-    EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
-    EXPECT_EQ(cmsg->cmsg_type, SO_TIMESTAMP);
-    EXPECT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(struct timeval)));
-
-    cmsg = CMSG_NXTHDR(&msg, cmsg);
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
     ASSERT_NE(cmsg, nullptr);
+    const bool await_timestamp = !IsRunningOnGvisor() &&
+                                 cmsg->cmsg_level == SOL_TCP &&
+                                 cmsg->cmsg_type == TCP_INQ;
+    // TODO(b/78348848): SO_TIMESTAMP isn't implemented for TCP sockets.
+    if (!await_timestamp &&
+        (!IsRunningOnGvisor() || cmsg->cmsg_level == SOL_SOCKET)) {
+      ASSERT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+      ASSERT_EQ(cmsg->cmsg_type, SO_TIMESTAMP);
+      ASSERT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(struct timeval)));
+
+      cmsg = CMSG_NXTHDR(&msg, cmsg);
+      ASSERT_NE(cmsg, nullptr);
+    }
+    ASSERT_EQ(cmsg->cmsg_level, SOL_TCP);
+    ASSERT_EQ(cmsg->cmsg_type, TCP_INQ);
+    ASSERT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(int)));
+
+    int inq = 0;
+    memcpy(&inq, CMSG_DATA(cmsg), sizeof(int));
+    ASSERT_EQ(inq, 0);
+    ASSERT_EQ(CMSG_NXTHDR(&msg, cmsg), nullptr);
+    if (!await_timestamp) {
+      break;
+    }
+    ASSERT_LT(Now(CLOCK_MONOTONIC), deadline)
+        << "SO_TIMESTAMP did not become available";
   }
-  EXPECT_EQ(cmsg->cmsg_level, SOL_TCP);
-  EXPECT_EQ(cmsg->cmsg_type, TCP_INQ);
-  EXPECT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(int)));
-
-  int inq = 0;
-  memcpy(&inq, CMSG_DATA(cmsg), sizeof(int));
-  EXPECT_EQ(inq, 0);
-
-  cmsg = CMSG_NXTHDR(&msg, cmsg);
-  ASSERT_EQ(cmsg, nullptr);
 }
 
 TEST_P(TcpSocketTest, TimeWaitPollHUP) {
@@ -1803,47 +1835,48 @@ TEST_P(SimpleTcpSocketTest, NonBlockingConnectRefused) {
   EXPECT_THAT(close(s.release()), SyscallSucceeds());
 }
 
-// Test that setting a supported congestion control algorithm succeeds for an
-// unconnected TCP socket
+// Supported congestion controls can be selected before connecting and are
+// inherited by accepted sockets.
 TEST_P(SimpleTcpSocketTest, SetCongestionControlSucceedsForSupported) {
   // This is Linux's net/tcp.h TCP_CA_NAME_MAX.
-  const int kTcpCaNameMax = 16;
+  constexpr int kTcpCaNameMax = 16;
 
-  FileDescriptor s =
-      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
-  {
-    const char kSetCC[kTcpCaNameMax] = "reno";
-    ASSERT_THAT(setsockopt(s.get(), IPPROTO_TCP, TCP_CONGESTION, &kSetCC,
-                           strlen(kSetCC)),
-                SyscallSucceedsWithValue(0));
-
-    char got_cc[kTcpCaNameMax];
-    memset(got_cc, '1', sizeof(got_cc));
-    socklen_t optlen = sizeof(got_cc);
+  for (const char* cc : {"reno", "cubic"}) {
+    SCOPED_TRACE(cc);
+    const FileDescriptor listener =
+        ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
     ASSERT_THAT(
-        getsockopt(s.get(), IPPROTO_TCP, TCP_CONGESTION, &got_cc, &optlen),
-        SyscallSucceedsWithValue(0));
-    // We ignore optlen here as the linux kernel sets optlen to the lower of the
-    // size of the buffer passed in or kTcpCaNameMax and not the length of the
-    // congestion control algorithm's actual name.
-    EXPECT_EQ(0, memcmp(got_cc, kSetCC, sizeof(kTcpCaNameMax)));
-  }
-  {
-    const char kSetCC[kTcpCaNameMax] = "cubic";
-    ASSERT_THAT(setsockopt(s.get(), IPPROTO_TCP, TCP_CONGESTION, &kSetCC,
-                           strlen(kSetCC)),
-                SyscallSucceedsWithValue(0));
+        setsockopt(listener.get(), IPPROTO_TCP, TCP_CONGESTION, cc, strlen(cc)),
+        SyscallSucceeds());
+    const auto check_cc = [cc](int fd) {
+      char got_cc[kTcpCaNameMax];
+      memset(got_cc, '1', sizeof(got_cc));
+      socklen_t optlen = sizeof(got_cc);
+      ASSERT_THAT(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, got_cc, &optlen),
+                  SyscallSucceeds());
+      // Linux returns the buffer capacity rather than the algorithm name's
+      // length. Compare the full name, including its terminating NUL.
+      ASSERT_GE(optlen, strlen(cc) + 1);
+      EXPECT_EQ(0, memcmp(got_cc, cc, strlen(cc) + 1));
+    };
+    ASSERT_NO_FATAL_FAILURE(check_cc(listener.get()));
 
-    char got_cc[kTcpCaNameMax];
-    memset(got_cc, '1', sizeof(got_cc));
-    socklen_t optlen = sizeof(got_cc);
+    sockaddr_storage addr =
+        ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddrZeroPort(GetParam()));
+    socklen_t addrlen = sizeof(addr);
+    ASSERT_THAT(bind(listener.get(), AsSockAddr(&addr), addrlen),
+                SyscallSucceeds());
+    ASSERT_THAT(listen(listener.get(), SOMAXCONN), SyscallSucceeds());
+    ASSERT_THAT(getsockname(listener.get(), AsSockAddr(&addr), &addrlen),
+                SyscallSucceeds());
+    const FileDescriptor connector =
+        ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
     ASSERT_THAT(
-        getsockopt(s.get(), IPPROTO_TCP, TCP_CONGESTION, &got_cc, &optlen),
-        SyscallSucceedsWithValue(0));
-    // We ignore optlen here as the linux kernel sets optlen to the lower of the
-    // size of the buffer passed in or kTcpCaNameMax and not the length of the
-    // congestion control algorithm's actual name.
-    EXPECT_EQ(0, memcmp(got_cc, kSetCC, sizeof(kTcpCaNameMax)));
+        RetryEINTR(connect)(connector.get(), AsSockAddr(&addr), addrlen),
+        SyscallSucceeds());
+    const FileDescriptor accepted =
+        ASSERT_NO_ERRNO_AND_VALUE(Accept(listener.get(), nullptr, nullptr));
+    ASSERT_NO_FATAL_FAILURE(check_cc(accepted.get()));
   }
 }
 
@@ -2293,17 +2326,42 @@ TEST_P(SimpleTcpSocketTest, SetSocketAttachDetachFilter) {
       {0x6, 0, 0, 0x00040000},   {0x6, 0, 0, 0x00000000},
   };
   struct sock_fprog bpf = {
-      .len = ABSL_ARRAYSIZE(code),
+      .len = std::size(code),
       .filter = code,
   };
-  ASSERT_THAT(
-      setsockopt(s.get(), SOL_SOCKET, SO_ATTACH_FILTER, &bpf, sizeof(bpf)),
-      SyscallSucceeds());
+  int ret =
+      setsockopt(s.get(), SOL_SOCKET, SO_ATTACH_FILTER, &bpf, sizeof(bpf));
+  if (ret < 0 && errno == EPERM) {
+    // Linux 5d39580f68e6 ("tcp: restrict SO_ATTACH_FILTER to priv users")
+    // requires CAP_NET_ADMIN over the socket's network namespace.
+    SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  }
+  ASSERT_THAT(ret, SyscallSucceeds());
 
   constexpr int val = 0;
   ASSERT_THAT(
       setsockopt(s.get(), SOL_SOCKET, SO_DETACH_FILTER, &val, sizeof(val)),
       SyscallSucceeds());
+}
+
+TEST_P(SimpleTcpSocketTest, SetSocketAttachFilterWithoutNetAdmin) {
+  FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+  struct sock_filter code[] = {{0x6, 0, 0, 0x00040000}};  // ret 0x40000
+  struct sock_fprog bpf = {
+      .len = std::size(code),
+      .filter = code,
+  };
+  AutoCapability cap(CAP_NET_ADMIN, false);
+  int ret =
+      setsockopt(s.get(), SOL_SOCKET, SO_ATTACH_FILTER, &bpf, sizeof(bpf));
+  if (!IsRunningOnGvisor() || IsRunningWithHostinet()) {
+    // Only Linux 5d39580f68e6 ("tcp: restrict SO_ATTACH_FILTER to priv
+    // users") and later requires CAP_NET_ADMIN, so this can succeed on
+    // old kernels (including with hostinet on an old kernel).
+    SKIP_IF(ret == 0);
+  }
+  EXPECT_THAT(ret, SyscallFailsWithErrno(EPERM));
 }
 
 #endif  // __linux__
@@ -2789,6 +2847,27 @@ TEST_P(SimpleTcpSocketTest, SetTCPCorkOff) {
   ASSERT_THAT(
       setsockopt(fd, IPPROTO_TCP, TCP_CORK, &kSockOptOff, sizeof(kSockOptOff)),
       SyscallSucceeds());
+}
+
+#ifndef SOL_TLS
+#define SOL_TLS 282
+#endif
+
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
+
+TEST_P(TcpSocketTest, SetKTLSFails) {
+  int opt = 1;
+  EXPECT_THAT(
+      setsockopt(connected_.get(), SOL_TLS, 1 /* TLS_TX */, &opt, sizeof(opt)),
+      SyscallFailsWithErrno(ENOPROTOOPT));
+
+  if (IsRunningOnGvisor()) {
+    EXPECT_THAT(
+        setsockopt(connected_.get(), SOL_TCP, TCP_ULP, "tls", sizeof("tls")),
+        SyscallFailsWithErrno(ENOPROTOOPT));
+  }
 }
 #endif  // __linux__
 

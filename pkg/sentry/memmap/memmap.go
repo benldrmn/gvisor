@@ -94,6 +94,10 @@ type Mappable interface {
 	// Postconditions: See CheckTranslateResult.
 	Translate(ctx context.Context, required, optional MappableRange, at hostarch.AccessType) ([]Translation, error)
 
+	// MayUseHugepages returns true if hugepage-aligned ranges in the Mappable
+	// may be backed by huge pages.
+	MayUseHugepages() bool
+
 	// InvalidateUnsavable requests that the Mappable invalidate Translations
 	// that cannot be preserved across save/restore.
 	//
@@ -264,7 +268,7 @@ type MappingIdentity interface {
 	// int64(mr.Start), int64(mr.End-1), fs.SyncData).
 	// (fs.FileOperations.Fsync() takes an inclusive end, but mr.End is
 	// exclusive, hence mr.End-1.) It is defined rather than Fsync so that
-	// implementors don't need to depend on the fs package for fs.SyncType.
+	// implementers don't need to depend on the fs package for fs.SyncType.
 	Msync(ctx context.Context, mr MappableRange) error
 }
 
@@ -333,6 +337,12 @@ type MMapOpts struct {
 	// be replaced. If Unmap is true, Fixed must be true.
 	Unmap bool
 
+	// NoReplace is true if MAP_FIXED_NOREPLACE semantics apply: the mapping
+	// must be located at Addr, and EEXIST (rather than ENOMEM) is returned if
+	// any mapping already exists in the range. If NoReplace is true, Fixed
+	// must be true and Unmap must be false.
+	NoReplace bool
+
 	// If Map32Bit is true, all addresses in the created mapping must fit in a
 	// 32-bit integer. (Note that the "end address" of the mapping, i.e. the
 	// address of the first byte *after* the mapping, need not fit in a 32-bit
@@ -397,6 +407,21 @@ type MMapOpts struct {
 	// underlying memory backing the mapping thus the memory content is
 	// guaranteed not to be modified outside the sentry's purview.
 	SentryOwnedContent bool
+
+	// If EagerForkCopy is true, private pages in the mapping are copied into
+	// the child immediately on fork, rather than being shared as COW
+	// between the parent and the child. This guarantees that later writes to
+	// the mapping never need to break COW, which replaces the pages
+	// backing the mapping and unmaps the pages from the platform.AddressSpace.
+	EagerForkCopy bool
+
+	// If Sealed is true, the application may not unmap, remap, change the
+	// protections of, discard the contents of, madvise, or map over the
+	// mapping. Attempts to do so fail with EPERM. This is reserved for
+	// sentry-managed mapping within the application's address
+	// space (i.e. usertrap table). Seals are inherited across
+	// fork.
+	Sealed bool
 }
 
 // NameMut is the type of MMapOpts.NameMut.
@@ -448,7 +473,7 @@ type File interface {
 	//	* fr.Length() > 0.
 	//	* At least one reference must be held on all pages in fr. (The File
 	//		interface does not provide a way to acquire an initial reference;
-	//		implementors may define mechanisms for doing so.)
+	//		implementers may define mechanisms for doing so.)
 	IncRef(fr FileRange, memCgID uint32)
 
 	// DecRef decrements the reference count on all pages in fr.
@@ -617,6 +642,17 @@ func (MappableNoTrackMappings) CopyMapping(ctx context.Context, ms MappingSpace,
 // InvalidateUnsavable implements Mappable.InvalidateUnsavable.
 func (MappableNoTrackMappings) InvalidateUnsavable(ctx context.Context) error {
 	return nil
+}
+
+// MappableNoHugepages implements Mappable.MayUseHugepages for Mappables that
+// never use huge pages.
+//
+// +stateify savable
+type MappableNoHugepages struct{}
+
+// MayUseHugepages implements Mappable.MayUseHugepages.
+func (MappableNoHugepages) MayUseHugepages() bool {
+	return false
 }
 
 // FileRange represents a range of uint64 offsets into a File.

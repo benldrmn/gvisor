@@ -21,6 +21,7 @@ go_library(
         "//pkg/buffer",
         "//pkg/sync",
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/header/parse",
         "//pkg/tcpip/network/internal/fragmentation",
@@ -39,7 +40,7 @@ go_test(
         "main_test.go",
         "ndp_test.go",
     ],
-    library = ":ipv6",
+    embed = [":ipv6"],
     deps = [
         "//pkg/buffer",
         "//pkg/refs",

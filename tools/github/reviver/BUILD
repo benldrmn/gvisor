@@ -11,11 +11,12 @@ go_library(
         "github.go",
         "reviver.go",
     ],
+    importpath = "gvisor.dev/gvisor/tools/github/reviver",
     nogo = False,
     visibility = [
         "//tools/github:__subpackages__",
     ],
-    deps = ["@com_github_google_go_github_v56//github:go_default_library"],
+    deps = ["@com_github_google_go_github_v84//github:go_default_library"],
 )
 
 go_test(
@@ -25,6 +26,6 @@ go_test(
         "github_test.go",
         "reviver_test.go",
     ],
-    library = ":reviver",
+    embed = [":reviver"],
     nogo = False,
 )

@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
-	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
 )
@@ -79,7 +78,7 @@ func createSyscallRegs(initRegs *arch.Registers, sysno uintptr, args ...arch.Sys
 }
 
 // updateSyscallRegs updates registers after finishing sysemu.
-func updateSyscallRegs(regs *arch.Registers) {
+func updateSyscallRegs(regs *arch.Registers, _ sysmsg.ContextState) {
 	// Ptrace puts -ENOSYS in rax on syscall-enter-stop.
 	regs.Rax = regs.Orig_rax
 }
@@ -180,34 +179,20 @@ func enableCpuidFault() {
 	hostsyscall.RawSyscall(unix.SYS_ARCH_PRCTL, linux.ARCH_SET_CPUID, 0, 0)
 }
 
-// appendArchSeccompRules append architecture specific seccomp rules when creating BPF program.
-// Ref attachedThread() for more detail.
-func appendArchSeccompRules(rules []seccomp.RuleSet) []seccomp.RuleSet {
-	return append(rules, []seccomp.RuleSet{
-		// Rules for trapping vsyscall access.
-		{
-			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-				unix.SYS_GETTIMEOFDAY: seccomp.MatchAll{},
-				unix.SYS_TIME:         seccomp.MatchAll{},
-				unix.SYS_GETCPU:       seccomp.MatchAll{}, // SYS_GETCPU was not defined in package syscall on amd64.
-			}),
-			Action:   seccomp.Trap,
-			Vsyscall: true,
-		},
-		{
-			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-				unix.SYS_ARCH_PRCTL: seccomp.Or{
-					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_SET_CPUID), seccomp.EqualTo(0)},
-					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_SET_FS)},
-					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_GET_FS)},
-				},
-			}),
-			Action: seccomp.Allow,
-		},
-	}...)
-}
-
-func restoreArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
+func (s *subprocess) restoreArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
+	// If syscall patching is disabled or the GS register is not 0, then we are in a context where
+	// the GS register is/can be used by the application. Thus, we need to set GsUsedByApp to 1 to
+	// restore the GS register to its original value in the signal handler.
+	usertrapDisabled := s.usertrap == nil || s.usertrap.Disabled()
+	appUsesGS := ac.GS() != 0
+	if disableSyscallPatching || usertrapDisabled || appUsesGS {
+		ctx.GsUsedByApp = 1
+		if !usertrapDisabled && appUsesGS {
+			s.usertrap.Disable()
+		}
+	} else {
+		ctx.GsUsedByApp = 0
+	}
 }
 
 func setArchSpecificRegs(sysThread *sysmsgThread, regs *arch.Registers) {
@@ -216,7 +201,7 @@ func setArchSpecificRegs(sysThread *sysmsgThread, regs *arch.Registers) {
 	regs.Gs_base = sysThread.msg.Self
 }
 
-func retrieveArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
+func (s *subprocess) retrieveArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
 }
 
 func sigErrorToAccessType(sigError uint64) hostarch.AccessType {

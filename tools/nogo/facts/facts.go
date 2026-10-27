@@ -23,9 +23,9 @@ import (
 	"reflect"
 	"sort"
 
-	"archive/zip"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/types/objectpath"
+	"gvisor.dev/gvisor/pkg/zip"
 	"gvisor.dev/gvisor/tools/checkconst"
 )
 
@@ -79,18 +79,20 @@ func NewPackage() *Package {
 	}
 }
 
-func extractObjectpath(obj types.Object) (name objectpath.Path, err error) {
+func extractObjectpath(enc *objectpath.Encoder, obj types.Object) (name objectpath.Path, err error) {
 	defer func() {
-		// Unfortunately, objectpath.For will occasionally panic for
+		// Unfortunately, objectpath.Encoder.For will occasionally panic for
 		// certain objects. This happens with basic analysis packages
 		// (buildssa), and therefore cannot be avoided.
 		if r := recover(); r != nil {
+			// Discard any index left incomplete by the failed lookup.
+			*enc = objectpath.Encoder{}
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
 	// Allow empty name for no object.
 	if obj != nil {
-		name, err = objectpath.For(obj)
+		name, err = enc.For(obj)
 	}
 	return
 }
@@ -98,16 +100,25 @@ func extractObjectpath(obj types.Object) (name objectpath.Path, err error) {
 // Serialize implements Serializer.Serialize.
 func (p *Package) Serialize(w io.Writer) error {
 	is := make([]item, 0, len(p.Objects))
+	var enc objectpath.Encoder
 	for obj, facts := range p.Objects {
-		name, err := extractObjectpath(obj)
+		name, err := extractObjectpath(&enc, obj)
 		if err != nil {
 			continue // Not exported; expected.
 		}
+		sortedFacts := make([]analysis.Fact, len(facts))
+		copy(sortedFacts, facts)
+		sort.Slice(sortedFacts, func(i, j int) bool {
+			return fmt.Sprintf("%T", sortedFacts[i]) < fmt.Sprintf("%T", sortedFacts[j])
+		})
 		is = append(is, item{
 			Key:   string(name),
-			Value: facts,
+			Value: sortedFacts,
 		})
 	}
+	sort.Slice(is, func(i, j int) bool {
+		return is[i].Key < is[j].Key
+	})
 	return writeItems(w, is)
 }
 
@@ -118,6 +129,10 @@ func (p *Package) ReadFrom(pkg *types.Package, r io.Reader) error {
 		return err
 	}
 	for _, fi := range is {
+		objectFacts, ok := fi.Value.([]analysis.Fact)
+		if !ok {
+			return fmt.Errorf("invalid fact payload for %q: %T", fi.Key, fi.Value)
+		}
 		var (
 			obj types.Object
 			err error
@@ -130,7 +145,7 @@ func (p *Package) ReadFrom(pkg *types.Package, r io.Reader) error {
 			// object. We just suppress this error and ignore it.
 			continue
 		}
-		p.Objects[obj] = fi.Value.([]analysis.Fact)
+		p.Objects[obj] = objectFacts
 	}
 	return nil
 }
@@ -184,7 +199,13 @@ func NewBundle() *Bundle {
 // Serialize implements Serializer.Serialize.
 func (b *Bundle) Serialize(w io.Writer) error {
 	zw := zip.NewWriter(w)
-	for pkg, facts := range b.decoded {
+	pkgs := make([]string, 0, len(b.decoded))
+	for pkg := range b.decoded {
+		pkgs = append(pkgs, pkg)
+	}
+	sort.Strings(pkgs)
+	for _, pkg := range pkgs {
+		facts := b.decoded[pkg]
 		if facts == nil {
 			// Some facts may be omitted for bundles, if there is
 			// only type information but no source information. We
@@ -229,7 +250,8 @@ func (b *Bundle) Add(path string, facts *Package) {
 	b.decoded[path] = facts
 }
 
-// Package looks up the given package in the bundle.
+// Package looks up the given package in the bundle. It returns nil without an
+// error if the package is absent, or an error if its facts cannot be read.
 func (b *Bundle) Package(pkg *types.Package) (*Package, error) {
 	// Already decoded?
 	if facts, ok := b.decoded[pkg.Path()]; ok {
@@ -240,7 +262,7 @@ func (b *Bundle) Package(pkg *types.Package) (*Package, error) {
 		// Nothing available.
 		//
 		// N.B. some bundles contain only cached packages.
-		return nil, fmt.Errorf("no facts available for package %q", pkg.Path())
+		return nil, nil
 	}
 
 	// Find based on the reader.
@@ -266,7 +288,7 @@ func (b *Bundle) Package(pkg *types.Package) (*Package, error) {
 	}
 
 	// Nothing available.
-	return nil, fmt.Errorf("no facts available for package %q", pkg.Path())
+	return nil, nil
 }
 
 func resolveConstants(pkg *types.Package, localPkg *types.Package, localFacts *Package, allFacts *Bundle) (checkconst.Constants, error) {
@@ -278,10 +300,10 @@ func resolveConstants(pkg *types.Package, localPkg *types.Package, localFacts *P
 	} else {
 		importFacts, err := allFacts.Package(pkg)
 		if err != nil {
-			return c, fmt.Errorf("no facts available for package %q", pkg.Path())
+			return c, fmt.Errorf("loading facts for package %q: %w", pkg.Path(), err)
 		}
 		if importFacts == nil {
-			panic("nil importFacts")
+			return c, fmt.Errorf("no facts available for package %q", pkg.Path())
 		}
 		factSource = importFacts
 	}

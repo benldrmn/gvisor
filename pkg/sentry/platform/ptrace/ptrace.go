@@ -46,12 +46,13 @@ package ptrace
 
 import (
 	"math"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/interrupt"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -82,6 +83,9 @@ type context struct {
 	// interrupt is the interrupt context.
 	interrupt interrupt.Forwarder
 
+	// thread is the subprocess thread this context used for its last switch.
+	thread atomic.Pointer[thread]
+
 	// mu protects the following fields.
 	mu sync.Mutex
 
@@ -103,7 +107,15 @@ type context struct {
 func (*PTrace) NewContext(ctx pkgcontext.Context) platform.Context {
 	c := new(context)
 	c.archContext.init(ctx)
+	c.interrupt.Dst = c
 	return c
+}
+
+// NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
+func (c *context) NotifyInterrupt() {
+	if t := c.thread.Load(); t != nil {
+		t.NotifyInterrupt()
+	}
 }
 
 // Switch runs the provided context in the given address space.
@@ -233,9 +245,16 @@ type PTrace struct {
 
 // New returns a new ptrace-based implementation of the platform interface.
 func New() (*PTrace, error) {
+	return NewWithOptions(platform.Options{})
+}
+
+// NewWithOptions returns a new ptrace-based implementation of the platform interface with custom options.
+func NewWithOptions(opts platform.Options) (*PTrace, error) {
+	mbCh := hostmm.Probe(false)
 	stubInitialized.Do(func() {
 		// Initialize the stub.
 		stubInit()
+		opts.StartupTimer.Reached("ptrace stub initialized")
 
 		// Create the master process for the global pool. This must be
 		// done before initializing any other processes.
@@ -244,12 +263,17 @@ func New() (*PTrace, error) {
 			// Should never happen.
 			panic("unable to initialize ptrace master: " + err.Error())
 		}
+		opts.StartupTimer.Reached("ptrace master process created")
 
 		// Set the master on the globalPool.
 		globalPool.master = master
 	})
-
-	return &PTrace{}, nil
+	opts.StartupTimer.Reached("waiting for membarrier")
+	memBarrier := <-mbCh
+	opts.StartupTimer.Reached("host membarrier probed")
+	return &PTrace{
+		UseHostGlobalMemoryBarrier: platform.UseHostGlobalMemoryBarrier{MemBarrier: memBarrier},
+	}, nil
 }
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
@@ -271,7 +295,7 @@ func (*PTrace) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *PTrace) NewAddressSpace() (platform.AddressSpace, error) {
+func (p *PTrace) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	return newSubprocess(globalPool.master.createStub)
 }
 
@@ -282,19 +306,8 @@ func (*PTrace) ConcurrencyCount() int {
 
 type constructor struct{}
 
-func (*constructor) New(platform.Options) (platform.Platform, error) {
-	return New()
-}
-
-func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
-	return nil, nil
-}
-
-// Flags implements platform.Constructor.Flags().
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{
-		RequiresCapSysPtrace: true,
-	}
+func (*constructor) New(opts platform.Options) (platform.Platform, error) {
+	return NewWithOptions(opts)
 }
 
 func init() {

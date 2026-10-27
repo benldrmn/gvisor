@@ -2,12 +2,18 @@
 
 load("@bazel_skylib//:bzl_library.bzl", _bzl_library = "bzl_library")
 load("@bazel_skylib//rules:build_test.bzl", _build_test = "build_test")
-load("@bazel_skylib//rules:common_settings.bzl", _BuildSettingInfo = "BuildSettingInfo", _bool_flag = "bool_flag")
+load("@bazel_skylib//rules:common_settings.bzl", _BuildSettingInfo = "BuildSettingInfo", _bool_flag = "bool_flag", _string_flag = "string_flag")
+load("@bazel_skylib//rules:expand_template.bzl", _expand_template = "expand_template")
+load("@bazel_skylib//rules/directory:providers.bzl", "DirectoryInfo")
+load("@com_google_protobuf//bazel:proto_library.bzl", _proto_library = "proto_library")
+load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
 
 build_test = _build_test
 bzl_library = _bzl_library
 bool_flag = _bool_flag
+string_flag = _string_flag
 BuildSettingInfo = _BuildSettingInfo
+expand_template = _expand_template
 more_shards = 4
 most_shards = 8
 version = "//tools/bazeldefs:version"
@@ -15,8 +21,8 @@ version = "//tools/bazeldefs:version"
 def short_path(path):
     return path
 
-def proto_library(name, has_services = None, **kwargs):
-    native.proto_library(
+def proto_library(name, has_services = None, **kwargs):  # buildifier: disable=unused-variable
+    _proto_library(
         name = name,
         **kwargs
     )
@@ -27,6 +33,7 @@ def select_arch(amd64 = None, arm64 = None, riscv64 = None, default = None, **kw
     Args:
       amd64: the option if the architecture is amd64.
       arm64: the option if the architecture is arm64.
+      riscv64: the option if the architecture is riscv64.
       default: the option if no matching architecture is provided.
       **kwargs: extra select arguments.
 
@@ -43,7 +50,7 @@ def select_arch(amd64 = None, arm64 = None, riscv64 = None, default = None, **kw
         values["//conditions:default"] = default
     return select(values, **kwargs)
 
-def select_system(linux = ["__linux__"], darwin = [], **kwargs):
+def select_system(linux = ["__linux__"], darwin = [], **_kwargs):
     return select({
         "@bazel_tools//src/conditions:darwin": darwin,
         "//conditions:default": linux,
@@ -56,23 +63,26 @@ arch_config = [
     "//command_line_option:platforms",
 ]
 
-def arm64_config(settings, attr):
+def arm64_config(_settings, _attr):
     return {
-        # Race builds are always disabled for cross-architecture generation. We
-        # can't run it locally anyways, what value can this provide?
+        # Disable the inherited race setting for cross-architecture generation.
+        # Targets with an explicit race attribute still use instrumentation.
         "@io_bazel_rules_go//go/config:race": False,
         "//command_line_option:cpu": "aarch64",
         "//command_line_option:crosstool_top": "@crosstool//:toolchains",
-        "//command_line_option:platforms": "@io_bazel_rules_go//go/toolchain:linux_arm64",
+        # Permit targets that explicitly enable race instrumentation to use cgo.
+        # Ordinary targets still inherit the pure build setting from .bazelrc.
+        "//command_line_option:platforms": "//tools/bazeldefs:linux_arm64",
     }
 
-def amd64_config(settings, attr):
+def amd64_config(_settings, _attr):
     return {
         # See above.
         "@io_bazel_rules_go//go/config:race": False,
         "//command_line_option:cpu": "k8",
         "//command_line_option:crosstool_top": "@crosstool//:toolchains",
-        "//command_line_option:platforms": "@io_bazel_rules_go//go/toolchain:linux_amd64",
+        # See above.
+        "//command_line_option:platforms": "//tools/bazeldefs:linux_amd64",
     }
 
 transition_allowlist = "@bazel_tools//tools/allowlists/function_transition_allowlist"
@@ -86,23 +96,130 @@ def default_net_util():
 def coreutil():
     return []  # Nothing needed.
 
-def bpf_program(name, src, bpf_object, visibility, hdrs):
-    """Generates BPF object files from .c source code.
+def target_emulator():
+    """Returns the user-mode emulator that runs target binaries at build time.
+
+    The emulators are pinned, statically-linked QEMU builds for the execution
+    platform's architecture (see target_emulators).
+
+    Returns:
+      A struct with:
+        tools: labels to add to the tools of a genrule.
+        cmd: the emulator command to run target binaries with when the
+          execution platform's architecture differs from the target's, or an
+          empty string if there is none. This may reference `tools` using make
+          variables.
+    """
+    return struct(
+        tools = select_arch(
+            amd64 = ["//tools/bazeldefs:qemu_x86_64"],
+            arm64 = ["//tools/bazeldefs:qemu_aarch64"],
+            riscv64 = ["//tools/bazeldefs:qemu_riscv64"],
+            default = [],
+        ),
+        cmd = select_arch(
+            amd64 = "$(execpath //tools/bazeldefs:qemu_x86_64)",
+            arm64 = "$(execpath //tools/bazeldefs:qemu_aarch64) -cpu neoverse-n1",
+            riscv64 = "$(execpath //tools/bazeldefs:qemu_riscv64)",
+            default = "",
+        ),
+    )
+
+def target_emulators(name):
+    """Defines the user-mode emulators used by target_emulator.
+
+    Each emulator is the pinned QEMU build for the execution platform's
+    architecture (see extensions/deb_data.bzl), or a stub that fails if there
+    is none. This must only be called from tools/bazeldefs/BUILD.
 
     Args:
-      name: target name for BPF program.
-      src: BPF program source code in C.
-      bpf_object: name of generated bpf object code.
-      visibility: target visibility.
-      hdrs: header files, but currently unsupported.
+      name: prefix of the emulator targets, which are named <name>_<arch>.
     """
-    if hdrs != []:
-        fail("hdrs attribute is unsupported")
-
-    native.genrule(
-        name = name,
-        srcs = [src],
-        visibility = visibility,
-        outs = [bpf_object],
-        cmd = "clang -O2 -Wall -Werror -target bpf -c $< -o $@ -I/usr/include/$$(uname -m)-linux-gnu",
+    native.alias(
+        name = name + "_aarch64",
+        actual = select({
+            ":amd64": "@qemu_user_amd64_files//:usr/bin/qemu-aarch64",
+            "//conditions:default": ":no_emulator.sh",
+        }),
+        tags = ["manual"],
     )
+    native.alias(
+        name = name + "_riscv64",
+        actual = select({
+            ":amd64": "@qemu_user_amd64_files//:usr/bin/qemu-riscv64",
+            ":arm64": "@qemu_user_arm64_files//:usr/bin/qemu-riscv64",
+            "//conditions:default": ":no_emulator.sh",
+        }),
+        tags = ["manual"],
+    )
+    native.alias(
+        name = name + "_x86_64",
+        actual = select({
+            ":arm64": "@qemu_user_arm64_files//:usr/bin/qemu-x86_64",
+            "//conditions:default": ":no_emulator.sh",
+        }),
+        tags = ["manual"],
+    )
+
+def _bpf_program_impl(ctx):
+    resource_dir = ctx.attr._clang_resource_dir[DirectoryInfo]
+    kernel_headers = ctx.attr._kernel_headers[DirectoryInfo]
+    libbpf = ctx.attr._libbpf[CcInfo].compilation_context
+
+    args = ctx.actions.args()
+    args.add_all(["-O2", "-Wall", "-Werror", "--target=bpfel"])
+
+    # Keep the oldest BPF ISA instead of inheriting Clang's default (now v3):
+    # https://github.com/llvm/llvm-project/blob/85ac56026/llvm/lib/Target/BPF/BPFSubtarget.cpp#L75
+    args.add("-mcpu=v1")
+    args.add("-nostdinc")
+    args.add("-resource-dir", resource_dir.path)
+    args.add("-isystem", resource_dir.path + "/include")
+    args.add("-isystem", kernel_headers.path)
+    args.add_all(libbpf.includes, before_each = "-isystem")
+    args.add_all(libbpf.quote_includes, before_each = "-iquote")
+    args.add_all(libbpf.system_includes, before_each = "-isystem")
+    args.add("-c", ctx.file.src)
+    args.add("-o", ctx.outputs.bpf_object)
+    ctx.actions.run(
+        executable = ctx.executable._clang,
+        arguments = [args],
+        inputs = depset(
+            [ctx.file.src] + ctx.files.hdrs,
+            transitive = [
+                resource_dir.transitive_files,
+                kernel_headers.transitive_files,
+                libbpf.headers,
+            ],
+        ),
+        outputs = [ctx.outputs.bpf_object],
+        mnemonic = "BPFCompile",
+        progress_message = "Compiling BPF program %{label}",
+    )
+    return [DefaultInfo(files = depset([ctx.outputs.bpf_object]))]
+
+bpf_program = rule(
+    implementation = _bpf_program_impl,
+    doc = "Compiles a BPF program with declared compiler and header inputs.",
+    attrs = {
+        "src": attr.label(allow_single_file = [".c"], mandatory = True),
+        "hdrs": attr.label_list(allow_files = [".h"]),
+        "bpf_object": attr.output(mandatory = True),
+        "_clang": attr.label(
+            default = "//tools/bazeldefs/llvm:bpf_clang",
+            executable = True,
+            allow_single_file = True,
+            cfg = "exec",
+        ),
+        "_clang_resource_dir": attr.label(
+            default = "//tools/bazeldefs/llvm:clang_resource_dir",
+            providers = [DirectoryInfo],
+            cfg = "exec",
+        ),
+        "_kernel_headers": attr.label(
+            default = "@kernel_headers//:kernel_headers_directory",
+            providers = [DirectoryInfo],
+        ),
+        "_libbpf": attr.label(default = "@libbpf//:bpf_headers", providers = [CcInfo]),
+    },
+)

@@ -33,9 +33,11 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/runsc/autoplatform"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
@@ -58,9 +60,12 @@ var (
 )
 
 // Run runs the binary, whose behavior is determined by the subcommand passed
-// on the command line. commands is a mapping of all top level runsc commands
-// to their command group name. helpTopics is a list of additional help topics.
-func Run(commands map[util.SubCommand]string, helpTopics []subcommands.Command) {
+// on the command line.
+// `sidecar` is the calling sidecar binary, or `nil` when called by `runsc`.
+// `commands` is a mapping of all top-level commands to their command group
+// name.
+// `helpTopics` is a list of additional help topics.
+func Run(sidecar *gvisorbinaries.Binary, commands map[util.SubCommand]string, helpTopics []subcommands.Command) {
 	// Set the start time as soon as possible.
 	startTime := starttime.Get()
 
@@ -174,6 +179,12 @@ func Run(commands map[util.SubCommand]string, helpTopics []subcommands.Command) 
 		}
 	}
 
+	// Replace --platform=auto with a concrete platform. Child processes
+	// receive the concrete platform through their flags.
+	if err := autoplatform.Resolve(conf, spec); err != nil {
+		util.Fatalf("%v", err)
+	}
+
 	// Construct LogFileOpts for the subcommand.
 	lfOpts := &specutils.LogFileOpts{
 		SandboxID: "<unknown>",
@@ -225,7 +236,7 @@ func Run(commands map[util.SubCommand]string, helpTopics []subcommands.Command) 
 	} else {
 		// Stderr is reserved for the application, just discard the logs if no debug
 		// log is specified.
-		emitters = append(emitters, newEmitter("text", io.Discard))
+		emitters = append(emitters, discardEmitter{})
 	}
 
 	if *panicLogFD > -1 || *debugLogFD > -1 {
@@ -281,6 +292,8 @@ func Run(commands map[util.SubCommand]string, helpTopics []subcommands.Command) 
 		}
 	}
 	log.Infof(delimString)
+	gvisorbinaries.ReleaseEnforcementPolicy = conf.SidecarReleaseEnforcementPolicy
+	gvisorbinaries.VerifyMatchingRelease(sidecar)
 
 	if *coverageFD >= 0 {
 		f := os.NewFile(uintptr(*coverageFD), "coverage file")
@@ -320,6 +333,12 @@ func Run(commands map[util.SubCommand]string, helpTopics []subcommands.Command) 
 	os.Exit(128)
 }
 
+// discardEmitter drops logs without formatting them.
+type discardEmitter struct{}
+
+// Emit implements log.Emitter.Emit.
+func (discardEmitter) Emit(int, log.Level, time.Time, string, ...any) {}
+
 func newEmitter(format string, logFile io.Writer) log.Emitter {
 	switch format {
 	case "text":
@@ -340,7 +359,7 @@ func userLogEmitter(conf *config.Config, subcommand string) (log.Emitter, bool) 
 	}
 	// We need to manually scan for `--user-log-fd` since it is a flag of the
 	// `boot` subcommand. We know it is in `--user-log-fd=FD` format because
-	// we control how arguments to `runsc boot` are formatted.
+	// we control how arguments to the `boot` subcommand are formatted.
 	const userLogFDFlagPrefix = "--user-log-fd="
 	var userLog *os.File
 	for _, arg := range os.Args[1:] {

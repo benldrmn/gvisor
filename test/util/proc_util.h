@@ -15,6 +15,8 @@
 #ifndef GVISOR_TEST_UTIL_PROC_UTIL_H_
 #define GVISOR_TEST_UTIL_PROC_UTIL_H_
 
+#include <sys/types.h>
+
 #include <ostream>
 #include <string>
 #include <vector>
@@ -178,13 +180,12 @@ MATCHER_P(ContainsMappings, mappings,
   // the major, minor, and inode fields.
   bool all_present = true;
   std::for_each(mappings.begin(), mappings.end(), [&](const ProcMapsEntry& e1) {
-    auto it =
-        absl::c_find_if(maps, [&e1](const ProcMapsEntry& e2) {
-          return e1.start == e2.start && e1.end == e2.end &&
-                 e1.readable == e2.readable && e1.writable == e2.writable &&
-                 e1.executable == e2.executable && e1.priv == e2.priv &&
-                 e1.offset == e2.offset && e1.filename == e2.filename;
-        });
+    auto it = absl::c_find_if(maps, [&e1](const ProcMapsEntry& e2) {
+      return e1.start == e2.start && e1.end == e2.end &&
+             e1.readable == e2.readable && e1.writable == e2.writable &&
+             e1.executable == e2.executable && e1.priv == e2.priv &&
+             e1.offset == e2.offset && e1.filename == e2.filename;
+    });
     if (it == maps.end()) {
       // It wasn't found.
       if (all_present) {

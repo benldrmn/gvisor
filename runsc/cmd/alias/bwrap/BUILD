@@ -18,9 +18,9 @@ go_library(
         "//pkg/log",
         "//runsc/cmd/util",
         "//runsc/config",
-        "//runsc/container",
         "//runsc/flag",
         "//runsc/specutils",
+        "//sandboxexec/sandbox",
         "@com_github_google_subcommands//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
@@ -30,11 +30,14 @@ go_library(
 go_test(
     name = "bwrap_test",
     srcs = ["bwrap_test.go"],
-    library = ":bwrap",
+    embed = [":bwrap"],
     deps = [
+        "//runsc/config",
+        "//sandboxexec/sandbox",
         "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
@@ -42,16 +45,17 @@ go_test(
     name = "bwrap_integration_test",
     srcs = ["bwrap_integration_test.go"],
     data = [
-        "//runsc",
+        "//:release",
     ],
-    library = ":bwrap",
+    embed = [":bwrap"],
+    local = True,
     tags = [
-        "local",
         "manual",
     ],
     deps = [
         "//pkg/test/testutil",
         "//runsc/specutils",
         "@com_github_google_go_cmp//cmp:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

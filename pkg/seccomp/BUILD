@@ -21,7 +21,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/bpf",
         "//pkg/log",
-        "//pkg/sync",
+        "//pkg/timing",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -32,10 +32,10 @@ go_test(
     srcs = [
         "seccomp_test.go",
     ],
+    embed = [":seccomp"],
     embedsrcs = [
         "//pkg/seccomp/victim",  # keep
     ],
-    library = ":seccomp",
     deps = [
         "//pkg/abi/linux",
         "//pkg/bpf",

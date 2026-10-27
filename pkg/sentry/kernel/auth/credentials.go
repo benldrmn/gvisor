@@ -17,8 +17,6 @@ package auth
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
 
 // Credentials contains information required to authorize privileged operations
@@ -35,9 +33,12 @@ type Credentials struct {
 	EffectiveKGID KGID
 	SavedKGID     KGID
 
-	// Filesystem user/group IDs are not implemented. "... setfsuid() is
-	// nowadays unneeded and should be avoided in new applications (likewise
-	// for setfsgid(2))." - setfsuid(2)
+	// Filesystem user/group IDs in the root user namespace, used for
+	// filesystem permission checks and as the owner of new files. They follow
+	// the effective IDs except when changed by setfsuid(2)/setfsgid(2).
+	// Analogous to Linux's struct cred::fsuid/fsgid. Never NoID.
+	FilesystemKUID KUID
+	FilesystemKGID KGID
 
 	// Supplementary groups used by set/getgroups.
 	//
@@ -56,6 +57,11 @@ type Credentials struct {
 	// maintained after a switch from root user to non-root user via setuid().
 	KeepCaps bool
 
+	// NoSetUIDFixup is SECBIT_NO_SETUID_FIXUP. If set, changing the real,
+	// effective or saved UID between 0 and nonzero does not change
+	// capabilities.
+	NoSetUIDFixup bool
+
 	// The user namespace associated with the owner of the credentials.
 	UserNamespace *UserNamespace
 }
@@ -70,13 +76,15 @@ func NewAnonymousCredentials() *Credentials {
 	// hierarchy, the returned credentials do not have any capabilities in any
 	// other namespace.
 	return &Credentials{
-		RealKUID:      NobodyKUID,
-		EffectiveKUID: NobodyKUID,
-		SavedKUID:     NobodyKUID,
-		RealKGID:      NobodyKGID,
-		EffectiveKGID: NobodyKGID,
-		SavedKGID:     NobodyKGID,
-		UserNamespace: NewRootUserNamespace(),
+		RealKUID:       NobodyKUID,
+		EffectiveKUID:  NobodyKUID,
+		SavedKUID:      NobodyKUID,
+		FilesystemKUID: NobodyKUID,
+		RealKGID:       NobodyKGID,
+		EffectiveKGID:  NobodyKGID,
+		SavedKGID:      NobodyKGID,
+		FilesystemKGID: NobodyKGID,
+		UserNamespace:  NewRootUserNamespace(),
 	}
 }
 
@@ -87,16 +95,18 @@ func NewRootCredentials(ns *UserNamespace) *Credentials {
 	// inheritable capability set to be initially empty (the capabilities test
 	// checks for this property).
 	return &Credentials{
-		RealKUID:      RootKUID,
-		EffectiveKUID: RootKUID,
-		SavedKUID:     RootKUID,
-		RealKGID:      RootKGID,
-		EffectiveKGID: RootKGID,
-		SavedKGID:     RootKGID,
-		PermittedCaps: AllCapabilities,
-		EffectiveCaps: AllCapabilities,
-		BoundingCaps:  AllCapabilities,
-		UserNamespace: ns,
+		RealKUID:       RootKUID,
+		EffectiveKUID:  RootKUID,
+		SavedKUID:      RootKUID,
+		FilesystemKUID: RootKUID,
+		RealKGID:       RootKGID,
+		EffectiveKGID:  RootKGID,
+		SavedKGID:      RootKGID,
+		FilesystemKGID: RootKGID,
+		PermittedCaps:  AllCapabilities,
+		EffectiveCaps:  AllCapabilities,
+		BoundingCaps:   AllCapabilities,
+		UserNamespace:  ns,
 	}
 }
 
@@ -111,12 +121,14 @@ func NewUserCredentials(kuid KUID, kgid KGID, extraKGIDs []KGID, capabilities *T
 	creds.RealKUID = uid
 	creds.EffectiveKUID = uid
 	creds.SavedKUID = uid
+	creds.FilesystemKUID = uid
 
 	// Set GID.
 	gid := kgid
 	creds.RealKGID = gid
 	creds.EffectiveKGID = gid
 	creds.SavedKGID = gid
+	creds.FilesystemKGID = gid
 
 	// Set additional GIDs.
 	creds.ExtraKGIDs = append(creds.ExtraKGIDs, extraKGIDs...)
@@ -172,13 +184,14 @@ func (c *Credentials) ForkIntoUserNamespace(ns *UserNamespace) *Credentials {
 	// values (all flags disabled) in the child (for clone(2)) or caller (for
 	// unshare(2), or setns(2)." - user_namespaces(7)
 	nc.KeepCaps = false
+	nc.NoSetUIDFixup = false
 	return nc
 }
 
 // InGroup returns true if c is in group kgid. Compare Linux's
 // kernel/groups.c:in_group_p().
 func (c *Credentials) InGroup(kgid KGID) bool {
-	if c.EffectiveKGID == kgid {
+	if c.FilesystemKGID == kgid {
 		return true
 	}
 	for _, extraKGID := range c.ExtraKGIDs {
@@ -268,18 +281,4 @@ func (c *Credentials) UseGID(gid GID) (KGID, error) {
 		return kgid, nil
 	}
 	return NoID, linuxerr.EPERM
-}
-
-// LoadSeccheckData sets credential data based on mask.
-func (c *Credentials) LoadSeccheckData(mask seccheck.FieldMask, info *pb.ContextData) {
-	if mask.Contains(seccheck.FieldCtxtCredentials) {
-		info.Credentials = &pb.Credentials{
-			RealUid:      uint32(c.RealKUID),
-			EffectiveUid: uint32(c.EffectiveKUID),
-			SavedUid:     uint32(c.SavedKUID),
-			RealGid:      uint32(c.RealKGID),
-			EffectiveGid: uint32(c.EffectiveKGID),
-			SavedGid:     uint32(c.SavedKGID),
-		}
-	}
 }

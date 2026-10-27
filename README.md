@@ -3,7 +3,6 @@
 [![Build status](https://badge.buildkite.com/3b159f20b9830461a71112566c4171c0bdfd2f980a8e4c0ae6.svg?branch=master)](https://buildkite.com/gvisor/pipeline)
 [![Issue reviver](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml)
 [![CodeQL](https://github.com/google/gvisor/actions/workflows/codeql.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/codeql.yml)
-[![gVisor chat](https://badges.gitter.im/gvisor/community.png)](https://gitter.im/gvisor/community)
 [![code search](https://img.shields.io/badge/code-search-blue)](https://cs.opensource.google/gvisor/gvisor)
 
 ## What is gVisor?
@@ -68,17 +67,18 @@ dependencies are wrapped in a build container. It is possible to use
 
 Make sure the following dependencies are installed:
 
-*   Linux 4.14.77+ ([older linux][old-linux])
+*   Linux 5.6+
 *   [Docker version 17.09.0 or greater][docker]
 
 ### Building
 
-Build and install the `runsc` binary:
+Build a release tarball containing `runsc`, the `containerd-shim-runsc-v1`
+containerd shim, and a few sidecar binaries that `runsc` expects to find in a
+`gvisor-bin/` directory next to itself, then extract it to `/usr/local/bin`:
 
 ```sh
-mkdir -p bin
-make copy TARGETS=runsc DESTINATION=bin/
-sudo cp ./bin/runsc /usr/local/bin
+make release-tarball DESTINATION=bin/
+sudo tar -C /usr/local/bin -xf bin/gvisor.tar.bz2
 ```
 
 To build specific libraries or binaries, you can specify the target:
@@ -100,7 +100,7 @@ to get started:
 After setting up dependencies, using Bazel is similar to the Makefile:
 
 ```sh
-bazel build //runsc:runsc
+bazel build -c opt //debian:gvisor-release-tar-bz2
 ```
 
 ### Testing
@@ -137,29 +137,29 @@ $(brew --prefix bazel@8)/bin/bazel test --macos_sdk_version=$(xcrun --show-sdk-v
 
 This project uses [bazel][bazel] to build and manage dependencies. A synthetic
 `go` branch is maintained that is compatible with standard `go` tooling for
-convenience.
+convenience. This is useful for external packages and libraries that depend on
+gVisor subpackages (e.g. userspace networking via Netstack) to import gVisor Go
+code into their Go projects.
 
-For example, to build and install `runsc` directly from this branch:
-
-```sh
-echo "module runsc" > go.mod
-GO111MODULE=on go get gvisor.dev/gvisor/runsc@go
-CGO_ENABLED=0 GO111MODULE=on sudo -E go build -o /usr/local/bin/runsc gvisor.dev/gvisor/runsc
-```
-
-Subsequently, you can build and install the shim binary for `containerd`:
+Select this branch explicitly with the `go` branch query. `@latest` resolves
+`master`, which requires Bazel and is not compatible with standard Go tooling:
 
 ```sh
-GO111MODULE=on sudo -E go build -o /usr/local/bin/containerd-shim-runsc-v1 gvisor.dev/gvisor/shim
+go get gvisor.dev/gvisor/pkg/tcpip/transport/tcp@go
 ```
 
-Note that this branch is supported in a best effort capacity, and direct
-development on this branch is not supported. Development should occur on the
-`master` branch, which is then reflected into the `go` branch.
+**NOTE**: **`runsc` builds from this branch are not supported**. gVisor and
+`runsc` require several binaries (some of which are not even written in Go) in
+order to function. The `go` branch is supported in a best effort capacity, and
+direct development on this branch is not supported. Development should occur on
+the `master` branch, which is then reflected into the `go` branch.
 
 ## Community & Governance
 
 See [GOVERNANCE.md](GOVERNANCE.md) for project governance information.
+
+See [ADOPTERS.md](ADOPTERS.md) for a list of known production users and
+adopters.
 
 The [gvisor-users mailing list][gvisor-users-list] and
 [gvisor-dev mailing list][gvisor-dev-list] are good starting points for
@@ -168,6 +168,10 @@ questions and discussion.
 ## Security Policy
 
 See [SECURITY.md](SECURITY.md).
+
+## Releases
+
+See [Releases](g3doc/release.md).
 
 ## Contributing
 
@@ -180,6 +184,5 @@ See [Contributing.md](CONTRIBUTING.md).
 [gvisor-dev-list]: https://groups.google.com/forum/#!forum/gvisor-dev
 [linux]: https://en.wikipedia.org/wiki/Linux_kernel_interfaces
 [oci]: https://www.opencontainers.org
-[old-linux]: https://gvisor.dev/docs/user_guide/networking/#gso
 [sandbox]: https://en.wikipedia.org/wiki/Sandbox_(computer_security)
 [bazelisk]: https://github.com/bazelbuild/bazelisk

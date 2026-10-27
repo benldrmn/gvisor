@@ -19,17 +19,20 @@ package platform
 
 import (
 	"fmt"
+	"sort"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -68,7 +71,7 @@ type Platform interface {
 	MaxUserAddress() hostarch.Addr
 
 	// NewAddressSpace returns a new memory context for this platform.
-	NewAddressSpace() (AddressSpace, error)
+	NewAddressSpace(opts AddressSpaceOptions) (AddressSpace, error)
 
 	// NewContext returns a new execution context.
 	NewContext(context.Context) Context
@@ -117,6 +120,18 @@ type Platform interface {
 	NumCPUs() int
 }
 
+// TSCAdjustablePlatform is an optional interface that may be implemented by a
+// Platform that applies an offset to the guest TSC.
+type TSCAdjustablePlatform interface {
+	// TSCOffset returns the offset the platform applies to the guest TSC,
+	// as a two's-complement value in host TSC cycles.
+	TSCOffset() uint64
+
+	// TSCFrequency returns the frequency in Hz at which the host TSC
+	// advances, and whether the platform was able to determine it.
+	TSCFrequency() (uint64, bool)
+}
+
 // NoCPUPreemptionDetection implements Platform.DetectsCPUPreemption and
 // dependent methods for Platforms that do not support this feature.
 type NoCPUPreemptionDetection struct{}
@@ -151,46 +166,50 @@ func (NoCPUNumbers) PreemptCPU(int32) error {
 }
 
 // UseHostGlobalMemoryBarrier implements Platform.HaveGlobalMemoryBarrier and
-// Platform.GlobalMemoryBarrier by invoking equivalent functionality on the
-// host.
-type UseHostGlobalMemoryBarrier struct{}
+// Platform.GlobalMemoryBarrier by invoking the host global memory barrier.
+// Platforms must populate `MemBarrier` from `<-hostmm.Probe(false)`.
+type UseHostGlobalMemoryBarrier struct {
+	MemBarrier hostmm.HostMemBarrier
+}
 
 // HaveGlobalMemoryBarrier implements Platform.HaveGlobalMemoryBarrier.
-func (UseHostGlobalMemoryBarrier) HaveGlobalMemoryBarrier() bool {
-	return hostmm.HaveGlobalMemoryBarrier()
+func (u UseHostGlobalMemoryBarrier) HaveGlobalMemoryBarrier() bool {
+	return u.MemBarrier.HaveGlobalMemoryBarrier()
 }
 
 // GlobalMemoryBarrier implements Platform.GlobalMemoryBarrier.
-func (UseHostGlobalMemoryBarrier) GlobalMemoryBarrier() error {
-	return hostmm.GlobalMemoryBarrier()
+func (u UseHostGlobalMemoryBarrier) GlobalMemoryBarrier() error {
+	return u.MemBarrier.GlobalMemoryBarrier()
 }
 
 // UseHostProcessMemoryBarrier implements Platform.HaveGlobalMemoryBarrier and
-// Platform.GlobalMemoryBarrier by invoking a process-local memory barrier.
-// This is faster than UseHostGlobalMemoryBarrier, but is only appropriate for
-// platforms for which application code executes while using the sentry's
-// mm_struct.
-type UseHostProcessMemoryBarrier struct{}
+// Platform.GlobalMemoryBarrier by preferring a process-local (private-expedited)
+// memory barrier, falling back to host global otherwise.
+// This is faster than UseHostGlobalMemoryBarrier, but only appropriate for
+// platforms for which application code executes while using the
+// sentry's mm_struct.
+// Platforms must populate `MemBarrier` from `<-hostmm.Probe(true)`.
+type UseHostProcessMemoryBarrier struct {
+	MemBarrier hostmm.HostMemBarrier
+}
 
 // HaveGlobalMemoryBarrier implements Platform.HaveGlobalMemoryBarrier.
-func (UseHostProcessMemoryBarrier) HaveGlobalMemoryBarrier() bool {
-	// Fall back to a global memory barrier if a process-local one isn't
-	// available.
-	return hostmm.HaveProcessMemoryBarrier() || hostmm.HaveGlobalMemoryBarrier()
+func (u UseHostProcessMemoryBarrier) HaveGlobalMemoryBarrier() bool {
+	return u.MemBarrier.HaveProcessMemoryBarrier() || u.MemBarrier.HaveGlobalMemoryBarrier()
 }
 
 // GlobalMemoryBarrier implements Platform.GlobalMemoryBarrier.
-func (UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
-	if hostmm.HaveProcessMemoryBarrier() {
-		return hostmm.ProcessMemoryBarrier()
+func (u UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
+	if u.MemBarrier.HaveProcessMemoryBarrier() {
+		return u.MemBarrier.ProcessMemoryBarrier()
 	}
-	return hostmm.GlobalMemoryBarrier()
+	return u.MemBarrier.GlobalMemoryBarrier()
 }
 
 // MemoryManager represents an abstraction above the platform address space
 // which manages memory mappings and their contents.
 type MemoryManager interface {
-	//usermem.IO provides access to the contents of a virtual memory space.
+	// usermem.IO provides access to the contents of a virtual memory space.
 	usermem.IO
 	// MMap establishes a memory mapping.
 	MMap(ctx context.Context, opts memmap.MMapOpts) (hostarch.Addr, error)
@@ -387,16 +406,32 @@ type AddressSpace interface {
 	// PostFork() is called after creating a copy of AddressSpace.
 	PostFork()
 
+	// UserModifiedGS notifies the address space that the user has modified the GS
+	// register.
+	UserModifiedGS(ctx context.Context, mm MemoryManager) error
+
 	// AddressSpaceIO methods are supported iff the associated platform's
 	// Platform.SupportsAddressSpaceIO() == true. AddressSpaces for which this
 	// does not hold may panic if AddressSpaceIO methods are invoked.
 	AddressSpaceIO
 }
 
+// AddressSpaceOptions contains options for Platform.NewAddressSpace.
+type AddressSpaceOptions struct {
+	// DisableSyscallPatching is used by systrap to indicate that the platform must not patch
+	// application syscall instructions in this address space.
+	//
+	// It is set when the application in the corresponding MemoryManager has
+	// decided to use the GS register, meaning we can no longer patch system calls.
+	// Since a MemoryManager acquires a fresh AddressSpace on fork() and after
+	// restore, it must be initialized to match the parent's state.
+	DisableSyscallPatching bool
+}
+
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //
-// AddressSpaceIO implementors are responsible for ensuring that address ranges
+// AddressSpaceIO implementers are responsible for ensuring that address ranges
 // are application-mappable.
 type AddressSpaceIO interface {
 	// CopyOut copies len(src) bytes from src to the memory mapped at addr. It
@@ -488,13 +523,6 @@ type AddressSpaceIOUnavailable struct{}
 // Error implements error.Error.
 func (AddressSpaceIOUnavailable) Error() string {
 	return "platform.AddressSpaceIO currently unavailable"
-}
-
-// Requirements is used to specify platform specific requirements.
-type Requirements struct {
-	// RequiresCapSysPtrace indicates that the sandbox has to be started with
-	// the CAP_SYS_PTRACE capability.
-	RequiresCapSysPtrace bool
 }
 
 // SeccompInfo represents seccomp-bpf data for a given platform.
@@ -599,6 +627,18 @@ type Options struct {
 	// SandboxID is the sandbox identifier, used by slimvm to pass to the
 	// host kernel module for sandbox identification.
 	SandboxID string
+
+	// StartupTimer is the timer tracking overall sandbox startup.
+	// Platform constructors should record any relevant midpoints on it.
+	StartupTimer *timing.Timer
+
+	// PinRing is as an accumulator for host FDs that are expensive to release.
+	// It allows releasing them asynchronously.
+	// See `//pkg/pinring`.
+	PinRing *pinring.PinRing
+
+	// TSCOffset is an offset to apply to the guest TSC counter (currently KVM only).
+	TSCOffset uint64
 }
 
 // Constructor represents a platform type.
@@ -609,14 +649,6 @@ type Constructor interface {
 	//
 	//	* opts - Platform customization bits.
 	New(opts Options) (Platform, error)
-
-	// OpenDevice opens the path to the device used by the platform.
-	// Passing in an empty string will use the default path for the device,
-	// e.g. "/dev/kvm" for the KVM platform.
-	OpenDevice(devicePath string) (*fd.FD, error)
-
-	// Requirements returns platform specific requirements.
-	Requirements() Requirements
 
 	// PrecompiledSeccompInfo returns a list of `SeccompInfo`s that is
 	// useful to precompile into the Sentry.
@@ -636,6 +668,7 @@ func List() (available []string) {
 	for name := range platforms {
 		available = append(available, name)
 	}
+	sort.Strings(available)
 	return
 }
 

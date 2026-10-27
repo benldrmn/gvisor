@@ -18,6 +18,7 @@
 #ifdef __linux__
 #include <linux/errqueue.h>
 #include <linux/in6.h>
+#include <netinet/ip_icmp.h>
 #endif  // __linux__
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -28,7 +29,14 @@
 #include <sys/types.h>
 #include <sys/un.h>
 
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "test/util/logging.h"
+#include "test/util/posix_error.h"
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 
@@ -491,10 +499,7 @@ TEST_P(UDPSocketPairTest, TOSRecvMismatch) {
 
 // Test that an IPv4 socket does not support the IPv6 TClass option.
 TEST_P(UDPSocketPairTest, TClassRecvMismatch) {
-  // This should only test AF_INET6 sockets for the mismatch behavior.
-  SKIP_IF(GetParam().domain != AF_INET6);
-  // IPV6_RECVTCLASS is only valid for SOCK_DGRAM and SOCK_RAW.
-  SKIP_IF((GetParam().type != SOCK_DGRAM) || (GetParam().type != SOCK_RAW));
+  SKIP_IF(GetParam().domain != AF_INET);
 
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 

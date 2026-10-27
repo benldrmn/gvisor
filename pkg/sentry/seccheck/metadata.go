@@ -48,6 +48,7 @@ const (
 	FieldCtxtThreadStartTime
 	FieldCtxtTime
 	FieldCtxtParentThreadGroupID
+	FieldCtxtIsExecSession
 )
 
 // Fields for container/start point.
@@ -63,12 +64,25 @@ const (
 	// about the binary being executed.
 	FieldSentryExecveBinaryInfo Field = iota
 
-	// FieldSentryExecveBinarySha256 is an optional field to collect the SHA-256
+	// FieldSentryExecveBinarySHA256 is an optional field to collect the SHA-256
 	// hash of the binary being executed.
-	FieldSentryExecveBinarySha256
+	FieldSentryExecveBinarySHA256
+
+	// FieldSentryExecveBinarySHA1 is an optional field to collect the SHA-1
+	// hash of the binary being executed.
+	FieldSentryExecveBinarySHA1
+
+	// FieldSentryExecveFdInfo is an optional field to collect information
+	// about standard file descriptors (stdin, stdout, stderr).
+	FieldSentryExecveFdInfo
+
+	// FieldSentryExecvePipeProcInfo is an optional field to collect lightweight
+	// information about sibling processes connected via pipes.
+	FieldSentryExecvePipeProcInfo
 )
 
-// Points is a map with all the trace points registered in the system.
+// Points is a map with all the trace points available in the system, keyed by
+// name. It is empty until Initialize is called.
 var Points = map[string]PointDesc{}
 
 // Sinks is a map with all the sinks registered in the system.
@@ -116,6 +130,10 @@ var defaultContextFields = []FieldDesc{
 		ID:   FieldCtxtParentThreadGroupID,
 		Name: "parent_thread_group_id",
 	},
+	{
+		ID:   FieldCtxtIsExecSession,
+		Name: "is_exec_session",
+	},
 }
 
 // SinkDesc describes a sink that is available to be configured.
@@ -128,7 +146,7 @@ type SinkDesc struct {
 	// is called. config is an opaque json object passed to the sink.
 	Setup func(config map[string]any) (*os.File, error)
 	// New creates a new sink. config is an opaque json object passed to the sink.
-	// endpoing is a file descriptor to the file returned in Setup. It's set to -1
+	// endpoint is a file descriptor to the file returned in Setup. It's set to -1
 	// if Setup returned nil.
 	New func(config map[string]any, endpoint *fd.FD) (Sink, error)
 }
@@ -251,8 +269,20 @@ func genericInit() {
 				Name: "binary_info",
 			},
 			{
-				ID:   FieldSentryExecveBinarySha256,
+				ID:   FieldSentryExecveBinarySHA256,
 				Name: "binary_sha256",
+			},
+			{
+				ID:   FieldSentryExecveBinarySHA1,
+				Name: "binary_sha1",
+			},
+			{
+				ID:   FieldSentryExecveFdInfo,
+				Name: "fd_info",
+			},
+			{
+				ID:   FieldSentryExecvePipeProcInfo,
+				Name: "pipe_proc_info",
 			},
 		},
 		ContextFields: defaultContextFields,
@@ -313,8 +343,10 @@ func genericInit() {
 
 var initOnce sync.Once
 
-// Initialize initializes the Points available in the system.
-// Must be called prior to using any of them.
+// Initialize fills Points with all the trace points available in the system.
+// It must be called before Points is read. Other functions in this package
+// call it when they need Points, so that sandboxes that never create a trace
+// session do not pay for it.
 func Initialize() {
 	initOnce.Do(func() {
 		genericInit()

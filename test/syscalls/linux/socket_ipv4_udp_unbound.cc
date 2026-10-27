@@ -15,20 +15,25 @@
 #include "test/syscalls/linux/socket_ipv4_udp_unbound.h"
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <memory>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/cleanup/cleanup.h"
 #include "test/syscalls/linux/ip_socket_test_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 
@@ -88,7 +93,7 @@ TEST_P(IPv4UDPUnboundSocketTest, IpMulticastLoopbackNoGroup) {
 // from being sent. Group membership interface configured by address.
 TEST_P(IPv4UDPUnboundSocketTest, IpMulticastLoopbackAddrNoDefaultSendIf) {
   // TODO(b/185517803): Fix for native test.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   auto socket1 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto socket2 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
@@ -128,7 +133,7 @@ TEST_P(IPv4UDPUnboundSocketTest, IpMulticastLoopbackAddrNoDefaultSendIf) {
 // from being sent. Group membership interface configured by NIC ID.
 TEST_P(IPv4UDPUnboundSocketTest, IpMulticastLoopbackNicNoDefaultSendIf) {
   // TODO(b/185517803): Fix for native test.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   auto socket1 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto socket2 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 

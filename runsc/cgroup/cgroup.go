@@ -25,8 +25,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff"
@@ -43,10 +45,57 @@ const (
 
 	// procRoot is the procfs root this module uses.
 	procRoot = "/proc"
-
-	// cgroupRoot is the cgroupfs root this module uses.
-	cgroupRoot = "/sys/fs/cgroup"
 )
+
+var (
+	cgroupRootInternal string
+	cgroupRootOnce     sync.Once
+)
+
+// cgroupRoot returns the cgroupfs root this module uses.
+func cgroupRoot() string {
+	cgroupRootOnce.Do(func() {
+		cgroupRootInternal = findCgroupRoot()
+	})
+	return cgroupRootInternal
+}
+
+// findCgroupRoot parses /proc/self/mountinfo to dynamically detect the cgroup root path.
+// It defaults to "/sys/fs/cgroup" if detection fails.
+func findCgroupRoot() string {
+	f, err := os.Open(filepath.Join(procRoot, "self/mountinfo"))
+	if err != nil {
+		return "/sys/fs/cgroup"
+	}
+	defer f.Close()
+
+	return parseCgroupRoot(f)
+}
+
+func parseCgroupRoot(r io.Reader) string {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 9 {
+			continue
+		}
+		fstype := fields[len(fields)-3]
+		if fstype == cgroupv1FsName || fstype == cgroupv2FsName {
+			mountPoint := fields[4]
+			// If mountPoint is a controller subdirectory (e.g., /sys/fs/cgroup/memory,
+			// /sys/fs/cgroup/cpu,cpuacct, or /sys/fs/cgroup/unified), return its parent
+			// directory as the cgroup root. Otherwise, return mountPoint directly
+			// (e.g., /sys/fs/cgroup or /dev/cgroup).
+			base := filepath.Base(mountPoint)
+			name := strings.TrimPrefix(base, "name=")
+			if _, ok := controllers[name]; ok || base == "unified" || strings.Contains(base, ",") {
+				return filepath.Dir(mountPoint)
+			}
+			return mountPoint
+		}
+	}
+	return "/sys/fs/cgroup"
+}
 
 var controllers = map[string]controller{
 	"blkio":    &blockIO{},
@@ -60,18 +109,25 @@ var controllers = map[string]controller{
 
 	// These controllers either don't have anything in the OCI spec or is
 	// irrelevant for a sandbox.
-	"cpuacct":    &noop{},
-	"devices":    &noop{},
-	"freezer":    &noop{},
+	"borglet": &noop{},
+	"cpuacct": &noop{},
+	"devices": &noop{},
+	"freezer": &noop{},
+	"io":      &noop{},
+	"job":     &noop{},
+	"misc":    &noop{},
+	// Optional: runsc functions correctly without v1 netcg or /dev/cgroup/net.
+	"net":        &noop{},
 	"perf_event": &noop{},
 	"rdma":       &noop{},
+	"rlimit":     &noop{},
 	"systemd":    &noop{},
 }
 
 // IsOnlyV2 checks whether cgroups V2 is enabled and V1 is not.
 func IsOnlyV2() bool {
 	var stat unix.Statfs_t
-	if err := unix.Statfs(cgroupRoot, &stat); err != nil {
+	if err := unix.Statfs(cgroupRoot(), &stat); err != nil {
 		// It's not used for anything important, assume not V2 on failure.
 		return false
 	}
@@ -319,6 +375,7 @@ type Cgroup interface {
 	Update(res *specs.LinuxResources) error
 	Uninstall() error
 	Join() (func(), error)
+	CloneIntoCgroup() (*os.File, error)
 	CPUQuota() (int64, error)
 	CPUPeriod() (int64, error)
 	CPUUsage() (uint64, error)
@@ -415,7 +472,7 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 			cgroupsPath = filepath.Join(filepath.Dir(p), cgroupsPath)
 		}
 		// Assume that for v2, cgroup is always mounted at cgroupRoot.
-		cg, err = newCgroupV2(cgroupRoot, cgroupsPath, useSystemd)
+		cg, err = newCgroupV2(cgroupRoot(), cgroupsPath, useSystemd)
 		if err != nil {
 			return nil, err
 		}
@@ -428,6 +485,38 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 	}
 	log.Debugf("New cgroup for pid: %s, %T: %+v", pid, cg, cg)
 	return cg, nil
+}
+
+// OwnsCPULimit returns whether `Install` set `cg`'s CPU limit, i.e. it created
+// the cgroup rather than finding it pre-configured.
+func OwnsCPULimit(cg Cgroup) bool {
+	switch c := cg.(type) {
+	case *cgroupSystemd:
+		return true
+	case *cgroupV2:
+		return slices.Contains(c.Own, c.MakePath(""))
+	case *cgroupV1:
+		return c.Own["cpu"]
+	default:
+		return false
+	}
+}
+
+// InstallSubcontainerCompatDir creates the host-side cgroup directory for a
+// subcontainer so cAdvisor (and other inotify-based tools) can discover it,
+// populating the container_spec_* limit files from res when non-nil. The
+// directory is tracked by cg for removal at Uninstall.
+//
+// systemd v2 is routed through installCompatDir, which mkdirs directly instead
+// of registering a process-less transient unit. cgroupfs (v1 / non-systemd v2)
+// delegates to Install, which already creates the directory and writes the
+// same files. The compat cgroup is process-less, so these limits have no
+// accounting effect; runtime counters stay zero (see #13067).
+func InstallSubcontainerCompatDir(cg Cgroup, res *specs.LinuxResources) error {
+	if sd, ok := cg.(*cgroupSystemd); ok {
+		return sd.installCompatDir(res)
+	}
+	return cg.Install(res)
 }
 
 // CgroupJSON is a wrapper for Cgroup that can be encoded to JSON.
@@ -586,7 +675,7 @@ func (c *cgroupV1) Update(res *specs.LinuxResources) error {
 // the controller should be skipped (e.g. controller is disabled). In case it
 // should be skipped, it also returns the error it got.
 func createController(c Cgroup, name string) (bool, error) {
-	ctrlrPath := filepath.Join(cgroupRoot, name)
+	ctrlrPath := filepath.Join(cgroupRoot(), name)
 	if _, err := os.Stat(ctrlrPath); err != nil {
 		return os.IsNotExist(err), err
 	}
@@ -594,7 +683,7 @@ func createController(c Cgroup, name string) (bool, error) {
 	path := c.MakePath(name)
 	log.Debugf("Creating cgroup %q: %q", name, path)
 	if err := os.MkdirAll(path, 0755); err != nil {
-		return errors.Is(err, unix.EROFS), err
+		return errors.Is(err, unix.EROFS) || errors.Is(err, unix.EACCES), err
 	}
 	return false, nil
 }
@@ -648,7 +737,7 @@ func (c *cgroupV1) Join() (func(), error) {
 	for ctrlr, path := range paths {
 		// Skip controllers we don't handle.
 		if _, ok := controllers[ctrlr]; ok {
-			fullPath := filepath.Join(cgroupRoot, ctrlr, path)
+			fullPath := filepath.Join(cgroupRoot(), ctrlr, path)
 			undoPaths = append(undoPaths, fullPath)
 		}
 	}
@@ -682,12 +771,20 @@ func (c *cgroupV1) Join() (func(), error) {
 	return cu.Release(), nil
 }
 
+// CloneIntoCgroup implements Cgroup.CloneIntoCgroup.
+func (c *cgroupV1) CloneIntoCgroup() (*os.File, error) {
+	return nil, errors.New("cgroup v2 required to use CLONE_INTO_CGROUP")
+}
+
 // CPUQuota returns the raw CFS CPU quota in microseconds.
 // A value of -1 means unlimited.
 func (c *cgroupV1) CPUQuota() (int64, error) {
 	path := c.MakePath("cpu")
 	quota, err := getInt(path, "cpu.cfs_quota_us")
 	if err != nil {
+		if os.IsNotExist(err) {
+			return -1, nil
+		}
 		return -1, err
 	}
 	return int64(quota), nil
@@ -698,6 +795,9 @@ func (c *cgroupV1) CPUPeriod() (int64, error) {
 	path := c.MakePath("cpu")
 	period, err := getInt(path, "cpu.cfs_period_us")
 	if err != nil {
+		if os.IsNotExist(err) {
+			return -1, nil
+		}
 		return -1, err
 	}
 	return int64(period), nil
@@ -739,7 +839,7 @@ func (c *cgroupV1) MakePath(controllerName string) string {
 	if parent, ok := c.Parents[controllerName]; ok {
 		path = filepath.Join(parent, c.Name)
 	}
-	return filepath.Join(cgroupRoot, controllerName, path)
+	return filepath.Join(cgroupRoot(), controllerName, path)
 }
 
 type controller interface {
@@ -812,7 +912,22 @@ func (*memory) set(spec *specs.LinuxResources, path string) error {
 }
 
 type cpu struct {
-	mandatory
+}
+
+func (*cpu) optional() bool {
+	return true
+}
+
+func (*cpu) skip(spec *specs.LinuxResources) error {
+	if spec != nil && spec.CPU != nil &&
+		((spec.CPU.Shares != nil && *spec.CPU.Shares != 0) ||
+			(spec.CPU.Quota != nil && *spec.CPU.Quota > 0) ||
+			(spec.CPU.Period != nil && *spec.CPU.Period != 0) ||
+			(spec.CPU.RealtimePeriod != nil && *spec.CPU.RealtimePeriod != 0) ||
+			(spec.CPU.RealtimeRuntime != nil && *spec.CPU.RealtimeRuntime > 0)) {
+		return fmt.Errorf("cpu controller is missing but limits are set in OCI spec")
+	}
+	return nil
 }
 
 func (*cpu) set(spec *specs.LinuxResources, path string) error {
@@ -835,7 +950,17 @@ func (*cpu) set(spec *specs.LinuxResources, path string) error {
 }
 
 type cpuSet struct {
-	mandatory
+}
+
+func (*cpuSet) optional() bool {
+	return true
+}
+
+func (*cpuSet) skip(spec *specs.LinuxResources) error {
+	if spec != nil && spec.CPU != nil && (spec.CPU.Cpus != "" || spec.CPU.Mems != "") {
+		return fmt.Errorf("cpuset controller is missing but limits are set in OCI spec")
+	}
+	return nil
 }
 
 func (*cpuSet) set(spec *specs.LinuxResources, path string) error {
@@ -859,7 +984,17 @@ func (*cpuSet) set(spec *specs.LinuxResources, path string) error {
 }
 
 type blockIO struct {
-	mandatory
+}
+
+func (*blockIO) optional() bool {
+	return true
+}
+
+func (*blockIO) skip(spec *specs.LinuxResources) error {
+	if spec != nil && spec.BlockIO != nil {
+		return fmt.Errorf("blkio controller is missing but limits are set in OCI spec")
+	}
+	return nil
 }
 
 func (*blockIO) set(spec *specs.LinuxResources, path string) error {
@@ -1004,16 +1139,31 @@ func (*hugeTLB) set(spec *specs.LinuxResources, path string) error {
 	return nil
 }
 
-// RunInCgroup executes fn inside the specified cgroup. If cg is nil, execute
-// it in the current context.
-func RunInCgroup(cg Cgroup, fn func() error) error {
+// RunInCgroup executes `fn` such that every subprocess `fn` creates ends up
+// inside `cg`.
+// `fn` is called with `cloneIntoCgroupFD` that may be nil.
+// If `cloneIntoCgroupFD` is non-nil, `fn` has to use it for
+// `SysProcAttr.CgroupFD` (and set `SysProcAttr.UseCgroupFD = true`).
+// This will use `clone3(CLONE_INTO_CGROUP)` which is fast.
+// If `cloneIntoCgroupFD` is nil, `fn` doesn't need to touch these fields and
+// can simply create a subprocess as normal. It will be created in the correct
+// cgroup by virtue of `RunInCgroup` switching into this cgroup before calling
+// `fn`.
+// If `cg` is nil, `fn` simply runs in the current context.
+func RunInCgroup(cg Cgroup, fn func(cloneIntoCgroupFD *os.File) error) error {
 	if cg == nil {
-		return fn()
+		return fn(nil)
 	}
+	cgroupFD, err := cg.CloneIntoCgroup()
+	if err == nil {
+		defer cgroupFD.Close()
+		return fn(cgroupFD)
+	}
+	log.Warningf("Cannot clone children directly into cgroup %q: %v. Joining it instead. This slows down gVisor startup and checkpoint/restore.", cg.MakePath(""), err)
 	restore, err := cg.Join()
 	if err != nil {
 		return err
 	}
 	defer restore()
-	return fn()
+	return fn(nil)
 }

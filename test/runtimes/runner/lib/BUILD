@@ -13,11 +13,13 @@ go_library(
         "go_test_dependency_not_go118.go",
         "lib.go",
     ],
-    visibility = ["//test/runtimes/runner:__pkg__"],
+    importpath = "gvisor.dev/gvisor/test/runtimes/runner/lib",
+    visibility = ["//test:__subpackages__"],
     deps = [
         "//pkg/log",
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",
+        "@com_github_docker_docker//api/types/mount:go_default_library",
     ],
 )
 
@@ -25,5 +27,5 @@ go_test(
     name = "lib_test",
     size = "small",
     srcs = ["exclude_test.go"],
-    library = ":lib",
+    embed = [":lib"],
 )

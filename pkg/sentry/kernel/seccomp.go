@@ -15,9 +15,6 @@
 package kernel
 
 import (
-	"fmt"
-	"reflect"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/sentry"
@@ -29,6 +26,11 @@ import (
 
 const (
 	maxSyscallFilterInstructions = 1 << 15
+
+	// seccompCacheableInputSize is the size of the seccomp_data ABI prefix
+	// that holds the syscall number and audit architecture. Reads beyond it
+	// cannot be cached by syscall number.
+	seccompCacheableInputSize = 8
 
 	// uncacheableBPFAction is an invalid seccomp action code.
 	// It is used as a sentinel value in `taskSeccompFilters.cache` to indicate
@@ -57,7 +59,8 @@ type taskSeccomp struct {
 	cacheAuditNumber uint32
 }
 
-// copy returns a copy of this `taskSeccomp`.
+// copy returns a copy of this taskSeccomp, including its cache. Cache lookups
+// check cacheAuditNumber before using entries for the current architecture.
 func (ts *taskSeccomp) copy() *taskSeccomp {
 	return &taskSeccomp{
 		filters:          append(([]bpf.Program)(nil), ts.filters...),
@@ -95,17 +98,29 @@ func seccompSiginfo(t *Task, errno, sysno int32, ip hostarch.Addr) *linux.Signal
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip hostarch.Addr) linux.BPFAction {
 	result := linux.BPFAction(t.evaluateSyscallFilters(sysno, args, ip))
-	action := result & linux.SECCOMP_RET_ACTION
+	// Extract the action using SECCOMP_RET_ACTION_FULL rather than
+	// SECCOMP_RET_ACTION: SECCOMP_RET_ACTION (0x7fff0000) would truncate
+	// SECCOMP_RET_KILL_PROCESS (0x80000000) to SECCOMP_RET_KILL_THREAD.
+	action := result & linux.SECCOMP_RET_ACTION_FULL
 	switch action {
 	case linux.SECCOMP_RET_TRAP:
 		// "Results in the kernel sending a SIGSYS signal to the triggering
 		// task without executing the system call. ... The SECCOMP_RET_DATA
 		// portion of the return value will be passed as si_errno." -
 		// Documentation/prctl/seccomp_filter.txt
+		//
+		// The signal is forced, analogous to Linux's
+		// kernel/seccomp.c:seccomp_send_sigsys() => force_sig_seccomp().
+		t.forceSignal(linux.SIGSYS, false /* unconditional */)
 		t.SendSignal(seccompSiginfo(t, int32(result.Data()), sysno, ip))
-		// "The return value register will contain an arch-dependent value." In
-		// practice, it's ~always the syscall number.
-		t.Arch().SetReturn(uintptr(sysno))
+		// Match Linux's syscall_rollback(): the return register holds the
+		// syscall number on x86_64 and the first argument on arm64.
+		switch t.Arch().Arch() {
+		case arch.ARM64:
+			t.Arch().SetReturn(args[0].Value)
+		default:
+			t.Arch().SetReturn(uintptr(sysno))
+		}
 
 	case linux.SECCOMP_RET_ERRNO:
 		// "Results in the lower 16-bits of the return value being passed to
@@ -124,8 +139,17 @@ func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip h
 			return linux.SECCOMP_RET_ERRNO
 		}
 
+	case linux.SECCOMP_RET_LOG:
+		t.Debugf("Syscall %d: logged by seccomp", sysno)
+		return linux.SECCOMP_RET_ALLOW
+
 	case linux.SECCOMP_RET_ALLOW:
 		// "Results in the system call being executed."
+
+	case linux.SECCOMP_RET_KILL_PROCESS:
+		// "Results in the entire process being killed immediately without
+		// executing the system call. The exit status of the process will be
+		// SIGSYS, not SIGKILL." - Documentation/prctl/seccomp_filter.txt
 
 	case linux.SECCOMP_RET_KILL_THREAD:
 		// "Results in the task exiting immediately without executing the
@@ -186,7 +210,14 @@ func (t *Task) evaluateSyscallFilters(sysno int32, args arch.SyscallArguments, i
 		// "The ordering ensures that a min_t() over composed return values
 		// always selects the least permissive choice." -
 		// include/uapi/linux/seccomp.h
-		if (thisRet & linux.SECCOMP_RET_ACTION) < (ret & linux.SECCOMP_RET_ACTION) {
+		//
+		// Like Linux's seccomp_run_filters() (ACTION_ONLY()), compare the
+		// SECCOMP_RET_ACTION_FULL-masked actions as signed integers. This is
+		// required so that SECCOMP_RET_KILL_PROCESS (0x80000000) sorts before
+		// SECCOMP_RET_KILL_THREAD (0x0) and takes precedence; masking with
+		// SECCOMP_RET_ACTION (0x7fff0000) would truncate KILL_PROCESS to
+		// KILL_THREAD.
+		if int32(thisRet&linux.SECCOMP_RET_ACTION_FULL) < int32(ret&linux.SECCOMP_RET_ACTION_FULL) {
 			ret = thisRet
 		}
 	}
@@ -196,36 +227,16 @@ func (t *Task) evaluateSyscallFilters(sysno int32, args arch.SyscallArguments, i
 
 // checkFilterCacheability executes `program` on the given `input`, and
 // checks if its result is cacheable. If it is, it returns that result.
-func checkFilterCacheability(program bpf.Program, input bpf.Input) (uint32, error) {
-	// Look up Nr and Arch fields, we'll use their offsets later
-	// to verify whether they were accessed.
-	sdType := reflect.TypeFor[linux.SeccompData]()
-	nrField, ok := sdType.FieldByName("Nr")
-	if !ok {
-		panic("linux.SeccompData.Nr field not found")
+func checkFilterCacheability(program bpf.Program, input bpf.Input, metrics *bpf.ExecutionMetrics) (uint32, bool) {
+	if err := bpf.InstrumentedExecWithMetrics[bpf.NativeEndian](program, input, metrics); err != nil {
+		return 0, false
 	}
-	archField, ok := sdType.FieldByName("Arch")
-	if !ok {
-		panic("linux.SeccompData.Arch field not found")
-	}
-
-	exec, err := bpf.InstrumentedExec[bpf.NativeEndian](program, input)
-	if err != nil {
-		return 0, err
-	}
-	for offset, accessed := range exec.InputAccessed {
-		if !accessed {
-			continue // Input byte not accessed by the program.
+	for offset, accessed := range metrics.InputAccessed {
+		if accessed && offset >= seccompCacheableInputSize {
+			return 0, false
 		}
-		if uintptr(offset) >= nrField.Offset && uintptr(offset) < nrField.Offset+nrField.Type.Size() {
-			continue // The program accessed the "Nr" field, this is OK.
-		}
-		if uintptr(offset) >= archField.Offset && uintptr(offset) < archField.Offset+archField.Type.Size() {
-			continue // The program accessed the "Arch" field, this is OK.
-		}
-		return 0, fmt.Errorf("program accessed byte at offset %d which is not the sysno or arch field", offset)
 	}
-	return exec.ReturnValue, nil
+	return metrics.ReturnValue, true
 }
 
 // populateCache recomputes `ts.cache` from `ts.filters`.
@@ -233,6 +244,7 @@ func (ts *taskSeccomp) populateCache(t *Task) {
 	ts.cacheAuditNumber = t.image.st.AuditNumber
 	sd := linux.SeccompData{}
 	input := bpf.Input(make([]byte, sd.SizeBytes()))
+	var metrics bpf.ExecutionMetrics
 
 	for sysno := int32(0); sysno <= sentry.MaxSyscallNum; sysno++ {
 		sd.Nr = sysno
@@ -247,12 +259,15 @@ func (ts *taskSeccomp) populateCache(t *Task) {
 		// If any filter is not cacheable, then we cannot cache the result for
 		// this sysno.
 		for i := len(ts.filters) - 1; i >= 0; i-- {
-			result, cacheErr := checkFilterCacheability(ts.filters[i], input)
-			if cacheErr != nil {
+			result, cacheable := checkFilterCacheability(ts.filters[i], input, &metrics)
+			if !cacheable {
 				sysnoIsCacheable = false
 				break
 			}
-			if (linux.BPFAction(result) & linux.SECCOMP_RET_ACTION) < (ret & linux.SECCOMP_RET_ACTION) {
+			// See the note in `evaluateSyscallFilters`: compare
+			// SECCOMP_RET_ACTION_FULL-masked actions as signed integers so
+			// that SECCOMP_RET_KILL_PROCESS takes precedence.
+			if int32(linux.BPFAction(result)&linux.SECCOMP_RET_ACTION_FULL) < int32(ret&linux.SECCOMP_RET_ACTION_FULL) {
 				ret = linux.BPFAction(result)
 			}
 		}
@@ -304,9 +319,7 @@ func (t *Task) AppendSyscallFilter(p bpf.Program, syncAll bool) error {
 				if currentNoNewPrivs {
 					ot.SetNoNewPrivs()
 				}
-				seccompCopy := newSeccomp.copy()
-				seccompCopy.populateCache(ot)
-				ot.seccomp.Store(seccompCopy)
+				ot.seccomp.Store(newSeccomp.copy())
 			}
 		}
 	}

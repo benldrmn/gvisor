@@ -58,7 +58,7 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	if err != nil {
 		return 0, nil, err
 	}
-	target, err := getTaskPathOperation(t, linux.AT_FDCWD, targetPath, disallowEmptyPath, followFinalSymlink)
+	target, err := getTaskPathOperation(t, linux.AT_FDCWD, targetPath, disallowEmptyPath, followFinalSymlink, 0)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -85,7 +85,7 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		// character placement, and the address is passed to each file system.
 		// Most file systems always treat this data as a string, though, and so
 		// do all of the ones we implement.
-		data, err = t.CopyInString(dataAddr, hostarch.PageSize)
+		data, err = t.CopyInString(dataAddr, int(hostarch.PageSize))
 		if err != nil {
 			return 0, nil, err
 		}
@@ -104,7 +104,7 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 			return 0, nil, err
 		}
 		var sourceTpop taskPathOperation
-		sourceTpop, err = getTaskPathOperation(t, linux.AT_FDCWD, sourcePath, disallowEmptyPath, followFinalSymlink)
+		sourceTpop, err = getTaskPathOperation(t, linux.AT_FDCWD, sourcePath, disallowEmptyPath, followFinalSymlink, 0)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -118,7 +118,7 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 			return 0, nil, err
 		}
 		var sourceTpop taskPathOperation
-		sourceTpop, err = getTaskPathOperation(t, linux.AT_FDCWD, sourcePath, disallowEmptyPath, followFinalSymlink)
+		sourceTpop, err = getTaskPathOperation(t, linux.AT_FDCWD, sourcePath, disallowEmptyPath, followFinalSymlink, 0)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -129,12 +129,12 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	// Only copy in source, fstype, and data if we are doing a normal mount.
 	var source string
 	if sourceAddr != 0 {
-		source, err = t.CopyInString(sourceAddr, hostarch.PageSize)
+		source, err = t.CopyInString(sourceAddr, int(hostarch.PageSize))
 		if err != nil {
 			return 0, nil, err
 		}
 	}
-	fsType, err := t.CopyInString(typeAddr, hostarch.PageSize)
+	fsType, err := t.CopyInString(typeAddr, int(hostarch.PageSize))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -165,7 +165,7 @@ func Umount2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	if err != nil {
 		return 0, nil, err
 	}
-	tpop, err := getTaskPathOperation(t, linux.AT_FDCWD, path, disallowEmptyPath, shouldFollowFinalSymlink(flags&linux.UMOUNT_NOFOLLOW == 0))
+	tpop, err := getTaskPathOperation(t, linux.AT_FDCWD, path, disallowEmptyPath, shouldFollowFinalSymlink(flags&linux.UMOUNT_NOFOLLOW == 0), 0)
 	if err != nil {
 		return 0, nil, err
 	}

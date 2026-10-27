@@ -2,8 +2,9 @@
 
 Sensitive security-related questions, comments, and reports should be sent to
 the gvisor-security@googlegroups.com
-([gvisor-security mailing list][gvisor-security-list]). You should receive a
-prompt response, typically within 48 hours.
+([gvisor-security mailing list][gvisor-security-list]), or reported privately
+via [GitHub security advisories][gvisor-security-advisories]. You should receive
+a prompt response, typically within 48 hours.
 
 ## Which issues get CVEs?
 
@@ -14,6 +15,10 @@ In general, we only assign CVEs for issues that meet all of the criteria:
     control the sandbox configuration**.
 -   The issue must be **gVisor-specific** (i.e. the same issue would not occur
     in a non-gVisor sandbox).
+-   The issue must occur in **supported, non-experimental features** in their
+    default or supported configurations. Experimental features (e.g. features
+    that require experimental flags or are documented as experimental) are out
+    of scope for CVEs.
 
 Since gVisor is a container security platform, its main security focus is on
 preventing a user workload from "getting out of the box", relative to issues
@@ -83,8 +88,8 @@ We distinguish the following type of issues, listed from most to least severe:
             alone, or any host directory explicitly mounted into the sandbox per
             the sandbox configuration.
     -   `Lateral`: **Sandbox-to-sandbox lateral movement**. Issues that allow an
-        attacker to execute arbitrary code execution in a sandbox on the same
-        host other than the one they started with.
+        attacker to execute arbitrary code in a sandbox on the same host other
+        than the one they started with.
     -   `HostDoS`: **Denial-of-service attacks** that affect **the host kernel**
         (e.g. trigger a host kernel panic).
     -   `PeerDoS`: **Denial-of-service attacks** that affect **other sandboxes
@@ -150,6 +155,8 @@ least-privileged to most-privileged:
     sandbox on the host.
     -   `RuntimeFlags` implies `SandboxSpec`, as runtime flags can affect
         gVisor's security measures and the finalized per-sandbox configuration.
+    -   This includes enabling experimental features or non-default runtime
+        flags.
 *   `HostRoot`: Control over **host**. Attacker has full control over the host
     that sandboxes run on.
     -   `HostRoot` implies `RuntimeFlags`, since root can change the runtime
@@ -159,7 +166,7 @@ least-privileged to most-privileged:
 
 The following table lists the types of issues that qualify for CVEs, provided
 that they are gVisor-specific (i.e. the same issue does not occur in a
-non-gVisor sandbox):
+non-gVisor sandbox) and affect supported, non-experimental features:
 
 **CVE?**       | `Remote` | `SandboxUser` | `SandboxRoot` | `SandboxImage` | `SandboxSpec` | `RuntimeFlags` | `HostRoot`
 -------------- | -------- | ------------- | ------------- | -------------- | ------------- | -------------- | ----------
@@ -207,7 +214,7 @@ non-gVisor sandbox):
     -   **CVE**: ✔️ Yes.
 -   An attacker exposes the host's `/var/run/docker.sock` UDS within a sandbox,
     then creates unsandboxed containers by using this UDS.
-    -   **Classification**: `SandboxConf / Escape`.
+    -   **Classification**: `SandboxSpec / Escape`.
     -   **CVE**: ❌ No. While the attacker is able to get out of the sandbox,
         they required access to the host's `/var/run/docker.sock` to do so,
         which secure deployments of gVisor do not expose. Additionally, running
@@ -274,20 +281,21 @@ Policies for security list access, vulnerability embargo, and vulnerability
 disclosure are outlined in the [governance policy](GOVERNANCE.md).
 
 [gvisor-security-list]: https://groups.google.com/forum/#!forum/gvisor-security
+[gvisor-security-advisories]: https://github.com/google/gvisor/security/advisories
 
 ## Information you must send as part of security vulnerability reports
 
 -   High-level summary of the issue
 -   Type of issue, e.g. "sandbox escape", "DoS", ...
--   Prerequisites, e.g. "the attacker requires the ability to set these special
-    flags to be set".
--   Classification code as per the above scheme (e.g. "`Sandboxed / Escape`").
+-   Prerequisites, e.g. "the attacker requires these special flags to be set".
+-   Classification code as per the above scheme (e.g. "`SandboxRoot / Escape`").
 -   Explanation of gVisor-specificity, aka behavior and reproducibility when
     executing the attack in an unsandboxed context, everything else being equal
     (e.g. running with `runc` instead of `runsc`).
 -   Proof-of-concept code and instructions on how to run it.
--   Each email must be about a single vulnerability. If you have found multiple
-    vulnerabilities, send a separate email for each of them.
+-   Each email or advisory must be about a single vulnerability. If you have
+    found multiple vulnerabilities, send a separate report for each of them.
 
-Submissions to the security mailing list that do not meet these requirements may
-be rejected, ignored, or have the reporters blocked after repeat offenses.
+Submissions to the security mailing list or GitHub security advisories that do
+not meet these requirements may be rejected, ignored, or have the reporters
+blocked after repeat offenses.

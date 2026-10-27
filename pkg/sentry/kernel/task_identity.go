@@ -158,71 +158,145 @@ func (t *Task) SetRESUID(r, e, s auth.UID) error {
 			return err
 		}
 	}
+	// Match Linux >= 6.3 (commit 659c0ce1cb9e): a call that changes nothing
+	// returns early, so it does not reset the filesystem UID either.
+	if (!r.Ok() || newR == creds.RealKUID) &&
+		(!e.Ok() || (newE == creds.EffectiveKUID && newE == creds.FilesystemKUID)) &&
+		(!s.Ok() || newS == creds.SavedKUID) {
+		return nil
+	}
 	t.setKUIDsUnchecked(newR, newE, newS)
 	return nil
 }
 
+// setKUIDsUnchecked sets the real, effective and saved UIDs. Like Linux's
+// setuid family, it also sets the filesystem UID to the new effective UID.
+//
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) setKUIDsUnchecked(newR, newE, newS auth.KUID) {
-	creds := t.Credentials().Fork() // The credentials object is immutable. See doc for creds.
+	oldCreds := t.Credentials()
+	creds := oldCreds.Fork() // The credentials object is immutable. See doc for creds.
 	root := creds.UserNamespace.MapToKUID(auth.RootUID)
 	oldR, oldE, oldS := creds.RealKUID, creds.EffectiveKUID, creds.SavedKUID
 	creds.RealKUID, creds.EffectiveKUID, creds.SavedKUID = newR, newE, newS
+	creds.FilesystemKUID = newE
 
-	// "1. If one or more of the real, effective or saved set user IDs was
-	// previously 0, and as a result of the UID changes all of these IDs have a
-	// nonzero value, then all capabilities are cleared from the permitted and
-	// effective capability sets." - capabilities(7)
-	if (oldR == root || oldE == root || oldS == root) && (newR != root && newE != root && newS != root) {
-		creds.AmbientCaps = 0
-		// prctl(2): "PR_SET_KEEPCAP: Set the state of the calling thread's
-		// "keep capabilities" flag, which determines whether the thread's permitted
-		// capability set is cleared when a change is made to the
-		// thread's user IDs such that the thread's real UID, effective
-		// UID, and saved set-user-ID all become nonzero when at least
-		// one of them previously had the value 0.  By default, the
-		// permitted capability set is cleared when such a change is
-		// made; setting the "keep capabilities" flag prevents it from
-		// being cleared." (A thread's effective capability set is always
-		// cleared when such a credential change is made,
-		// regardless of the setting of the "keep capabilities" flag.)
-		if !creds.KeepCaps {
-			creds.PermittedCaps = 0
+	if !creds.NoSetUIDFixup {
+		// "1. If one or more of the real, effective or saved set user IDs was
+		// previously 0, and as a result of the UID changes all of these IDs have a
+		// nonzero value, then all capabilities are cleared from the permitted and
+		// effective capability sets." - capabilities(7)
+		if (oldR == root || oldE == root || oldS == root) && (newR != root && newE != root && newS != root) {
+			creds.AmbientCaps = 0
+			// prctl(2): "PR_SET_KEEPCAP: Set the state of the calling thread's
+			// "keep capabilities" flag, which determines whether the thread's permitted
+			// capability set is cleared when a change is made to the
+			// thread's user IDs such that the thread's real UID, effective
+			// UID, and saved set-user-ID all become nonzero when at least
+			// one of them previously had the value 0.  By default, the
+			// permitted capability set is cleared when such a change is
+			// made; setting the "keep capabilities" flag prevents it from
+			// being cleared." (A thread's effective capability set is always
+			// cleared when such a credential change is made,
+			// regardless of the setting of the "keep capabilities" flag.)
+			if !creds.KeepCaps {
+				creds.PermittedCaps = 0
+				creds.EffectiveCaps = 0
+			}
+		}
+		// """
+		// 2. If the effective user ID is changed from 0 to nonzero, then all
+		// capabilities are cleared from the effective set.
+		//
+		// 3. If the effective user ID is changed from nonzero to 0, then the
+		// permitted set is copied to the effective set.
+		// """
+		if oldE == root && newE != root {
 			creds.EffectiveCaps = 0
+		} else if oldE != root && newE == root {
+			creds.EffectiveCaps = creds.PermittedCaps
 		}
 	}
-	// """
-	// 2. If the effective user ID is changed from 0 to nonzero, then all
-	// capabilities are cleared from the effective set.
-	//
-	// 3. If the effective user ID is changed from nonzero to 0, then the
-	// permitted set is copied to the effective set.
-	// """
-	if oldE == root && newE != root {
-		creds.EffectiveCaps = 0
-	} else if oldE != root && newE == root {
-		creds.EffectiveCaps = creds.PermittedCaps
-	}
-	// "4. If the filesystem user ID is changed from 0 to nonzero (see
-	// setfsuid(2)), then the following capabilities are cleared from the
-	// effective set: ..."
-	// (filesystem UIDs aren't implemented, nor are any of the capabilities in
-	// question)
+	// Rule 4 of capabilities(7) (filesystem UID changes) is applied only by
+	// setfsuid(2); like Linux's cap_emulate_setxuid(), the filesystem UID
+	// reset above does not drop or raise the filesystem capabilities.
+	t.commitIDChange(oldCreds, creds)
+}
 
-	if oldE != newE {
+// commitIDChange installs creds, which replace oldCreds after a UID or GID
+// change.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) commitIDChange(oldCreds, creds *auth.Credentials) {
+	if oldCreds.EffectiveKUID != creds.EffectiveKUID ||
+		oldCreds.EffectiveKGID != creds.EffectiveKGID ||
+		oldCreds.FilesystemKUID != creds.FilesystemKUID ||
+		oldCreds.FilesystemKGID != creds.FilesystemKGID {
 		// "[dumpability] is reset to the current value contained in
 		// the file /proc/sys/fs/suid_dumpable (which by default has
 		// the value 0), in the following circumstances: The process's
-		// effective user or group ID is changed." - prctl(2)
+		// effective user or group ID is changed. The process's filesystem
+		// user or group ID is changed ..." - prctl(2)
 		//
 		// (suid_dumpable isn't implemented, so we just use the
 		// default.
 		t.MemoryManager().SetDumpability(mm.NotDumpable)
 
 		// Not documented, but compare Linux's kernel/cred.c:commit_creds().
-		t.parentDeathSignal = 0
+		t.SetParentDeathSignal(0)
 	}
 	t.creds.Store(creds)
+}
+
+// SetFSUID implements the semantics of setfsuid(2). It returns the previous
+// filesystem UID; like Linux, it reports failure only through that value.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) SetFSUID(uid auth.UID) auth.UID {
+	oldCreds := t.Credentials()
+	oldFSUID := oldCreds.FilesystemKUID.In(oldCreds.UserNamespace).OrOverflow()
+	kuid := oldCreds.UserNamespace.MapToKUID(uid)
+	if !kuid.Ok() || kuid == oldCreds.FilesystemKUID {
+		return oldFSUID
+	}
+	if kuid != oldCreds.RealKUID && kuid != oldCreds.EffectiveKUID && kuid != oldCreds.SavedKUID &&
+		!oldCreds.HasSelfCapability(linux.CAP_SETUID) {
+		return oldFSUID
+	}
+	creds := oldCreds.Fork() // The credentials object is immutable. See doc for creds.
+	creds.FilesystemKUID = kuid
+	// Match Linux's cap_task_fix_setuid(LSM_SETID_FS).
+	if !creds.NoSetUIDFixup {
+		root := creds.UserNamespace.MapToKUID(auth.RootUID)
+		if oldCreds.FilesystemKUID == root && kuid != root {
+			creds.EffectiveCaps &^= auth.FilesystemCapabilities
+		} else if oldCreds.FilesystemKUID != root && kuid == root {
+			creds.EffectiveCaps |= creds.PermittedCaps & auth.FilesystemCapabilities
+		}
+	}
+	t.commitIDChange(oldCreds, creds)
+	return oldFSUID
+}
+
+// SetFSGID implements the semantics of setfsgid(2). It returns the previous
+// filesystem GID; like Linux, it reports failure only through that value.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) SetFSGID(gid auth.GID) auth.GID {
+	oldCreds := t.Credentials()
+	oldFSGID := oldCreds.FilesystemKGID.In(oldCreds.UserNamespace).OrOverflow()
+	kgid := oldCreds.UserNamespace.MapToKGID(gid)
+	if !kgid.Ok() || kgid == oldCreds.FilesystemKGID {
+		return oldFSGID
+	}
+	if kgid != oldCreds.RealKGID && kgid != oldCreds.EffectiveKGID && kgid != oldCreds.SavedKGID &&
+		!oldCreds.HasSelfCapability(linux.CAP_SETGID) {
+		return oldFSGID
+	}
+	creds := oldCreds.Fork() // The credentials object is immutable. See doc for creds.
+	creds.FilesystemKGID = kgid
+	t.commitIDChange(oldCreds, creds)
+	return oldFSGID
 }
 
 // SetGID implements the semantics of setgid(2).
@@ -312,31 +386,26 @@ func (t *Task) SetRESGID(r, e, s auth.GID) error {
 			return err
 		}
 	}
+	// See the matching no-op check in SetRESUID.
+	if (!r.Ok() || newR == creds.RealKGID) &&
+		(!e.Ok() || (newE == creds.EffectiveKGID && newE == creds.FilesystemKGID)) &&
+		(!s.Ok() || newS == creds.SavedKGID) {
+		return nil
+	}
 	t.setKGIDsUnchecked(newR, newE, newS)
 	return nil
 }
 
+// setKGIDsUnchecked sets the real, effective and saved GIDs. Like Linux's
+// setgid family, it also sets the filesystem GID to the new effective GID.
+//
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) setKGIDsUnchecked(newR, newE, newS auth.KGID) {
-	creds := t.Credentials().Fork() // The credentials object is immutable. See doc for creds.
-	oldE := creds.EffectiveKGID
+	oldCreds := t.Credentials()
+	creds := oldCreds.Fork() // The credentials object is immutable. See doc for creds.
 	creds.RealKGID, creds.EffectiveKGID, creds.SavedKGID = newR, newE, newS
-
-	if oldE != newE {
-		// "[dumpability] is reset to the current value contained in
-		// the file /proc/sys/fs/suid_dumpable (which by default has
-		// the value 0), in the following circumstances: The process's
-		// effective user or group ID is changed." - prctl(2)
-		//
-		// (suid_dumpable isn't implemented, so we just use the
-		// default.
-		t.MemoryManager().SetDumpability(mm.NotDumpable)
-
-		// Not documented, but compare Linux's
-		// kernel/cred.c:commit_creds().
-		t.parentDeathSignal = 0
-	}
-	t.creds.Store(creds)
+	creds.FilesystemKGID = newE
+	t.commitIDChange(oldCreds, creds)
 }
 
 // SetExtraGIDs attempts to change t's supplemental groups. All IDs are
@@ -438,14 +507,13 @@ func (t *Task) SetKeepCaps(k bool) {
 }
 
 // PrivilegedSecureBits is the set of securebits that are privileged.
-const PrivilegedSecureBits = linux.SECBIT_KEEP_CAPS
+const PrivilegedSecureBits = linux.SECBIT_KEEP_CAPS | linux.SECBIT_NO_SETUID_FIXUP
 
 // SetSecurebits sets the securebits flags of the task.
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) SetSecurebits(arg2 uint64) error {
-	// We only support SECBIT_KEEP_CAPS.
-	supported := uint64(linux.SECBIT_KEEP_CAPS)
+	supported := uint64(linux.SECBIT_KEEP_CAPS | linux.SECBIT_NO_SETUID_FIXUP)
 	if (arg2 & ^supported) != 0 {
 		return linuxerr.EPERM
 	}
@@ -455,6 +523,9 @@ func (t *Task) SetSecurebits(arg2 uint64) error {
 		var oldSec uint64
 		if creds.KeepCaps {
 			oldSec |= linux.SECBIT_KEEP_CAPS
+		}
+		if creds.NoSetUIDFixup {
+			oldSec |= linux.SECBIT_NO_SETUID_FIXUP
 		}
 
 		// Linux EPERMs if the value is unchanged for unprivileged callers.
@@ -468,11 +539,18 @@ func (t *Task) SetSecurebits(arg2 uint64) error {
 		}
 	}
 
-	t.SetKeepCaps((arg2 & linux.SECBIT_KEEP_CAPS) != 0)
+	t.mu.Lock()
+	creds := t.Credentials().Fork()
+	creds.KeepCaps = (arg2 & linux.SECBIT_KEEP_CAPS) != 0
+	creds.NoSetUIDFixup = (arg2 & linux.SECBIT_NO_SETUID_FIXUP) != 0
+	t.creds.Store(creds)
+	t.mu.Unlock()
 	return nil
 }
 
 // SetNoNewPrivs will set the no new privileges flag PR_SET_NO_NEW_PRIVS.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetNoNewPrivs() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -480,6 +558,8 @@ func (t *Task) SetNoNewPrivs() {
 }
 
 // GetNoNewPrivs returns true if the prctl flag NO_NEW_PRIVS is set.
+//
+// +checklocksexclude:t.mu
 func (t *Task) GetNoNewPrivs() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

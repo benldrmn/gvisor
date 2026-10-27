@@ -48,6 +48,8 @@ type taskInode struct {
 
 	dentriesMu dentriesRWMutex `state:"nosave"`
 	// dentries is a list of dentries to be invalidated when the task is destroyed.
+	//
+	// +checklocks:dentriesMu
 	dentries map[*kernfs.Dentry]struct{}
 }
 
@@ -56,6 +58,18 @@ var _ kernfs.Inode = (*taskInode)(nil)
 func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns *kernel.PIDNamespace, isThreadGroup bool, fakeCgroupControllers map[string]string) (kernfs.Inode, error) {
 	if task.ExitState() == kernel.TaskExitDead {
 		return nil, linuxerr.ESRCH
+	}
+
+	nsEntries := map[string]kernfs.Inode{
+		"net":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNET),
+		"mnt":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNS),
+		"pid":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWPID),
+		"user": fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWUSER),
+		"ipc":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWIPC),
+		"uts":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWUTS),
+	}
+	if task.Kernel().Cgroup2FS().EverMounted() {
+		nsEntries["cgroup"] = fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWCGROUP)
 	}
 
 	contents := map[string]kernfs.Inode{
@@ -76,23 +90,16 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 		"mountinfo":       fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountInfoData{fs: fs, task: task}),
 		"mounts":          fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountsData{fs: fs, task: task}),
 		"net":             fs.newTaskNetDir(ctx, task),
-		"ns": fs.newTaskOwnedDir(ctx, task, fs.NextIno(), 0511, map[string]kernfs.Inode{
-			"net":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNET),
-			"mnt":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNS),
-			"pid":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWPID),
-			"user": fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWUSER),
-			"ipc":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWIPC),
-			"uts":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWUTS),
-		}),
-		"oom_score":     fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newStaticFile("0\n")),
-		"oom_score_adj": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &oomScoreAdj{task: task}),
-		"root":          fs.newRootSymlink(ctx, task, fs.NextIno()),
-		"setgroups":     fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &setgroupsData{task: task}),
-		"smaps":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mmFile{task: task, ftype: smapsMMFile}),
-		"stat":          fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskStatData{task: task, pidns: pidns, tgstats: isThreadGroup}),
-		"statm":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &statmData{task: task}),
-		"status":        fs.newStatusInode(ctx, task, pidns, fs.NextIno(), 0444),
-		"uid_map":       fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &idMapData{task: task, gids: false}),
+		"ns":              fs.newTaskOwnedDir(ctx, task, fs.NextIno(), 0511, nsEntries),
+		"oom_score":       fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newStaticFile("0\n")),
+		"oom_score_adj":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &oomScoreAdj{task: task}),
+		"root":            fs.newRootSymlink(ctx, task, fs.NextIno()),
+		"setgroups":       fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &setgroupsData{task: task}),
+		"smaps":           fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mmFile{task: task, ftype: smapsMMFile}),
+		"stat":            fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskStatData{task: task, pidns: pidns, tgstats: isThreadGroup}),
+		"statm":           fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &statmData{task: task}),
+		"status":          fs.newStatusInode(ctx, task, pidns, fs.NextIno(), 0444),
+		"uid_map":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &idMapData{task: task, gids: false}),
 	}
 	if isThreadGroup {
 		contents["task"] = fs.newSubtasks(ctx, task, pidns, fakeCgroupControllers)
@@ -110,7 +117,7 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 		dentries: make(map[*kernfs.Dentry]struct{}),
 	}
 	// Note: credentials are overridden by taskOwnedInode.
-	taskInode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	taskInode.InodeAttrs.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
 	taskInode.InitRefs()
 
 	inode := &taskOwnedInode{Inode: taskInode, owner: task}
@@ -122,9 +129,12 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 	return inode, nil
 }
 
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) TaskDestroyAction(ctx context.Context) {
 	i.dentriesMu.Lock()
 	dentries := i.dentries
+	// Detach the map before invalidation callbacks run. RegisterDentry cannot
+	// repopulate a nil map, so this loop exclusively owns the old entries.
 	i.dentries = nil
 	i.dentriesMu.Unlock()
 
@@ -134,6 +144,8 @@ func (i *taskInode) TaskDestroyAction(ctx context.Context) {
 }
 
 // RegisterDentry implements kernfs.Inode.RegisterDentry.
+//
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) RegisterDentry(d *kernfs.Dentry) {
 	i.dentriesMu.Lock()
 	defer i.dentriesMu.Unlock()
@@ -150,6 +162,8 @@ func (i *taskInode) RegisterDentry(d *kernfs.Dentry) {
 }
 
 // UnregisterDentry implements kernfs.Inode.RegisterDentry.
+//
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) UnregisterDentry(d *kernfs.Dentry) {
 	i.dentriesMu.Lock()
 	defer i.dentriesMu.Unlock()
@@ -188,6 +202,7 @@ func (i *taskInode) DecRef(ctx context.Context) {
 	i.taskInodeRefs.DecRef(func() { i.Destroy(ctx) })
 }
 
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
 	i.dentriesMu.RLock()
 	if i.dentries == nil {
@@ -221,9 +236,24 @@ func (i *taskOwnedInode) TaskFromProcPIDInode() *kernel.Task {
 
 var _ kernfs.Inode = (*taskOwnedInode)(nil)
 
+// taskOwnerCreds returns the credentials used to initialize inodes owned by
+// task. kernfs takes the owner of a new inode from the filesystem IDs, but
+// like Linux's fs/proc/base.c:task_dump_owner(), /proc/[pid] entries are
+// owned by the task's effective IDs.
+func taskOwnerCreds(task *kernel.Task) *auth.Credentials {
+	creds := task.Credentials()
+	if creds.FilesystemKUID == creds.EffectiveKUID && creds.FilesystemKGID == creds.EffectiveKGID {
+		return creds
+	}
+	creds = creds.Fork()
+	creds.FilesystemKUID = creds.EffectiveKUID
+	creds.FilesystemKGID = creds.EffectiveKGID
+	return creds
+}
+
 func (fs *filesystem) newTaskOwnedInode(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode, inode dynamicInode) kernfs.Inode {
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
 
 	return &taskOwnedInode{Inode: inode, owner: task}
 }
@@ -231,7 +261,7 @@ func (fs *filesystem) newTaskOwnedInode(ctx context.Context, task *kernel.Task, 
 func (fs *filesystem) newTaskOwnedDir(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode, children map[string]kernfs.Inode) kernfs.Inode {
 	// Note: credentials are overridden by taskOwnedInode.
 	fdOpts := kernfs.GenericDirectoryFDOptions{SeekEnd: kernfs.SeekEndZero}
-	dir := kernfs.NewStaticDir(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm, children, fdOpts)
+	dir := kernfs.NewStaticDir(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm, children, fdOpts)
 
 	return &taskOwnedInode{Inode: dir, owner: task}
 }
@@ -241,6 +271,8 @@ func (i *taskOwnedInode) Valid(ctx context.Context, parent *kernfs.Dentry, name 
 }
 
 // Stat implements kernfs.Inode.Stat.
+//
+// +checklocksexclude:i.owner.mu
 func (i *taskOwnedInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
 	stat, err := i.Inode.Stat(ctx, fs, opts)
 	if err != nil {
@@ -259,12 +291,15 @@ func (i *taskOwnedInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.
 }
 
 // CheckPermissions implements kernfs.Inode.CheckPermissions.
+//
+// +checklocksexclude:i.owner.mu
 func (i *taskOwnedInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	mode := i.Mode()
 	uid, gid := i.getOwner(mode)
-	return vfs.GenericCheckPermissions(creds, ats, mode, uid, gid)
+	return vfs.GenericCheckPermissions(creds, ats, mode, nil, uid, gid)
 }
 
+// +checklocksexclude:i.owner.mu
 func (i *taskOwnedInode) getOwner(mode linux.FileMode) (auth.KUID, auth.KGID) {
 	// By default, set the task owner as the file owner.
 	creds := i.owner.Credentials()
@@ -285,12 +320,16 @@ func (i *taskOwnedInode) getOwner(mode linux.FileMode) (auth.KUID, auth.KGID) {
 		return auth.RootKUID, auth.RootKGID
 	}
 	if m.Dumpability() != mm.UserDumpable {
+		// Linux's fs/proc/base.c:task_dump_owner() maps root in the mm's user
+		// namespace, which fs/exec.c:would_dump() may have lowered to an
+		// ancestor of the task's namespace.
+		userNS := m.UserNamespace()
 		uid = auth.RootKUID
-		if kuid := creds.UserNamespace.MapToKUID(auth.RootUID); kuid.Ok() {
+		if kuid := userNS.MapToKUID(auth.RootUID); kuid.Ok() {
 			uid = kuid
 		}
 		gid = auth.RootKGID
-		if kgid := creds.UserNamespace.MapToKGID(auth.RootGID); kgid.Ok() {
+		if kgid := userNS.MapToKGID(auth.RootGID); kgid.Ok() {
 			gid = kgid
 		}
 	}

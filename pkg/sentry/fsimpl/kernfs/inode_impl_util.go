@@ -191,7 +191,7 @@ type InodeAttrs struct {
 
 // Init initializes this InodeAttrs.
 func (a *InodeAttrs) Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, mode linux.FileMode) {
-	a.InitWithIDs(ctx, creds.EffectiveKUID, creds.EffectiveKGID, devMajor, devMinor, ino, mode)
+	a.InitWithIDs(ctx, creds.FilesystemKUID, creds.FilesystemKGID, devMajor, devMinor, ino, mode)
 }
 
 // InitWithIDs initializes this InodeAttrs.
@@ -211,7 +211,7 @@ func (a *InodeAttrs) InitWithIDs(ctx context.Context, uid auth.KUID, gid auth.KG
 	a.uid.Store(uint32(uid))
 	a.gid.Store(uint32(gid))
 	a.nlink.Store(nlink)
-	a.blockSize.Store(hostarch.PageSize)
+	a.blockSize.Store(uint32(hostarch.PageSize))
 	now := ktime.NowFromContext(ctx).Nanoseconds()
 	a.atime.Store(now)
 	a.mtime.Store(now)
@@ -310,7 +310,7 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 	if opts.Stat.Mask&linux.STATX_SIZE != 0 && a.Mode().IsDir() {
 		return linuxerr.EISDIR
 	}
-	if err := vfs.CheckSetStat(ctx, creds, &opts, a.Mode(), auth.KUID(a.uid.Load()), auth.KGID(a.gid.Load())); err != nil {
+	if err := vfs.CheckSetStat(ctx, creds, &opts, a.Mode(), nil, auth.KUID(a.uid.Load()), auth.KGID(a.gid.Load())); err != nil {
 		return err
 	}
 
@@ -373,6 +373,7 @@ func (a *InodeAttrs) CheckPermissions(_ context.Context, creds *auth.Credentials
 		creds,
 		ats,
 		a.Mode(),
+		nil,
 		auth.KUID(a.uid.Load()),
 		auth.KGID(a.gid.Load()),
 	)
@@ -599,6 +600,24 @@ func (o *OrderedChildren) removeLocked(name string) {
 		delete(o.set, name)
 		o.order.Remove(s)
 	}
+}
+
+// RemoveStatic removes a child entry (including static entries) from o and
+// drops the reference owned by o if the entry was static.
+func (o *OrderedChildren) RemoveStatic(ctx context.Context, name string) error {
+	o.mu.Lock()
+	s, ok := o.set[name]
+	if !ok {
+		o.mu.Unlock()
+		return linuxerr.ENOENT
+	}
+	delete(o.set, name)
+	o.order.Remove(s)
+	o.mu.Unlock()
+	if s.static {
+		s.inode.DecRef(ctx)
+	}
+	return nil
 }
 
 // Precondition: caller must hold o.mu for reading or writing.

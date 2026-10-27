@@ -45,12 +45,13 @@ func (t *syscallThread) maskAllSignalsAttached() {
 }
 
 // unmaskAllSignals unblocks all signals.
-func (t *syscallThread) unmaskAllSignalsAttached() {
+func (t *syscallThread) unmaskAllSignalsAttached() error {
 	p := t.thread
 	mask := uint64(0)
 	if errno := hostsyscall.RawSyscallErrno6(unix.SYS_PTRACE, linux.PTRACE_SETSIGMASK, uintptr(p.tid), 8, uintptr(unsafe.Pointer(&mask)), 0, 0); errno != 0 {
-		panic(fmt.Sprintf("unable to setmask: %v", errno))
+		return fmt.Errorf("unable to setmask: %w", errno)
 	}
+	return nil
 }
 
 func futexWakeUint32(addr *uint32) error {
@@ -108,10 +109,15 @@ func (t *syscallThread) waitForSeccompNotify() error {
 			t.seccompNotifyResp.ID = req.ID
 			break
 		}
-		if errno == unix.EINTR && t.subproc.alive() {
+		// ENOENT: the stub thread's notifying syscall was interrupted between
+		// the wakeup and the lookup (by the cgroup freezer, say, which kicks
+		// every task out of its waits). The syscall restarts and the kernel
+		// issues a new notification for it, as notifySeccompThread already
+		// expects for SEND: wait for that one.
+		if (errno == unix.EINTR || errno == unix.ENOENT) && t.subproc.alive() {
 			continue
 		}
-		t.thread.kill()
+		t.kill()
 		return fmt.Errorf("failed getting response from syscall thread : %w", errno)
 	}
 	return nil

@@ -8,12 +8,16 @@ package(
 go_library(
     name = "netfilter",
     srcs = [
+        "comment_matcher.go",
+        "conntrack_matcher.go",
         "ct_target.go",
         "dnat.go",
         "extensions.go",
         "ipv4.go",
         "ipv6.go",
         "mark_matcher.go",
+        "mark_target.go",
+        "masquerade.go",
         "multiport_matcher.go",
         "multiport_matcher_v1.go",
         "netfilter.go",
@@ -60,11 +64,21 @@ go_test(
 
 go_test(
     name = "netfilter_test",
-    srcs = ["mark_matcher_test.go"],
-    library = ":netfilter",
+    srcs = [
+        "mark_matcher_test.go",
+        "mark_target_test.go",
+        "masquerade_test.go",
+        "netfilter_test.go",
+    ],
+    embed = [":netfilter"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/marshal",
+        "//pkg/syserr",
+        "//pkg/tcpip",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/network/ipv4",
+        "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/stack",
     ],
 )

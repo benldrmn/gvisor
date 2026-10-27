@@ -2,7 +2,7 @@
 
 Want to contribute? Great! First, read this page.
 
-### Contributor License Agreement
+## Contributor License Agreement
 
 Contributions to this project must be accompanied by a Contributor License
 Agreement. You (or your employer) retain the copyright to your contribution;
@@ -14,7 +14,7 @@ You generally only need to submit a CLA once, so if you've already submitted one
 (even if it was for a different project), you probably don't need to do it
 again.
 
-### AI tool Use
+## AI tool Use
 
 We expect our contributors to embrace AI tools.
 
@@ -22,7 +22,7 @@ This policy ensures that AI-generated contributions are always guided,
 validated, and owned by a skilled human, promoting better software and a
 stronger community than policing how code gets written.
 
-#### Policy
+### Policy
 
 While contributors can use any AI tools to create their contributions, **human
 oversight is mandatory**. All AI-generated content must be thoroughly reviewed
@@ -34,24 +34,60 @@ standard before seeking review, respecting maintainers' time, and must be
 **prepared to discuss and justify their contributions** during the review
 process.
 
-#### Label AI-assisted Work
+## Editor Setup
 
-**Transparently label all contributions containing substantial AI-generated
-content.** This should be done in the pull request description, commit message,
-or any standard authorship area, for example, by adding
+### Visual Studio Code
 
-`Assisted-by: Gemini CLI`
+The easiest way to work on gVisor in VSCode is using the
+[Dev Containers][vscode-dev-containers] extension.
 
-to your commit message.
+Open the gVisor repository in VSCode, and a "Folder contains a Dev Container"
+popup will appear. Press "Reopen in Container". The first load will take a few
+minutes while the dev container is built, the Go packages are loaded, and the
+clangd compilation database is generated. Afterwards, language server features
+(hover, autocomplete, reference search, format on save, etc) should work "out of
+the box" for both Go and C++. VSCode's terminal will open in the dev container,
+where you can run `bazel build`, `bazel test`, and so on to work on gVisor.
 
-Such transparency is crucial for the community to understand and build best
-practices around AI tool usage. This policy includes, but is not limited to:
+For example, you can build and run `runsc` in the dev container as follows. The
+`//:release` target builds `runsc` together with the `gvisor-bin/` directory of
+sidecar binaries, such as the Sentry, that `runsc` runs:
 
--   Code changes in a pull request
--   Issues or security vulnerabilities
--   Comments and feedback on pull requests or issues
+```
+bazel build //:release
+bazel-bin/release/runsc --rootless do bash
+```
 
-### Using GOPATH
+Alternatively, it is possible to develop gVisor without a dev container. For the
+Go language server to work, ensure you have an up-to-date version of [Go][go]
+and the correct version of Bazel (ideally through [bazelisk][bazelisk])
+installed on the host. In this configuration, it is still recommended to build,
+run, and test gVisor in a container, which is handled automatically using
+`make`. For example, to build and run `runsc`:
+
+```
+mkdir -p runsc-dev
+make copy TARGETS=//:release DESTINATION=./runsc-dev
+./runsc-dev/runsc --rootless do bash
+```
+
+In addition, for language server support in C++ files (e.g. the syscall tests):
+install [clangd][clangd] on the host, then run `tools/gen_compile_commands.py`
+to generate a `compile_commands.json`. After reloading the editor window, clangd
+should work.
+
+### Other Editors
+
+For LSP integration in other editors, ensure that the environment variable
+`GOPACKAGESDRIVER=tools/gopackagesdriver.sh` is passed along to `gopls`. Also,
+ensure `--allow-config` is passed to `clangd`, which will allow gVisor's
+`.clangd` configuration to take effect. The Go package driver targets Linux on
+the host CPU architecture by default. Set `GOOS=darwin` to analyze native macOS
+packages, or set `GOARCH` to analyze a different architecture. Set these
+variables rather than `--platforms` so the driver selects source files and
+builds for the same target.
+
+#### Using GOPATH (not recommended)
 
 Some editors may require the code to be structured in a `GOPATH` directory tree.
 In this case, you may use the `:gopath` target to generate a directory tree with
@@ -73,7 +109,7 @@ Dependencies can be added by using `go get`. In order to keep the `WORKSPACE`
 file in sync, run `bazel run //:gazelle -- update-repos -from_file=go.mod` in
 place of `go mod`.
 
-### Coding Guidelines
+## Coding Guidelines
 
 All code should comply with the [style guide](g3doc/style.md). Note that code
 may be automatically formatted per the guidelines when merged.
@@ -121,9 +157,10 @@ Rules:
     *   `@com_github_opencontainers_runtime_spec//specs_go:go_default_library`
         (Go import `github.com/opencontainers/runtime-spec/specs_go`).
 
-*   For performance reasons, `runsc boot` may not run the `netpoller` goroutine.
+*   For performance reasons, the Sentry (`gvisor_sentry boot`) may not run the
+    `netpoller` goroutine.
 
-### Code reviews
+## Code reviews
 
 Before sending code reviews, run `bazel test ...` to ensure tests are passing.
 
@@ -138,19 +175,19 @@ logical units of work that can be applied separately.
 When approved, the change will be submitted by a team member and automatically
 merged into the repository.
 
-### Presubmit checks
+## Presubmit checks
 
 Accessing check logs may require membership in the
 [gvisor-dev mailing list][gvisor-dev-list], which is public.
 
-### Bug IDs
+## Bug IDs
 
 Some TODOs and NOTEs sprinkled throughout the code have associated IDs of the
 form `b/1234`. These correspond to bugs in our internal bug tracker. Eventually
 these bugs will be moved to the GitHub Issues, but until then they can simply be
 ignored.
 
-### Build and test with Docker
+## Build and test with Docker
 
 Running `make dev` is a convenient way to build and install `runsc` as a Docker
 runtime. The output of this command will show the runtimes installed.
@@ -163,7 +200,7 @@ docker run --rm --runtime=my-branch --rm hello-world
 make refresh
 ```
 
-### Update golang dependencies
+## Update golang dependencies
 
 First, we need to update dependencies in the go.mod and go.sum files. To do
 that, we should checkout the go branch and update dependencies using the go get
@@ -182,7 +219,7 @@ git checkout origin/master
 bazel run //:gazelle -- update-repos -from_file=go.mod
 ```
 
-### The small print
+## The small print
 
 Contributions made by corporations are covered by a different agreement than the
 one above, the
@@ -192,3 +229,7 @@ one above, the
 [gccla]: https://cla.developers.google.com/about/google-corporate
 [github]: https://github.com/google/gvisor/compare
 [gvisor-dev-list]: https://groups.google.com/forum/#!forum/gvisor-dev
+[go]: https://go.dev/doc/install
+[bazelisk]: https://github.com/bazelbuild/bazelisk
+[clangd]: https://clangd.llvm.org/installation
+[vscode-dev-containers]: https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers

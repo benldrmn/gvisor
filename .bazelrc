@@ -15,6 +15,10 @@
 # Ensure a strong hash function.
 startup --host_jvm_args=-Dbazel.DigestFunction=SHA256
 
+# Start Python programs with the declared interpreter, without requiring a host
+# Python interpreter to bootstrap it.
+build --@rules_python//python/config_settings:bootstrap_impl=script
+
 # Build with C++17.
 # com_google_protobuf is compiled with a few warnings.
 build --cxxopt=-std=c++17 --cxxopt=-Wno-error=maybe-uninitialized
@@ -26,6 +30,10 @@ build --stamp --workspace_status_command tools/workspace_status.sh
 build:race --@io_bazel_rules_go//go/config:race --@io_bazel_rules_go//go/config:pure=false
 test:race --@io_bazel_rules_go//go/config:race --@io_bazel_rules_go//go/config:pure=false
 
+# Build with the runtime lock-order checker (the "lockdep" go build tag).
+build:lockdep --define=lockdep=true
+test:lockdep --define=lockdep=true
+
 build --@io_bazel_rules_go//go/config:pure
 test --@io_bazel_rules_go//go/config:pure
 
@@ -36,15 +44,21 @@ build:plugin-tldk --@io_bazel_rules_go//go/config:pure=false --define=plugin_tld
 # by default for all tests.
 build --build_tag_filters=-nogo
 
+# Select the ordinary syscall tests used by public CI.
+test:syscalls-amd64 --test_tag_filters=-allsave,-runsc_slimvm
+test:syscalls-arm64 --test_tag_filters=-allsave,runsc_ptrace,runsc_systrap
+build:syscalls-arm64-64k --test_tag_filters=-allsave,runsc_systrap
+build:syscalls-arm64-64k --//tools/bazeldefs:page_size=64k
+
 # Set flags for x86_64.
 build:x86_64 --crosstool_top=@crosstool//:toolchains
 build:x86_64 --cpu=k8
-build:x86_64 --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64
+build:x86_64 --platforms=//tools/bazeldefs:linux_amd64
 
 # Set flags for aarch64.
 build:aarch64 --crosstool_top=@crosstool//:toolchains
 build:aarch64 --cpu=aarch64
-build:aarch64 --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64
+build:aarch64 --platforms=//tools/bazeldefs:linux_arm64
 
 # Use prebuilt protoc to speed up builds.
 common --@com_google_protobuf//bazel/toolchains:prefer_prebuilt_protoc

@@ -12,9 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <linux/capability.h>
-#include <netinet/in.h>
+#include <endian.h>
+#include <sched.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+// Netfilter headers require <netinet/in.h> to precede them.
+// clang-format off
+#include <netinet/in.h>
+// clang-format on
+
+#include <linux/capability.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter/x_tables.h>
+#include <linux/netfilter_ipv6.h>
 
 #include <cerrno>
 #include <cstdio>
@@ -23,13 +35,16 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "test/syscalls/linux/iptables.h"
+#include "test/syscalls/linux/iptables_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
@@ -52,52 +67,61 @@ constexpr size_t kEmptyErrorEntrySize =
 
 using ::testing::AnyOf;
 
-TEST(IP6TablesBasic, FailSockoptNonRaw) {
-  // Even if the user has CAP_NET_RAW, they shouldn't be able to use the
-  // ip6tables sockopts with a non-raw socket.
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+TEST(IP6TablesBasic, MissingTable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
-  int sock;
-  ASSERT_THAT(sock = socket(AF_INET6, SOCK_DGRAM, 0), SyscallSucceeds());
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET6, SOCK_DGRAM, 0));
 
-  struct ipt_getinfo info = {};
-  snprintf(info.name, XT_TABLE_MAXNAMELEN, "%s", kNatTablename);
+  struct ipt_getinfo info = {.name = "gvisor-missing"};
   socklen_t info_size = sizeof(info);
-  EXPECT_THAT(getsockopt(sock, SOL_IPV6, IP6T_SO_GET_INFO, &info, &info_size),
-              SyscallFailsWithErrno(ENOPROTOOPT));
+  EXPECT_THAT(
+      getsockopt(sock.get(), SOL_IPV6, IP6T_SO_GET_INFO, &info, &info_size),
+      SyscallFailsWithErrno(ENOENT));
 
-  EXPECT_THAT(close(sock), SyscallSucceeds());
-}
+  info_size = sizeof(info) + 1;
+  EXPECT_THAT(
+      getsockopt(sock.get(), SOL_IPV6, IP6T_SO_GET_INFO, &info, &info_size),
+      SyscallFailsWithErrno(EINVAL));
 
-TEST(IP6TablesBasic, GetInfoErrorPrecedence) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+  struct ip6t_get_entries entries = {.name = "gvisor-missing"};
+  socklen_t entries_size = sizeof(entries);
+  EXPECT_THAT(getsockopt(sock.get(), SOL_IPV6, IP6T_SO_GET_ENTRIES, &entries,
+                         &entries_size),
+              SyscallFailsWithErrno(ENOENT));
 
-  int sock;
-  ASSERT_THAT(sock = socket(AF_INET6, SOCK_DGRAM, 0), SyscallSucceeds());
-
-  // When using the wrong type of socket and a too-short optlen, we should get
-  // EINVAL.
-  struct ipt_getinfo info = {};
-  snprintf(info.name, XT_TABLE_MAXNAMELEN, "%s", kNatTablename);
-  socklen_t info_size = sizeof(info) - 1;
-  EXPECT_THAT(getsockopt(sock, SOL_IPV6, IP6T_SO_GET_INFO, &info, &info_size),
+  entries.size = 1;
+  EXPECT_THAT(getsockopt(sock.get(), SOL_IPV6, IP6T_SO_GET_ENTRIES, &entries,
+                         &entries_size),
               SyscallFailsWithErrno(EINVAL));
 }
 
-TEST(IP6TablesBasic, GetEntriesErrorPrecedence) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+TEST(IP6TablesBasic, GetInfoShortBuffer) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
-  int sock;
-  ASSERT_THAT(sock = socket(AF_INET6, SOCK_DGRAM, 0), SyscallSucceeds());
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET6, SOCK_DGRAM, 0));
 
-  // When using the wrong type of socket and a too-short optlen, we should get
-  // EINVAL.
+  struct ipt_getinfo info = {};
+  snprintf(info.name, XT_TABLE_MAXNAMELEN, "%s", kNatTablename);
+  socklen_t info_size = sizeof(info) - 1;
+  EXPECT_THAT(
+      getsockopt(sock.get(), SOL_IPV6, IP6T_SO_GET_INFO, &info, &info_size),
+      SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(IP6TablesBasic, GetEntriesShortBuffer) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET6, SOCK_DGRAM, 0));
+
   struct ip6t_get_entries entries = {};
   socklen_t entries_size = sizeof(struct ip6t_get_entries) - 1;
   snprintf(entries.name, XT_TABLE_MAXNAMELEN, "%s", kNatTablename);
-  EXPECT_THAT(
-      getsockopt(sock, SOL_IPV6, IP6T_SO_GET_ENTRIES, &entries, &entries_size),
-      SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(getsockopt(sock.get(), SOL_IPV6, IP6T_SO_GET_ENTRIES, &entries,
+                         &entries_size),
+              SyscallFailsWithErrno(EINVAL));
 }
 
 TEST(IP6TablesBasic, GetRevision) {
@@ -258,17 +282,43 @@ struct RequiresCapNetAdminTestParams {
   std::function<absl::StatusOr<SockOptArgs>(int sock)> generate_sockopt_args;
 };
 
+using SockOptTestParams = std::tuple<SocketKind, RequiresCapNetAdminTestParams>;
+
+const auto kSocketKinds =
+    ::testing::Values(SimpleSocket(AF_INET6, SOCK_RAW, IPPROTO_RAW),
+                      SimpleSocket(AF_INET6, SOCK_DGRAM, 0),
+                      SimpleSocket(AF_INET6, SOCK_STREAM, 0));
+
+std::string SockOptTestName(
+    const ::testing::TestParamInfo<SockOptTestParams>& info) {
+  const auto& [kind, params] = info.param;
+  std::string name = params.test_name;
+  name += kind.domain == AF_INET ? "IPv4" : "IPv6";
+  if (kind.type == SOCK_RAW) {
+    return name + "Raw";
+  }
+  if (kind.type == SOCK_DGRAM) {
+    return name + "Datagram";
+  }
+  return name + "Stream";
+}
+
 class GetSockOptRequiresCapNetAdminTest
-    : public ::testing::TestWithParam<RequiresCapNetAdminTestParams> {};
+    : public ::testing::TestWithParam<SockOptTestParams> {};
 
 TEST_P(GetSockOptRequiresCapNetAdminTest, Validate) {
-  const RequiresCapNetAdminTestParams& params = GetParam();
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+  const auto& [kind, params] = GetParam();
+  SKIP_IF(kind.type == SOCK_RAW &&
+          !ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
-  FileDescriptor sock = ASSERT_NO_ERRNO_AND_VALUE(
-      Socket(/*family=*/AF_INET6, /*type=*/SOCK_RAW, /*protocol=*/IPPROTO_RAW));
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(kind.domain, kind.type, kind.protocol));
+  // Linux fails with ENOENT if the kernel lacks the queried table or target.
+  // Skip natively in that case.
   absl::StatusOr<SockOptArgs> args_or_status =
       params.generate_sockopt_args(sock.get());
+  SKIP_IF(absl::IsNotFound(args_or_status.status()) &&
+          GvisorPlatform() == Platform::kNative);
   ASSERT_EQ(args_or_status.status(), absl::OkStatus());
   SockOptArgs& getsockopt_args = *args_or_status;
 
@@ -280,10 +330,11 @@ TEST_P(GetSockOptRequiresCapNetAdminTest, Validate) {
               getsockopt_args.optlen);
 
   // Validate that the socket creator can successfully getsockopt.
-  ASSERT_THAT(
-      getsockopt(getsockopt_args.sock, SOL_IPV6, getsockopt_args.optname,
-                 getsockopt_args.optval.get(), &getsockopt_args.optlen),
-      SyscallSucceeds());
+  int ret = getsockopt(getsockopt_args.sock, SOL_IPV6, getsockopt_args.optname,
+                       getsockopt_args.optval.get(), &getsockopt_args.optlen);
+  SKIP_IF(ret == -1 && errno == ENOENT &&
+          GvisorPlatform() == Platform::kNative);
+  ASSERT_THAT(ret, SyscallSucceeds());
 
   // Validate that another process from a different user namespace cannot
   // getsockopt and fails with EPERM.
@@ -297,108 +348,123 @@ TEST_P(GetSockOptRequiresCapNetAdminTest, Validate) {
         // getsockopt is async signal safe, so it's okay to call it here.
         TEST_CHECK_ERRNO(getsockopt(sock_fd, SOL_IPV6, optname, optval, optlen),
                          EPERM);
+        if (optname == IP6T_SO_GET_INFO) {
+          socklen_t invalid_len = 0;
+          TEST_CHECK_ERRNO(
+              getsockopt(sock_fd, SOL_IPV6, optname, optval, &invalid_len),
+              EPERM);
+          invalid_len = *optlen + 1;
+          TEST_CHECK_ERRNO(
+              getsockopt(sock_fd, SOL_IPV6, optname, optval, &invalid_len),
+              EPERM);
+        }
       }),
       IsPosixErrorOkAndHolds(0));
 }
 
 INSTANTIATE_TEST_SUITE_P(
     GetSockOptRequiresCapNetAdminTests, GetSockOptRequiresCapNetAdminTest,
-    ::testing::ValuesIn<RequiresCapNetAdminTestParams>(
-        {{.test_name = "GetInfo",
-          .generate_sockopt_args =
-              [](int sock) {
-                SockOptArgs args;
-                args.sock = sock;
-                std::unique_ptr<char[]> info_buffer =
-                    std::make_unique<char[]>(sizeof(ipt_getinfo));
-                ipt_getinfo* info =
-                    reinterpret_cast<ipt_getinfo*>(info_buffer.get());
-                snprintf(info->name, XT_TABLE_MAXNAMELEN, "%s", kNatTablename);
-                args.optname = IP6T_SO_GET_INFO;
-                args.optval = std::move(info_buffer);
-                args.optlen = sizeof(ipt_getinfo);
-                return args;
-              }},
-         {.test_name = "GetEntries",
-          .generate_sockopt_args = [](int sock) -> absl::StatusOr<SockOptArgs> {
-            socklen_t get_info_optlen = sizeof(ipt_getinfo);
-            ipt_getinfo get_info;
-            snprintf(get_info.name, XT_TABLE_MAXNAMELEN, "%s", kNatTablename);
-            EXPECT_THAT(getsockopt(sock, /*level=*/SOL_IPV6, IP6T_SO_GET_INFO,
-                                   &get_info, &get_info_optlen),
-                        SyscallSucceeds());
-            socklen_t get_entries_optlen =
-                sizeof(ipt_get_entries) + get_info.size;
-            std::unique_ptr<char[]> entries_buffer =
-                std::make_unique<char[]>(get_entries_optlen);
-            ipt_get_entries* entries =
-                reinterpret_cast<ipt_get_entries*>(entries_buffer.get());
-            snprintf(entries->name, XT_TABLE_MAXNAMELEN, "%s", kNatTablename);
-            entries->size = get_info.size;
-            SockOptArgs get_entries_args = {
-                .sock = sock,
-                .optname = IP6T_SO_GET_ENTRIES,
-                .optval = std::move(entries_buffer),
-                .optlen = get_entries_optlen,
-            };
-            return get_entries_args;
-          }},
-         {.test_name = "GetRevisionTarget",
-          .generate_sockopt_args =
-              [](int sock) {
-                std::unique_ptr<char[]> rev_buffer =
-                    std::make_unique<char[]>(sizeof(xt_get_revision));
-                xt_get_revision* rev =
-                    reinterpret_cast<xt_get_revision*>(rev_buffer.get());
-                snprintf(rev->name, sizeof(rev->name), "REDIRECT");
-                rev->revision = 0;
-                return SockOptArgs{
+    ::testing::Combine(
+        kSocketKinds,
+        ::testing::ValuesIn<RequiresCapNetAdminTestParams>(
+            {{.test_name = "GetInfo",
+              .generate_sockopt_args =
+                  [](int sock) {
+                    SockOptArgs args;
+                    args.sock = sock;
+                    std::unique_ptr<char[]> info_buffer =
+                        std::make_unique<char[]>(sizeof(ipt_getinfo));
+                    ipt_getinfo* info =
+                        reinterpret_cast<ipt_getinfo*>(info_buffer.get());
+                    snprintf(info->name, XT_TABLE_MAXNAMELEN, "%s",
+                             kNatTablename);
+                    args.optname = IP6T_SO_GET_INFO;
+                    args.optval = std::move(info_buffer);
+                    args.optlen = sizeof(ipt_getinfo);
+                    return args;
+                  }},
+             {.test_name = "GetEntries",
+              .generate_sockopt_args =
+                  [](int sock) -> absl::StatusOr<SockOptArgs> {
+                socklen_t get_info_optlen = sizeof(ipt_getinfo);
+                ipt_getinfo get_info;
+                snprintf(get_info.name, XT_TABLE_MAXNAMELEN, "%s",
+                         kNatTablename);
+                if (getsockopt(sock, SOL_IPV6, IP6T_SO_GET_INFO, &get_info,
+                               &get_info_optlen) != 0) {
+                  return absl::ErrnoToStatus(errno, "IP6T_SO_GET_INFO");
+                }
+                socklen_t get_entries_optlen =
+                    sizeof(ipt_get_entries) + get_info.size;
+                std::unique_ptr<char[]> entries_buffer =
+                    std::make_unique<char[]>(get_entries_optlen);
+                ipt_get_entries* entries =
+                    reinterpret_cast<ipt_get_entries*>(entries_buffer.get());
+                snprintf(entries->name, XT_TABLE_MAXNAMELEN, "%s",
+                         kNatTablename);
+                entries->size = get_info.size;
+                SockOptArgs get_entries_args = {
                     .sock = sock,
-                    .optname = IP6T_SO_GET_REVISION_TARGET,
-                    .optval = std::move(rev_buffer),
-                    .optlen = sizeof(xt_get_revision),
+                    .optname = IP6T_SO_GET_ENTRIES,
+                    .optval = std::move(entries_buffer),
+                    .optlen = get_entries_optlen,
                 };
+                return get_entries_args;
               }},
-         {.test_name = "GetRevisionMatch",
-          .generate_sockopt_args =
-              [](int sock) {
-                std::unique_ptr<char[]> rev_buffer =
-                    std::make_unique<char[]>(sizeof(xt_get_revision));
-                xt_get_revision* rev =
-                    reinterpret_cast<xt_get_revision*>(rev_buffer.get());
-                snprintf(rev->name, sizeof(rev->name), "tcp");
-                rev->revision = 0;
-                return SockOptArgs{
-                    .sock = sock,
-                    .optname = IP6T_SO_GET_REVISION_MATCH,
-                    .optval = std::move(rev_buffer),
-                    .optlen = sizeof(xt_get_revision),
-                };
-              }}}),
-    [](const ::testing::TestParamInfo<
-        GetSockOptRequiresCapNetAdminTest::ParamType>& info) {
-      return info.param.test_name;
-    });
+             {.test_name = "GetRevisionTarget",
+              .generate_sockopt_args =
+                  [](int sock) {
+                    std::unique_ptr<char[]> rev_buffer =
+                        std::make_unique<char[]>(sizeof(xt_get_revision));
+                    xt_get_revision* rev =
+                        reinterpret_cast<xt_get_revision*>(rev_buffer.get());
+                    snprintf(rev->name, sizeof(rev->name), "REDIRECT");
+                    rev->revision = 0;
+                    return SockOptArgs{
+                        .sock = sock,
+                        .optname = IP6T_SO_GET_REVISION_TARGET,
+                        .optval = std::move(rev_buffer),
+                        .optlen = sizeof(xt_get_revision),
+                    };
+                  }},
+             {.test_name = "GetRevisionMatch",
+              .generate_sockopt_args =
+                  [](int sock) {
+                    std::unique_ptr<char[]> rev_buffer =
+                        std::make_unique<char[]>(sizeof(xt_get_revision));
+                    xt_get_revision* rev =
+                        reinterpret_cast<xt_get_revision*>(rev_buffer.get());
+                    snprintf(rev->name, sizeof(rev->name), "tcp");
+                    rev->revision = 0;
+                    return SockOptArgs{
+                        .sock = sock,
+                        .optname = IP6T_SO_GET_REVISION_MATCH,
+                        .optval = std::move(rev_buffer),
+                        .optlen = sizeof(xt_get_revision),
+                    };
+                  }}})),
+    SockOptTestName);
 
 class SetSockOptRequiresCapNetAdminTest
-    : public ::testing::TestWithParam<RequiresCapNetAdminTestParams> {};
+    : public ::testing::TestWithParam<SockOptTestParams> {};
 
 TEST_P(SetSockOptRequiresCapNetAdminTest, Validate) {
-  const RequiresCapNetAdminTestParams& params = GetParam();
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+  const auto& [kind, params] = GetParam();
+  SKIP_IF(kind.type == SOCK_RAW &&
+          !ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
-  FileDescriptor sock = ASSERT_NO_ERRNO_AND_VALUE(
-      Socket(/*domain=*/AF_INET6, /*type=*/SOCK_RAW, /*protocol=*/IPPROTO_RAW));
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(kind.domain, kind.type, kind.protocol));
   absl::StatusOr<SockOptArgs> args_or_status =
       params.generate_sockopt_args(sock.get());
   ASSERT_EQ(args_or_status.status(), absl::OkStatus());
   SockOptArgs& setsockopt_args = *args_or_status;
-  // Validate that the socket creator either succeeds or fails with EINVAL,
-  // but not with EPERM.
+  // The socket creator passes the permission check, but the replacement
+  // lacks table entries and is invalid.
   ASSERT_THAT(setsockopt(setsockopt_args.sock, /*level=*/SOL_IPV6,
                          setsockopt_args.optname, setsockopt_args.optval.get(),
                          setsockopt_args.optlen),
-              AnyOf(SyscallSucceeds(), SyscallFailsWithErrno(EINVAL)));
+              SyscallFailsWithErrno(EINVAL));
   // Validate that another process from a different user namespace cannot
   // setsockopt and fails with EPERM.
   EXPECT_THAT(
@@ -420,27 +486,46 @@ TEST_P(SetSockOptRequiresCapNetAdminTest, Validate) {
 
 INSTANTIATE_TEST_SUITE_P(
     SetSockOpt, SetSockOptRequiresCapNetAdminTest,
-    ::testing::ValuesIn<RequiresCapNetAdminTestParams>(
-        {{.test_name = "SetReplace",
-          .generate_sockopt_args =
-              [](int sock) {
-                SockOptArgs args;
-                args.sock = sock;
-                std::unique_ptr<char[]> replace_buffer =
-                    std::make_unique<char[]>(sizeof(ipt_replace));
-                ipt_replace* replace =
-                    reinterpret_cast<ipt_replace*>(replace_buffer.get());
-                snprintf(replace->name, sizeof(replace->name), "%s",
-                         kNatTablename);
-                args.optname = IP6T_SO_SET_REPLACE;
-                args.optval = std::move(replace_buffer);
-                args.optlen = sizeof(ipt_replace);
-                return args;
-              }}}),
-    [](const ::testing::TestParamInfo<
-        SetSockOptRequiresCapNetAdminTest::ParamType>& info) {
-      return info.param.test_name;
-    });
+    ::testing::Combine(
+        kSocketKinds,
+        ::testing::ValuesIn<RequiresCapNetAdminTestParams>(
+            {{.test_name = "SetReplace",
+              .generate_sockopt_args =
+                  [](int sock) {
+                    SockOptArgs args;
+                    args.sock = sock;
+                    std::unique_ptr<char[]> replace_buffer =
+                        std::make_unique<char[]>(sizeof(ipt_replace));
+                    ipt_replace* replace =
+                        reinterpret_cast<ipt_replace*>(replace_buffer.get());
+                    snprintf(replace->name, sizeof(replace->name), "%s",
+                             kNatTablename);
+                    args.optname = IP6T_SO_SET_REPLACE;
+                    args.optval = std::move(replace_buffer);
+                    args.optlen = sizeof(ipt_replace);
+                    return args;
+                  }}})),
+    SockOptTestName);
+
+// Creates an ip6tables replace payload for the "filter" table where a built-in
+// hook entry point (LOCAL_IN) points directly to a user-defined chain header
+// (an XT_ERROR_TARGET whose errorname is a custom chain name, "my_chain").
+std::vector<char> MakeUserChainTargetReplacePayload() {
+  return MakeUserChainTargetReplacePayload6();
+}
+
+TEST(IP6TablesTest, UserChainTargetCrash) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET6, SOCK_RAW, IPPROTO_RAW));
+  std::vector<char> replace = MakeUserChainTargetReplacePayload();
+  EXPECT_THAT(
+      setsockopt(sock.get(), SOL_IPV6, IP6T_SO_SET_REPLACE, replace.data(),
+                 replace.size()),
+      AnyOf(SyscallFailsWithErrno(EINVAL), SyscallFailsWithErrno(ENOPROTOOPT)));
+}
 
 }  // namespace
 

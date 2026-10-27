@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 )
@@ -80,21 +81,36 @@ type SaveOpts struct {
 	// CudaCheckpointSequential indicates whether cuda-checkpoint should be run
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
+
+	// ValidateMetadata indicates whether filesystem implementations backed by
+	// remote filesystems should refresh metadata during save so that restore
+	// can validate file sizes and/or modification timestamps.
+	ValidateMetadata bool
+
+	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
+	// should split filesystem to separate pages from the full checkpoint.
+	FSSaveOpts *kernel.FSSaveOpts
 }
 
 // Close releases resources owned by opts.
 func (opts *SaveOpts) Close() error {
-	var dstErr, pmErr, pfErr error
+	var err error
 	if c, ok := opts.Destination.(io.Closer); ok {
-		dstErr = c.Close()
+		err = errors.Join(err, c.Close())
+		opts.Destination = nil
 	}
 	if opts.PagesMetadata != nil {
-		pmErr = opts.PagesMetadata.Close()
+		err = errors.Join(err, opts.PagesMetadata.Close())
+		opts.PagesMetadata = nil
 	}
 	if opts.PagesFile != nil {
-		pfErr = opts.PagesFile.Close()
+		err = errors.Join(err, opts.PagesFile.Close())
+		opts.PagesFile = nil
 	}
-	return errors.Join(dstErr, pmErr, pfErr)
+	if opts.FSSaveOpts != nil {
+		err = errors.Join(err, opts.FSSaveOpts.Close())
+	}
+	return err
 }
 
 // Save saves the system state.
@@ -148,7 +164,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	if wt != 0 {
 		opts.Metadata[GvisorWallTimeKey] = wt.String()
 	}
-	addSaveMetadata(opts.Metadata)
+	addSaveMetadata(opts.Metadata, k)
 
 	// Open the statefile.
 	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata) // transfers ownership of opts.Destination to wc if err == nil
@@ -157,9 +173,13 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
+		vfsOpts := vfs.PrepareSaveOptions{
+			ValidateMetadata: opts.ValidateMetadata,
+		}
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
+		opts.FSSaveOpts = nil
 	}
 
 	t1, _ := CPUTime()
@@ -182,7 +202,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 
 // NewStatefileReader returns the statefile's metadata and a reader for it.
 // The ownership of source is transferred to the returned reader.
-func NewStatefileReader(source io.ReadCloser, key []byte) (io.ReadCloser, map[string]string, error) {
+//
+// Callers that use the data must call Verify on the reader when they stop
+// reading. See statefile.Reader.
+func NewStatefileReader(source io.ReadCloser, key []byte) (statefile.Reader, map[string]string, error) {
 	r, m, err := statefile.NewReader(source, key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("statefile.NewReader failed: %w", err)

@@ -33,16 +33,15 @@ import (
 // Saver is an interface for saving the kernel.
 type Saver interface {
 	SaveAsync() error
-	SpecEnviron(containerName string) []string
 	FSSave() error
 }
 
-// CheckpointGeneration stores information about the last checkpoint taken.
+// CheckpointGeneration describes the latest checkpoint attempt or restore.
 //
 // +stateify savable
 type CheckpointGeneration struct {
-	// Count is incremented every time a checkpoint is triggered, even if the
-	// checkpoint failed.
+	// Count is incremented after each checkpoint attempt, including failures,
+	// and on restore.
 	Count uint32
 	// Restore indicates if the current instance resumed after the checkpoint or
 	// it was restored from a checkpoint.
@@ -50,6 +49,9 @@ type CheckpointGeneration struct {
 }
 
 // AddStateToCheckpoint adds a key-value pair to be additionally checkpointed.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) AddStateToCheckpoint(key, v any) {
 	k.checkpointMu.Lock()
 	defer k.checkpointMu.Unlock()
@@ -61,6 +63,9 @@ func (k *Kernel) AddStateToCheckpoint(key, v any) {
 
 // PopCheckpointState pops a key-value pair from the additional checkpoint
 // state. If the key doesn't exist, nil is returned.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) PopCheckpointState(key any) any {
 	k.checkpointMu.Lock()
 	defer k.checkpointMu.Unlock()
@@ -73,6 +78,9 @@ func (k *Kernel) PopCheckpointState(key any) any {
 
 // SetSaver sets the kernel's Saver.
 // Thread-compatible.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) SetSaver(s Saver) {
 	k.checkpointMu.Lock()
 	defer k.checkpointMu.Unlock()
@@ -81,6 +89,9 @@ func (k *Kernel) SetSaver(s Saver) {
 
 // Saver returns the kernel's Saver.
 // Thread-compatible.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) Saver() Saver {
 	k.checkpointMu.Lock()
 	defer k.checkpointMu.Unlock()
@@ -88,6 +99,9 @@ func (k *Kernel) Saver() Saver {
 }
 
 // CheckpointGen returns the current checkpoint generation.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) CheckpointGen() CheckpointGeneration {
 	k.checkpointMu.Lock()
 	defer k.checkpointMu.Unlock()
@@ -96,6 +110,9 @@ func (k *Kernel) CheckpointGen() CheckpointGeneration {
 }
 
 // IncCheckpointGenOnRestore increments the checkpoint generation upon restore.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) IncCheckpointGenOnRestore() {
 	k.checkpointMu.Lock()
 	defer k.checkpointMu.Unlock()
@@ -108,6 +125,9 @@ func (k *Kernel) IncCheckpointGenOnRestore() {
 
 // OnCheckpointAttempt is called when a checkpoint attempt is completed. err is
 // any checkpoint errors that may have occurred.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) OnCheckpointAttempt(err error) {
 	if err == nil {
 		log.Infof("Checkpoint completed successfully.")
@@ -124,7 +144,11 @@ func (k *Kernel) OnCheckpointAttempt(err error) {
 	k.CheckpointWait.signal(k.checkpointGen, err)
 }
 
-// WaitForCheckpoint waits for the Kernel to have been successfully checkpointed.
+// WaitForCheckpoint waits for the next checkpoint generation or an error
+// notification, and returns the reported error.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) WaitForCheckpoint() error {
 	// Send checkpoint result to a channel and wait on it.
 	ch := make(chan error, 1)
@@ -136,6 +160,8 @@ func (k *Kernel) WaitForCheckpoint() error {
 }
 
 // SignalAllCheckpointWaiters signals all checkpoint waiters with err.
+//
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) SignalAllCheckpointWaiters(err error) {
 	k.CheckpointWait.signal(CheckpointGeneration{Count: math.MaxUint32}, err)
 }
@@ -145,6 +171,9 @@ type checkpointWaiter struct {
 	count uint32
 	// callback is the function that will be called when the checkpoint generation
 	// reaches the desired count. It is set to nil after the callback is called.
+	//
+	// It is protected by the owning CheckpointWaitable's mu. The waiter has
+	// no reference to that owner, so checklocks cannot name the mutex here.
 	callback func(CheckpointGeneration, error)
 }
 
@@ -152,22 +181,32 @@ type checkpointWaiter struct {
 // checkpoint to complete.
 //
 // +stateify savable
+// +checklocksalias:k.CheckpointWait.mu=mu
 type CheckpointWaitable struct {
+	// k contains this waitable in k.CheckpointWait. It is set before the
+	// waitable is used and remains unchanged.
 	k *Kernel
 
 	mu sync.Mutex `state:"nosave"`
 
 	// Don't save the waiters, because they are repopulated after restore. It also
 	// allows for external entities to wait for the checkpoint.
+	//
+	// +checklocks:mu
 	waiters map[*checkpointWaiter]struct{} `state:"nosave"`
 }
 
-// Register registers a callback that is notified when the checkpoint generation count is higher
-// than the desired count.
+// Register registers a callback that is notified when the checkpoint generation
+// reaches the desired count.
+//
+// cb runs with mu held and may also run with the kernel's checkpoint mutex
+// held. It must not call methods that acquire either mutex. checklocks cannot
+// attach these owner-lock requirements to the supplied function value.
+//
+// +checklocksexclude:w.mu
+// +checklocksexclude:w.k.checkpointMu
 func (w *CheckpointWaitable) Register(cb func(CheckpointGeneration, error), count uint32) any {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	waiter := &checkpointWaiter{
 		count:    count,
 		callback: cb,
@@ -176,8 +215,17 @@ func (w *CheckpointWaitable) Register(cb func(CheckpointGeneration, error), coun
 		w.waiters = make(map[*checkpointWaiter]struct{})
 	}
 	w.waiters[waiter] = struct{}{}
+	w.mu.Unlock()
 
-	if gen := w.k.CheckpointGen(); count <= gen.Count {
+	// Publish the waiter before reading the generation to avoid missing a
+	// checkpoint. Do not hold mu while acquiring checkpointMu: notification
+	// holds checkpointMu while acquiring mu.
+	gen := w.k.CheckpointGen()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Notification may have already delivered the checkpoint's error.
+	if waiter.callback != nil && count <= gen.Count {
 		// The checkpoint has already occurred. Signal immediately.
 		waiter.callback(gen, nil)
 		waiter.callback = nil
@@ -185,8 +233,10 @@ func (w *CheckpointWaitable) Register(cb func(CheckpointGeneration, error), coun
 	return waiter
 }
 
-// Unregister unregisters a waiter. It must be called even if the channel
-// was signalled.
+// Unregister unregisters a waiter. It must be called even if the callback
+// has already run.
+//
+// +checklocksexclude:w.mu
 func (w *CheckpointWaitable) Unregister(key any) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -197,6 +247,9 @@ func (w *CheckpointWaitable) Unregister(key any) {
 	}
 }
 
+// signal notifies waiters whose desired generation has been reached.
+//
+// +checklocksexclude:w.mu
 func (w *CheckpointWaitable) signal(gen CheckpointGeneration, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -212,13 +265,45 @@ func (w *CheckpointWaitable) signal(gen CheckpointGeneration, err error) {
 // loadPrivateMemoryFiles loads the private MemoryFiles from mfmap and it reads
 // private MemoryFile metadata from `r`. This consumes bytes from `r`, so this
 // must be called only once.
-func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile, opts *pgalloc.LoadOpts) error {
+func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile, fsCheckpointed map[checkpoint.ResourceID]struct{}, opts *pgalloc.LoadOpts) error {
 	// Load the metadata.
 	var meta privateMemoryFileMetadata
 	if _, err := state.Load(ctx, r, &meta); err != nil {
 		return err
 	}
-	// Ensure that it is consistent with mfmap.
+	// Ensure that it is consistent with mfmap, unless we are restoring from
+	// split filesystem checkpoint.
+	if fsCheckpointed != nil {
+		ownersMap := make(map[checkpoint.ResourceID]struct{}, len(meta.owners))
+		for _, fsID := range meta.owners {
+			ownersMap[fsID] = struct{}{}
+		}
+
+		// Check that all expected are loaded.
+		for fsID := range mfmap {
+			_, inFS := fsCheckpointed[fsID]
+			_, inSentry := ownersMap[fsID]
+			if !inFS && !inSentry {
+				return fmt.Errorf("private memory file %q was neither in FS checkpoint nor in Sentry checkpoint", fsID)
+			}
+			if inFS && inSentry {
+				return fmt.Errorf("private memory file %q was present in both FS checkpoint and Sentry checkpoint", fsID)
+			}
+		}
+
+		// Load from sentry checkpoint.
+		for _, fsID := range meta.owners {
+			mf, ok := mfmap[fsID]
+			if !ok {
+				return fmt.Errorf("saved private memory file for %q was not configured on restore", fsID)
+			}
+			err := mf.LoadFrom(ctx, r, opts)
+			if err != nil {
+				return fmt.Errorf("failed to load MemoryFile %p fsID %q from Sentry state: %w", mf, fsID, err)
+			}
+		}
+		return nil
+	}
 	if len(mfmap) != len(meta.owners) {
 		return fmt.Errorf("inconsistent private memory files on restore: savedMFOwners = %v, mfmap = %v", meta.owners, mfmap)
 	}
@@ -241,7 +326,7 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader) error {
 	if err := k.mf.LoadFrom(ctx, r, &opts); err != nil {
 		return fmt.Errorf("failed to load main MemoryFile %p: %w", k.mf, err)
 	}
-	if err := loadPrivateMemoryFiles(ctx, r, pgalloc.MemoryFileMapFromContext(ctx), &opts); err != nil {
+	if err := loadPrivateMemoryFiles(ctx, r, pgalloc.MemoryFileMapFromContext(ctx), FSCheckpointedMemoryFilesFromContext(ctx), &opts); err != nil {
 		return fmt.Errorf("failed to load private MemoryFiles: %w", err)
 	}
 	return nil
@@ -260,16 +345,29 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader) error {
 type AsyncMFLoader struct {
 	// privateMFsChan is used to tell the background goroutine about private
 	// MemoryFiles, once they are known. This channel is written to exactly once.
-	privateMFsChan chan map[checkpoint.ResourceID]*pgalloc.MemoryFile
+	privateMFsChan chan privateMFsInfo
 
+	// Error fields are published by WaitGroup completion rather than a mutex:
+	// mainMFStartWg publishes mainMetadataErr and apfl, metadataWg publishes
+	// metadataErr, and loadWg publishes loadErr. Readers wait for the
+	// corresponding group.
+	// checklocks cannot express these completion-based publication boundaries.
 	mainMFStartWg   sync.WaitGroup
 	mainMetadataErr error
+
+	// apfl is nil if async page loading failed to start.
+	apfl *pgalloc.AsyncPagesFileLoad
 
 	metadataWg  sync.WaitGroup
 	metadataErr error
 
 	loadWg  sync.WaitGroup
 	loadErr error
+}
+
+type privateMFsInfo struct {
+	mfmap          map[checkpoint.ResourceID]*pgalloc.MemoryFile
+	fsCheckpointed map[checkpoint.ResourceID]struct{}
 }
 
 // NewAsyncMFLoader creates a new AsyncMFLoader. It takes ownership of
@@ -279,18 +377,18 @@ type AsyncMFLoader struct {
 // If timeline is provided, it will be used to track async page loading.
 // It takes ownership of the timeline, and will end it when done loading all
 // pages.
-func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
+func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline, pageLoadOpts pgalloc.AsyncPagesFileLoadOpts) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
-		privateMFsChan: make(chan map[checkpoint.ResourceID]*pgalloc.MemoryFile, 1),
+		privateMFsChan: make(chan privateMFsInfo, 1),
 	}
 	mfl.mainMFStartWg.Add(1)
 	mfl.metadataWg.Add(1)
 	mfl.loadWg.Add(1)
-	go mfl.backgroundGoroutine(pagesMetadata, pagesFile, mainMF, timeline)
+	go mfl.backgroundGoroutine(pagesMetadata, pagesFile, mainMF, timeline, pageLoadOpts)
 	return mfl
 }
 
-func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) {
+func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline, pageLoadOpts pgalloc.AsyncPagesFileLoadOpts) {
 	defer timeline.End()
 	defer pagesMetadata.Close()
 	cu := cleanup.Make(func() {
@@ -303,13 +401,17 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	apfl, err := pgalloc.StartAsyncPagesFileLoad(pagesFile, func(err error) {
 		defer mfl.loadWg.Done()
 		mfl.loadErr = err
-	}, timeline) // transfers ownership of pagesFile
+	}, timeline, pageLoadOpts) // transfers ownership of pagesFile
 	if err != nil {
 		mfl.loadWg.Done()
+		mfl.mainMetadataErr = err
+		mfl.metadataErr = err
+		mfl.mainMFStartWg.Done()
 		log.Warningf("Failed to start async page loading: %v", err)
 		return
 	}
 	cu.Add(apfl.MemoryFilesDone)
+	mfl.apfl = apfl
 
 	opts := pgalloc.LoadOpts{
 		PagesFile: apfl,
@@ -330,10 +432,10 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 		return
 	}
 	timeline.Reached("waiting for privateMF info")
-	privateMFs := <-mfl.privateMFsChan
+	info := <-mfl.privateMFsChan
 	timeline.Reached("received privateMFs info")
-	log.Infof("Loading metadata for %d private MemoryFiles", len(privateMFs))
-	if err := loadPrivateMemoryFiles(ctx, pagesMetadata, privateMFs, &opts); err != nil {
+	log.Infof("Loading metadata for %d private MemoryFiles", len(info.mfmap))
+	if err := loadPrivateMemoryFiles(ctx, pagesMetadata, info.mfmap, info.fsCheckpointed, &opts); err != nil {
 		log.Warningf("Failed to load private MemoryFiles: %v", err)
 		mfl.metadataErr = err
 		return
@@ -355,8 +457,19 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 }
 
 // KickoffPrivate notifies the background goroutine of the private MemoryFiles.
-func (mfl *AsyncMFLoader) KickoffPrivate(mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile) {
-	mfl.privateMFsChan <- mfmap
+func (mfl *AsyncMFLoader) KickoffPrivate(ctx context.Context, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile) {
+	mfl.privateMFsChan <- privateMFsInfo{
+		mfmap:          mfmap,
+		fsCheckpointed: FSCheckpointedMemoryFilesFromContext(ctx),
+	}
+}
+
+// Unthrottle allows page loading to use full I/O parallelism.
+func (mfl *AsyncMFLoader) Unthrottle() {
+	mfl.mainMFStartWg.Wait()
+	if mfl.apfl != nil {
+		mfl.apfl.Unthrottle()
+	}
 }
 
 // WaitMainMFStart waits for the background goroutine to successfully start

@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
 #include <linux/sched.h>
 #include <sched.h>
 #include <signal.h>
@@ -29,6 +30,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -39,6 +41,7 @@
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -466,7 +469,9 @@ TEST(CloneTest, NewUserMountNamespace) {
       << "status = " << status;
 }
 
-// Clone with CLONE_SETTLS and a non-canonical TLS address is rejected.
+#if defined(__x86_64__)
+// Clone with CLONE_SETTLS and a non-canonical TLS address is rejected only on
+// x86-64 due to canonical address checks.
 TEST(CloneTest, NonCanonicalTLS) {
   constexpr uintptr_t kNonCanonical = 1ull << 63;
 
@@ -478,21 +483,11 @@ TEST(CloneTest, NonCanonicalTLS) {
   // long clone(unsigned long flags, void *stack,
   //            int *parent_tid, int *child_tid,
   //            unsigned long tls);
-  //
-  // While on arm64, the order of the last two arguments is reversed:
-  // long clone(unsigned long flags, void *stack,
-  //            int *parent_tid, unsigned long tls,
-  //            int *child_tid);
-#if defined(__x86_64__)
   EXPECT_THAT(syscall(__NR_clone, SIGCHLD | CLONE_SETTLS, &stack, nullptr,
                       nullptr, kNonCanonical),
               SyscallFailsWithErrno(EPERM));
-#elif defined(__aarch64__) || defined(__riscv)
-  EXPECT_THAT(syscall(__NR_clone, SIGCHLD | CLONE_SETTLS, &stack, nullptr,
-                      kNonCanonical, nullptr),
-              SyscallFailsWithErrno(EPERM));
-#endif
 }
+#endif
 
 #ifndef SYS_clone3
 #define SYS_clone3 435

@@ -30,7 +30,8 @@ import (
 // Read implements subcommands.Command for the "read" command.
 type Read struct {
 	containerLoader
-	size int64
+	offset int64
+	size   int64
 }
 
 // Name implements subcommands.Command.Name.
@@ -48,22 +49,23 @@ func (*Read) Usage() string {
 	return `read [flags] <container-id> <path> - read a file of the sandbox given the path
 
 Where "<container-id>" is the name for the instance of the container, and
-"<path>" is the path to the file in the sandbox to read. Size can be specified via the --size flag.
+"<path>" is the path to the file in the sandbox to read. Size and offset can be specified via the --size and --offset flags.
 
 EXAMPLE:
-       # runsc read --size 4096 <container-id> /etc/passwd
+       # runsc read --size 4096 --offset 0 <container-id> /etc/passwd
        # runsc read <container-id> /etc/passwd
 `
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (r *Read) SetFlags(f *flag.FlagSet) {
+	f.Int64Var(&r.offset, "offset", 0, "byte offset in the file to read from")
 	f.Int64Var(&r.size, "size", 0, "maximum size to read (0 means unlimited)")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (r *Read) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -81,12 +83,12 @@ func (r *Read) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	size := r.size
 
 	conf := args[0].(*config.Config)
-	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		util.Fatalf("Failed to load container: %v", err)
 	}
 
-	if err := c.Sandbox.ReadFile(c.ID, path, size, os.Stdout); err != nil {
+	if err := c.Sandbox.ReadFile(c.ID, path, r.offset, size, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %s\n", err)
 		return subcommands.ExitFailure
 	}

@@ -15,13 +15,16 @@
 package sys_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -33,7 +36,7 @@ const (
 	vfioDev = "vfio-dev"
 )
 
-func newTestSystem(t *testing.T, pciTestDir string) *testutil.System {
+func tryNewTestSystem(t *testing.T, idata *sys.InternalData) (*testutil.System, error) {
 	k, err := testutil.Boot()
 	if err != nil {
 		t.Fatalf("Failed to create test kernel: %v", err)
@@ -46,18 +49,30 @@ func newTestSystem(t *testing.T, pciTestDir string) *testutil.System {
 
 	mountOpts := &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
-			InternalData: &sys.InternalData{
-				EnableTPUProxyPaths: pciTestDir != "",
-				TestSysfsPathPrefix: pciTestDir,
-			},
+			InternalData: idata,
 		},
 	}
 
 	mns, err := k.VFS().NewMountNamespace(ctx, creds, "", sys.Name, mountOpts, nil)
 	if err != nil {
+		return nil, err
+	}
+	return testutil.NewSystem(ctx, t, k.VFS(), mns), nil
+}
+
+func newTestSystemWithInternalData(t *testing.T, idata *sys.InternalData) *testutil.System {
+	s, err := tryNewTestSystem(t, idata)
+	if err != nil {
 		t.Fatalf("Failed to create new mount namespace: %v", err)
 	}
-	return testutil.NewSystem(ctx, t, k.VFS(), mns)
+	return s
+}
+
+func newTestSystem(t *testing.T, pciTestDir string) *testutil.System {
+	return newTestSystemWithInternalData(t, &sys.InternalData{
+		EnableTPUProxyPaths: pciTestDir != "",
+		TestSysfsPathPrefix: pciTestDir,
+	})
 }
 
 func TestReadCPUFile(t *testing.T) {
@@ -214,7 +229,7 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 	if err := os.MkdirAll(pciPath0, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
-	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0000:10")
+	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0007:10")
 	if err := os.MkdirAll(pciPath1, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
@@ -245,14 +260,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		{
 			group:             "2",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0",
+			pciAddress:        "0007:10:05.0",
 			name:              "vfio2",
 			nestedDeviceIndex: 3,
 		},
 		{
 			group:             "3",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0/0000:03:00.1",
+			pciAddress:        "0007:10:05.0/0007:03:00.1",
 			name:              "vfio3",
 			nestedDeviceIndex: -1,
 		},
@@ -282,6 +297,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 			t.Fatalf("Failed to symlink iommu_groups directory: %v", err)
 		}
 	}
+	// Non-PCI platform devices in IOMMU groups (e.g. on ARM64 hosts) must be ignored.
+	nonPCIIOMMUPath := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", "4", "devices")
+	if err := os.MkdirAll(nonPCIIOMMUPath, 0755); err != nil {
+		t.Fatalf("Failed to create non-PCI iommu_groups directory: %v", err)
+	}
+	if err := os.Symlink("../../../../devices/platform/arm-smmu-v3.0.auto", path.Join(nonPCIIOMMUPath, "arm-smmu-v3.0.auto")); err != nil {
+		t.Fatalf("Failed to symlink non-PCI iommu_group device: %v", err)
+	}
 	s := newTestSystem(t, sysfsTestDir)
 	defer s.Destroy()
 
@@ -307,5 +330,336 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
 			path.Base(device.pciAddress): linux.DT_LNK,
 		})
+	}
+
+	// Read iommu_group symlinks via /bus/pci/devices to populate cached dentries.
+	for _, tc := range []struct {
+		pciAddr   string
+		wantGroup string
+	}{
+		{"0000:00:04.0", "../../../kernel/iommu_groups/0"},
+		{"0000:00:05.0", "../../../kernel/iommu_groups/1"},
+	} {
+		pop := s.PathOpAtRoot(path.Join("bus", "pci", "devices", tc.pciAddr, "iommu_group"))
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("ReadlinkAt(%q) failed: %v", tc.pciAddr, err)
+		}
+		if got != tc.wantGroup {
+			t.Fatalf("ReadlinkAt(%q) = %q, want %q", tc.pciAddr, got, tc.wantGroup)
+		}
+	}
+
+	// Swap IOMMU groups 0 and 1 on the host and run CompleteRestore.
+	for _, swap := range []struct {
+		pciAddr  string
+		oldGroup string
+		newGroup string
+	}{
+		{"0000:00:04.0", "0", "1"},
+		{"0000:00:05.0", "1", "0"},
+	} {
+		iommuLink := path.Join(pciPath0, swap.pciAddr, "iommu_group")
+		if err := os.Remove(iommuLink); err != nil {
+			t.Fatalf("Failed to remove old iommu_group symlink: %v", err)
+		}
+		if err := os.Symlink(path.Join("..", "..", "..", "kernel", "iommu_groups", swap.newGroup), iommuLink); err != nil {
+			t.Fatalf("Failed to create new iommu_group symlink: %v", err)
+		}
+		oldDevLink := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", swap.oldGroup, "devices", swap.pciAddr)
+		if err := os.Remove(oldDevLink); err != nil {
+			t.Fatalf("Failed to remove old iommu_groups device symlink: %v", err)
+		}
+	}
+	for _, swap := range []struct {
+		pciAddr  string
+		newGroup string
+	}{
+		{"0000:00:04.0", "1"},
+		{"0000:00:05.0", "0"},
+	} {
+		newDevLink := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", swap.newGroup, "devices", swap.pciAddr)
+		if err := os.Symlink(path.Join("..", "..", "..", "..", "devices", "pci0000:00", swap.pciAddr), newDevLink); err != nil {
+			t.Fatalf("Failed to create new iommu_groups device symlink: %v", err)
+		}
+	}
+
+	if err := s.VFS.CompleteRestore(s.Ctx, &vfs.CompleteRestoreOptions{}); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+
+	// Verify that cached dentries were invalidated and the new IOMMU groups are visible.
+	for _, tc := range []struct {
+		pciAddr   string
+		wantGroup string
+		groupNum  string
+	}{
+		{"0000:00:04.0", "../../../kernel/iommu_groups/1", "1"},
+		{"0000:00:05.0", "../../../kernel/iommu_groups/0", "0"},
+	} {
+		pop := s.PathOpAtRoot(path.Join("bus", "pci", "devices", tc.pciAddr, "iommu_group"))
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("ReadlinkAt(%q) after CompleteRestore failed: %v", tc.pciAddr, err)
+		}
+		if got != tc.wantGroup {
+			t.Errorf("ReadlinkAt(%q) after CompleteRestore = %q, want %q", tc.pciAddr, got, tc.wantGroup)
+		}
+		pop = s.PathOpAtRoot(path.Join("kernel", "iommu_groups", tc.groupNum, "devices"))
+		s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
+			tc.pciAddr: linux.DT_LNK,
+		})
+	}
+}
+
+// Check that the DMI entries exist after mount and after CompleteRestore
+// rebuilds /sys/class and /sys/devices.
+func TestProductNameCompleteRestore(t *testing.T) {
+	sysfsTestDir := t.TempDir()
+	for _, dir := range []string{
+		path.Join(sysfsTestDir, "sys", "devices"),
+		path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("Failed to create %q: %v", dir, err)
+		}
+	}
+	const productName = "Test Product"
+	s := newTestSystemWithInternalData(t, &sys.InternalData{
+		ProductName:         productName,
+		EnableTPUProxyPaths: true,
+		TestSysfsPathPrefix: sysfsTestDir,
+	})
+	defer s.Destroy()
+
+	checkDMI := func(stage string) {
+		t.Helper()
+		pop := s.PathOpAtRoot("devices/virtual/dmi/id/product_name")
+		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+		if err != nil {
+			t.Fatalf("%s: OpenAt(product_name) failed: %v", stage, err)
+		}
+		defer fd.DecRef(s.Ctx)
+		content, err := s.ReadToEnd(fd)
+		if err != nil {
+			t.Fatalf("%s: Read(product_name) failed: %v", stage, err)
+		}
+		if want := productName + "\n"; content != want {
+			t.Errorf("%s: product_name = %q, want %q", stage, content, want)
+		}
+		pop = s.PathOpAtRoot("class/dmi/id")
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("%s: ReadlinkAt(class/dmi/id) failed: %v", stage, err)
+		}
+		if want := "../../devices/virtual/dmi/id"; got != want {
+			t.Errorf("%s: ReadlinkAt(class/dmi/id) = %q, want %q", stage, got, want)
+		}
+	}
+
+	checkDMI("before CompleteRestore")
+	if err := s.VFS.CompleteRestore(s.Ctx, &vfs.CompleteRestoreOptions{}); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+	checkDMI("after CompleteRestore")
+}
+
+// rdmaTestPCIConfig is a fake raw PCI config space blob; deliberately not
+// valid UTF-8 to check binary-faithful mirroring.
+var rdmaTestPCIConfig = []byte{0x86, 0x80, 0x0d, 0x02, 0x00, 0x00, 0x10, 0x00}
+
+// newRDMATestSnapshot returns a snapshot with a ConnectX NIC behind a bridge
+// on domain 0000 and a GPU on an extended (VMD-style, 5-hex-digit) domain.
+func newRDMATestSnapshot() *rdma.Snapshot {
+	const nicLeaf = "devices/pci0000:07/0000:07:01.0/0000:0c:00.0"
+	return &rdma.Snapshot{
+		VerbsABIVersion: "6\n",
+		PCINodes: []rdma.PCINode{
+			{Path: "devices/pci0000:07"},
+			{Path: "devices/pci0000:07/0000:07:01.0", Attrs: map[string]string{"class": "0x060400\n"}, Config: rdmaTestPCIConfig},
+			{Path: nicLeaf, Attrs: map[string]string{
+				"vendor": "0x15b3\n",
+				"uevent": "DRIVER=mlx5_core\nPCI_SLOT_NAME=0000:0c:00.0\n",
+				// Host-view CPU affinity: must be rewritten to the sandbox's
+				// single-node view.
+				"numa_node":     "1\n",
+				"local_cpus":    "ffffffff,ffffff00,00000000\n",
+				"local_cpulist": "56-111\n",
+			}},
+			{Path: "devices/pci10000:e0"},
+			{Path: "devices/pci10000:e0/10000:e0:06.0", Attrs: map[string]string{
+				"class":  "0x030200\n",
+				"vendor": "0x10de\n",
+				// A device on no NUMA node stays that way.
+				"numa_node": "-1\n",
+			}},
+		},
+		Devices: []rdma.Device{{
+			Uverbs:     "uverbs0",
+			IBDev:      "mlx5_0",
+			LeafPCI:    nicLeaf,
+			Dev:        "231:192\n",
+			ABIVersion: "1\n",
+			IBAttrs:    map[string]string{"node_guid": "0011:2233:4455:6677\n"},
+			Ports: map[string]rdma.Port{
+				"1": {
+					StaticAttrs:  map[string]string{"link_layer": "Ethernet\n"},
+					LiveAttrs:    []string{"state"},
+					GIDNames:     []string{"0", "1"},
+					CounterNames: []string{"port_rcv_data"},
+				},
+			},
+			NetDevs: []rdma.NetDev{{
+				Name:     "eth1",
+				Attrs:    map[string]string{"mtu": "9000\n"},
+				ErrAttrs: map[string]int32{"speed": int32(unix.EINVAL)},
+			}},
+		}},
+		NUMA: &rdma.NUMA{
+			// Two-node host (aggregate ranges "0-1"): the sandbox must
+			// advertise a single node covering the sandbox's CPUs.
+			Aggregate: map[string]string{"online": "0-1\n", "possible": "0-1\n"},
+		},
+	}
+}
+
+func readTestFile(s *testutil.System, p string) (string, error) {
+	pop := s.PathOpAtRoot(p)
+	fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+	if err != nil {
+		return "", err
+	}
+	defer fd.DecRef(s.Ctx)
+	return s.ReadToEnd(fd)
+}
+
+func TestRDMASysfs(t *testing.T) {
+	s := newTestSystemWithInternalData(t, &sys.InternalData{RDMASysfs: newRDMATestSnapshot()})
+	defer s.Destroy()
+
+	const nicLeaf = "/devices/pci0000:07/0000:07:01.0/0000:0c:00.0"
+	for p, want := range map[string]map[string]testutil.DirentType{
+		"/devices/pci0000:07": {
+			"0000:07:01.0": linux.DT_DIR,
+			"pci_bus":      linux.DT_DIR,
+		},
+		"/devices/pci0000:07/0000:07:01.0": {
+			"0000:0c:00.0": linux.DT_DIR,
+			"pci_bus":      linux.DT_DIR,
+			"subsystem":    linux.DT_LNK,
+			"class":        linux.DT_REG,
+			"config":       linux.DT_REG,
+		},
+		nicLeaf: {
+			"infiniband":       linux.DT_DIR,
+			"infiniband_verbs": linux.DT_DIR,
+			"net":              linux.DT_DIR,
+			"subsystem":        linux.DT_LNK,
+			"driver":           linux.DT_LNK,
+			"vendor":           linux.DT_REG,
+			"uevent":           linux.DT_REG,
+			"numa_node":        linux.DT_REG,
+			"local_cpus":       linux.DT_REG,
+			"local_cpulist":    linux.DT_REG,
+		},
+		nicLeaf + "/infiniband/mlx5_0": {
+			"device":    linux.DT_LNK,
+			"node_guid": linux.DT_REG,
+			"ports":     linux.DT_DIR,
+		},
+		nicLeaf + "/infiniband/mlx5_0/ports/1": {
+			"link_layer": linux.DT_REG,
+			"state":      linux.DT_REG,
+			"gids":       linux.DT_DIR,
+			"gid_attrs":  linux.DT_DIR,
+			"counters":   linux.DT_DIR,
+		},
+		nicLeaf + "/infiniband/mlx5_0/ports/1/gids": {
+			"0": linux.DT_REG,
+			"1": linux.DT_REG,
+		},
+		nicLeaf + "/infiniband_verbs/uverbs0": {
+			"ibdev":       linux.DT_REG,
+			"abi_version": linux.DT_REG,
+			"dev":         linux.DT_REG,
+			"device":      linux.DT_LNK,
+		},
+		nicLeaf + "/net/eth1": {
+			"mtu":    linux.DT_REG,
+			"speed":  linux.DT_REG,
+			"device": linux.DT_LNK,
+		},
+		// Extended-domain (VMD-style) GPU root.
+		"/devices/pci10000:e0": {
+			"10000:e0:06.0": linux.DT_DIR,
+			"pci_bus":       linux.DT_DIR,
+		},
+		"/class/infiniband":       {"mlx5_0": linux.DT_LNK},
+		"/class/infiniband_verbs": {"uverbs0": linux.DT_LNK, "abi_version": linux.DT_REG},
+		"/class/net":              {"eth1": linux.DT_LNK},
+		"/class/pci_bus": {
+			"0000:07":  linux.DT_LNK,
+			"0000:0c":  linux.DT_LNK,
+			"10000:e0": linux.DT_LNK,
+		},
+		"/bus/pci/devices": {
+			"0000:07:01.0":  linux.DT_LNK,
+			"0000:0c:00.0":  linux.DT_LNK,
+			"10000:e0:06.0": linux.DT_LNK,
+		},
+		"/bus/pci/drivers":           {"mlx5_core": linux.DT_DIR},
+		"/bus/pci/drivers/mlx5_core": {"0000:0c:00.0": linux.DT_LNK},
+		// The two host nodes collapse into a single sandbox node.
+		"/devices/system/node": {"online": linux.DT_REG, "possible": linux.DT_REG, "node0": linux.DT_DIR},
+		"/devices/system/node/node0": {
+			"cpumap":   linux.DT_REG,
+			"cpulist":  linux.DT_REG,
+			"distance": linux.DT_REG,
+		},
+	} {
+		pop := s.PathOpAtRoot(p)
+		s.AssertAllDirentTypes(s.ListDirents(pop), want)
+	}
+
+	// The advertised NUMA view is a single node covering the sandbox's CPUs.
+	wantCPUList := "0\n"
+	if cores := kernel.KernelFromContext(s.Ctx).ApplicationCores(); cores > 1 {
+		wantCPUList = fmt.Sprintf("0-%d\n", cores-1)
+	}
+
+	// Attribute contents, including via a /sys/class symlink (the path
+	// consumers actually resolve).
+	for p, want := range map[string]string{
+		"/class/infiniband/mlx5_0/node_guid":                   "0011:2233:4455:6677\n",
+		"/class/infiniband_verbs/abi_version":                  "6\n",
+		nicLeaf + "/infiniband_verbs/uverbs0/ibdev":            "mlx5_0\n",
+		"/class/infiniband/mlx5_0/ports/1/../../device/vendor": "0x15b3\n",
+		"/devices/system/node/online":                          "0\n",
+		"/devices/system/node/node0/cpulist":                   wantCPUList,
+		"/devices/system/node/node0/distance":                  "10\n",
+		nicLeaf + "/numa_node":                                 "0\n",
+		nicLeaf + "/local_cpulist":                             wantCPUList,
+		"/devices/pci10000:e0/10000:e0:06.0/numa_node":         "-1\n",
+		// Raw PCI config space is mirrored byte-faithfully.
+		"/devices/pci0000:07/0000:07:01.0/config": string(rdmaTestPCIConfig),
+		// The device/driver symlink and the /sys/bus/pci/drivers back-symlink
+		// resolve to the same PCI function (libfabric realpath's the former
+		// during EFA discovery).
+		nicLeaf + "/driver/0000:0c:00.0/vendor":          "0x15b3\n",
+		"/bus/pci/drivers/mlx5_core/0000:0c:00.0/vendor": "0x15b3\n",
+	} {
+		got, err := readTestFile(s, p)
+		if err != nil {
+			t.Fatalf("reading %q: %v", p, err)
+		}
+		if got != want {
+			t.Errorf("%q contains %q, want %q", p, got, want)
+		}
+	}
+
+	// An attribute whose host read failed exists but fails reads with the
+	// host's errno.
+	if _, err := readTestFile(s, nicLeaf+"/net/eth1/speed"); !errors.Is(err, unix.EINVAL) {
+		t.Errorf("reading speed of a down link returned %v, want EINVAL", err)
 	}
 }

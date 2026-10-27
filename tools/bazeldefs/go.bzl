@@ -3,14 +3,16 @@
 load("@bazel_gazelle//:def.bzl", _gazelle = "gazelle")
 load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@bazel_skylib//lib:shell.bzl", "shell")
-load("@io_bazel_rules_go//go:def.bzl", "GoLibrary", _go_binary = "go_binary", _go_context = "go_context", _go_library = "go_library", _go_path = "go_path", _go_test = "go_test")
+load("@io_bazel_rules_go//go:def.bzl", "GoArchive", "GoInfo", "GoLibrary", _go_binary = "go_binary", _go_context = "go_context", _go_library = "go_library", _go_path = "go_path", _go_reset_target = "go_reset_target", _go_rule = "go_rule", _go_test = "go_test")
 load("@io_bazel_rules_go//proto:def.bzl", _go_grpc_library = "go_grpc_library", _go_proto_library = "go_proto_library")
 load("//tools/bazeldefs:defs.bzl", "select_arch", "select_system")
 
 gazelle = _gazelle
 
 go_path = _go_path
+go_reset_target = _go_reset_target
 go_cov = native.genrule
+cov_available = True
 
 def _go_proto_or_grpc_library(go_library_func, name, **kwargs):
     if "importpath" in kwargs:
@@ -76,6 +78,9 @@ def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
         "//tools/bazeldefs:pagesize_64k": base_gotags + ["pagesize_64k"],
         "//tools:debug": base_gotags + ["debug"],
         "//conditions:default": base_gotags,
+    }) + select({
+        "//tools:lockdep": ["lockdep"],
+        "//conditions:default": [],
     })
     _go_binary(
         name = name,
@@ -88,24 +93,54 @@ def go_importpath(target):
     """Returns the importpath for the target."""
     return target[GoLibrary].importpath
 
+def go_source_files(target):
+    """Returns the canonical source membership, including source-only embeds."""
+    return target[GoInfo].srcs
+
+def go_has_source(target):
+    """Returns whether the target exposes its canonical Go source view."""
+    return GoInfo in target
+
+def go_binary_archive(target):
+    """Returns compiled Go archive metadata for a binary target."""
+    return target[GoArchive].data
+
+def go_binary_nogo_dep(name, noasan = False):  # buildifier: disable=unused-variable
+    """Returns the target that nogo should analyze for the given go_binary.
+
+    Args:
+        name: the go_binary rule name.
+        noasan: whether the binary disables sanitizers. Unused here; the bazel
+            go_binary rule is always analyzable directly.
+
+    Returns:
+        A label relative to the current package.
+    """
+    return ":" + name
+
 def go_library(name, bazel_cgo = False, bazel_cdeps = [], bazel_clinkopts = [], bazel_copts = [], **kwargs):
     """Wrapper for `go_library` rule.
 
     Args:
         name: name of the target.
         bazel_cgo: if True, build with cgo.
-        cgo_cdeps: cgo deps to pass to `go_library`.
-        cgo_clinkopts: cgo linkopts to pass to `go_library`.
-        cgo_copts: cgo opts to pass to `go_library`.
+        bazel_cdeps: cgo deps to pass to `go_library`.
+        bazel_clinkopts: cgo linkopts to pass to `go_library`.
+        bazel_copts: cgo opts to pass to `go_library`.
         **kwargs: rest of the arguments are passed to `go_library`.
     """
+    importpath = "gvisor.dev/gvisor/" + native.package_name()
+
+    # Gazelle writes importpath explicitly; it must match the package.
+    if kwargs.pop("importpath", importpath) != importpath:
+        fail("%s: importpath must be %s" % (name, importpath))
     _go_library(
         name = name,
         cgo = bazel_cgo,
         cdeps = bazel_cdeps,
         copts = bazel_copts,
         clinkopts = bazel_clinkopts,
-        importpath = "gvisor.dev/gvisor/" + native.package_name(),
+        importpath = importpath,
         **kwargs
     )
 
@@ -130,6 +165,9 @@ def go_test(name, static = False, pure = False, library = None, **kwargs):
         "//tools/bazeldefs:pagesize_64k": base_gotags + ["pagesize_64k"],
         "//tools:debug": base_gotags + ["debug"],
         "//conditions:default": base_gotags,
+    }) + select({
+        "//tools:lockdep": ["lockdep"],
+        "//conditions:default": [],
     })
     _go_test(
         name = name,
@@ -140,7 +178,7 @@ def go_rule(rule, implementation, **kwargs):
     """Wraps a rule definition with Go attributes.
 
     Args:
-      rule: rule function (typically rule or aspect).
+      rule: rule or aspect function.
       implementation: implementation function.
       **kwargs: other arguments to pass to rule.
 
@@ -151,21 +189,25 @@ def go_rule(rule, implementation, **kwargs):
         "_go_context_data": attr.label(default = "@io_bazel_rules_go//:go_context_data"),
         "_stdlib": attr.label(default = "@io_bazel_rules_go//:stdlib"),
     })
-    kwargs.setdefault("toolchains", []).append("@io_bazel_rules_go//go:toolchain")
-    return rule(implementation, **kwargs)
+    if rule == aspect:
+        # Nogo analyzes Go sources without invoking the C/C++ toolchain.
+        kwargs.setdefault("toolchains", []).append("@io_bazel_rules_go//go:toolchain")
+        return aspect(implementation, **kwargs)
+    return _go_rule(implementation, **kwargs)
 
 def go_embed_libraries(target):
     if hasattr(target.attr, "embed"):
         return target.attr.embed
     return []
 
-def go_context(ctx, goos = None, goarch = None):
+def go_context(ctx, goos = None, goarch = None, attr = None):
     """Extracts a standard Go context struct.
 
     Args:
       ctx: the starlark context (required).
       goos: the GOOS value.
       goarch: the GOARCH value.
+      attr: the analyzed rule's attributes for aspect callers.
 
     Returns:
       A context Go struct with pointers to Go toolchain components.
@@ -174,7 +216,7 @@ def go_context(ctx, goos = None, goarch = None):
     # We don't change anything for the standard library analysis. All Go files
     # are available in all instances. Note that this includes the standard
     # library sources, which are analyzed by nogo.
-    go_ctx = _go_context(ctx)
+    go_ctx = _go_context(ctx, attr = attr, maybe_needs_cc_toolchain = False)
 
     nogo_args = []
     if go_ctx.mode.race:
@@ -189,13 +231,18 @@ def go_context(ctx, goos = None, goarch = None):
 
     return struct(
         env = dict(go_ctx.env, CGO_ENABLED = "0"),
-        go = go_ctx.go,
+        go = go_ctx.sdk.go,
         goarch = goarch or go_ctx.sdk.goarch,
         goos = goos or go_ctx.sdk.goos,
-        gotags = go_ctx.tags,
+        gotags = go_ctx.mode.tags,
         lang_version = "go" + go_ctx.sdk.version,  # go_ctx.sdk.version excludes the go prefix.
         nogo_args = nogo_args,
-        runfiles = depset([go_ctx.go] + go_ctx.sdk.srcs.to_list() + go_ctx.sdk.tools.to_list() + go_ctx.stdlib.libs.to_list()),
+        # Go builds tools such as objdump on demand, including assembly sources
+        # that need the SDK's pkg/include headers.
+        runfiles = depset(
+            [go_ctx.sdk.go],
+            transitive = [go_ctx.sdk.srcs, go_ctx.sdk.headers, go_ctx.sdk.tools, go_ctx.stdlib.libs],
+        ),
         stdlib_srcs = go_ctx.sdk.srcs,
         stdlib_mod = stdlib_mod,
     )
@@ -253,7 +300,7 @@ def _go_imports_impl(ctx):
     ctx.actions.write(
         output = goimports_launcher,
         is_executable = True,
-        content = "PATH=$PWD/{} exec {} {} > {}".format(
+        content = "#!/bin/sh\nPATH=$PWD/{} exec {} {} > {}\n".format(
             shell.quote(go_symlink.dirname),
             shell.quote(goimports_tool.executable.path),
             shell.quote(src.path),
@@ -294,5 +341,5 @@ def go_imports(name, src, out):
         out = out,
     )
 
-def nogo_extra_proto_deps(target):
+def nogo_extra_proto_deps(target):  # buildifier: disable=unused-variable
     return []

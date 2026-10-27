@@ -22,6 +22,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math"
@@ -31,6 +32,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -142,16 +144,42 @@ func ImageByName(name string) string {
 	return fmt.Sprintf("gvisor.dev/images/%s", name)
 }
 
+// FindRunsc returns the path to the runsc binary.
+// As a side effect, it sets the GVISOR_SIDECAR_BINARIES_DIR environment
+// variable needed to properly aim `runsc` at its sidecar binaries in
+// environments like bazel where build artifacts are laid out by hash
+// which can use `runsc` to be placed in a far-away directory from the
+// rest of the sidecar binaries.
+func FindRunsc() (string, error) {
+	path, err := FindFile("release/runsc")
+	if err != nil {
+		return "", err
+	}
+	if os.Getenv("GVISOR_SIDECAR_BINARIES_DIR") == "" {
+		dir, err := FindFile("release/gvisor-bin")
+		if err != nil {
+			return "", fmt.Errorf("failed to find gvisor-bin directory: %w", err)
+		}
+		os.Setenv("GVISOR_SIDECAR_BINARIES_DIR", dir)
+	}
+	return path, nil
+}
+
 // ConfigureExePath configures the executable for runsc in the test environment.
 func ConfigureExePath() error {
-	if *runscPath == "" {
-		path, err := FindFile("runsc/runsc")
+	if _, err := os.Stat(*runscPath); err != nil {
+		path, err := FindRunsc()
 		if err != nil {
 			return err
 		}
 		*runscPath = path
 	}
 	specutils.ExePath = *runscPath
+	if os.Getenv("GVISOR_SIDECAR_BINARIES_DIR") == "" {
+		if dir, err := FindFile("release/gvisor-bin"); err == nil {
+			os.Setenv("GVISOR_SIDECAR_BINARIES_DIR", dir)
+		}
+	}
 	return nil
 }
 
@@ -261,6 +289,63 @@ func TestConfig(t *testing.T) *config.Config {
 	return conf
 }
 
+func isCgroupV2() bool {
+	var st unix.Statfs_t
+	if err := unix.Statfs("/sys/fs/cgroup", &st); err != nil {
+		return false
+	}
+	return st.Type == unix.CGROUP2_SUPER_MAGIC
+}
+
+// ConfigForBenchmark returns the default configuration to use in benchmarks.
+// Debugging, tracing, and logging are disabled, and GKE production flags are
+// enabled to ensure accurate performance measurements.
+func ConfigForBenchmark(b *testing.B) *config.Config {
+	testFlags := flag.NewFlagSet("bench", flag.ContinueOnError)
+	config.RegisterFlags(testFlags)
+	conf, err := config.NewFromFlags(testFlags)
+	if err != nil {
+		b.Fatalf("error loading configuration from flags: %v", err)
+	}
+	conf.AllowPacketEndpointWrite = true
+	conf.AllowSUID = true
+	conf.Debug = false
+	conf.EnableRaw = true
+	conf.HostSettings = config.HostSettingsEnforce
+	conf.LogPackets = false
+	conf.Network = config.NetworkNone
+	conf.OCISeccomp = true
+	conf.Strace = false
+	conf.SystemdCgroup = isCgroupV2()
+	// TODO: b/567596480 - Investigate running benchmarks with TestOnlyAllowRunAsCurrentUserWithoutChroot = false
+	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = true
+	conf.WatchdogAction = "panic"
+	return conf
+}
+
+// Measure executes fn while the benchmark timer is running. It starts the timer
+// immediately before calling fn, pauses it when fn returns (even if fn panics or
+// fails), and returns the elapsed duration of fn.
+func Measure(b *testing.B, fn func()) time.Duration {
+	b.StartTimer()
+	start := time.Now()
+	defer b.StopTimer()
+	fn()
+	return time.Since(start)
+}
+
+// ReportPercentiles sorts the recorded iteration durations and reports p50 and p90 metrics.
+func ReportPercentiles(b *testing.B, samples []time.Duration) {
+	if len(samples) == 0 {
+		return
+	}
+	slices.Sort(samples)
+	for _, p := range []int{50, 90} {
+		idx := (len(samples) - 1) * p / 100
+		b.ReportMetric(float64(samples[idx].Nanoseconds()), fmt.Sprintf("p%d.ns", p))
+	}
+}
+
 // NewSpecWithArgs creates a simple spec with the given args suitable for use
 // in tests.
 func NewSpecWithArgs(args ...string) *specs.Spec {
@@ -308,7 +393,10 @@ func SetupRootDir() (string, func(), error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating root dir: %v", err)
 	}
-	return rootDir, func() { os.RemoveAll(rootDir) }, nil
+	return rootDir, func() {
+		specutils.UnmountNullNetNS(rootDir)
+		os.RemoveAll(rootDir)
+	}, nil
 }
 
 // SetupContainer creates a bundle and root dir for the container, generates a
@@ -453,7 +541,44 @@ func WaitForHTTP(ip string, port int, timeout time.Duration) error {
 	return Poll(cb, timeout)
 }
 
-// Reaper reaps child processes.
+// ownedMu protects owned, the set of children started by StartCmd. Reapers
+// leave those children for exec.Cmd.Wait. StartCmd holds ownedMu across the
+// fork, so a Reaper never sees such a child before it is in owned.
+var (
+	ownedMu sync.Mutex
+	owned   = make(map[int]struct{})
+)
+
+// StartCmd starts cmd so that no Reaper reaps it. The caller must wait for
+// cmd with WaitCmd instead of cmd.Wait.
+func StartCmd(cmd *exec.Cmd) error {
+	ownedMu.Lock()
+	defer ownedMu.Unlock()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	owned[cmd.Process.Pid] = struct{}{}
+	return nil
+}
+
+// WaitCmd waits for a command started by StartCmd.
+func WaitCmd(cmd *exec.Cmd) error {
+	err := cmd.Wait()
+	ownedMu.Lock()
+	delete(owned, cmd.Process.Pid)
+	ownedMu.Unlock()
+	return err
+}
+
+// RunCmd is like cmd.Run, but a running Reaper does not race with it.
+func RunCmd(cmd *exec.Cmd) error {
+	if err := StartCmd(cmd); err != nil {
+		return err
+	}
+	return WaitCmd(cmd)
+}
+
+// Reaper reaps child processes, except those started by StartCmd.
 type Reaper struct {
 	// mu protects ch, which will be nil if the reaper is not running.
 	mu sync.Mutex
@@ -486,14 +611,54 @@ func (r *Reaper) Start() {
 				// Channel closed.
 				return
 			}
-			for {
-				cpid, _ := unix.Wait4(-1, nil, unix.WNOHANG, nil)
-				if cpid < 1 {
-					break
-				}
-			}
+			reapChildren()
 		}
 	}()
+}
+
+// reapChildren reaps every exited child that StartCmd did not start.
+func reapChildren() {
+	ownedMu.Lock()
+	defer ownedMu.Unlock()
+
+	if len(owned) == 0 {
+		for {
+			cpid, _ := unix.Wait4(-1, nil, unix.WNOHANG, nil)
+			if cpid < 1 {
+				return
+			}
+		}
+	}
+	// Some children are owned, so don't use wait4(-1).
+	// Reap the others one at a time.
+	for _, pid := range childPIDs() {
+		if _, ok := owned[pid]; !ok {
+			unix.Wait4(pid, nil, unix.WNOHANG, nil)
+		}
+	}
+}
+
+// childPIDs returns the PIDs of this process's children. Each child is listed
+// under the thread that forked it, so all threads are read.
+func childPIDs() []int {
+	files, err := filepath.Glob("/proc/self/task/*/children")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			// The thread exited.
+			continue
+		}
+		for _, field := range strings.Fields(string(data)) {
+			if pid, err := strconv.Atoi(field); err == nil {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
 }
 
 // Stop stops reaping child processes.
@@ -519,38 +684,45 @@ func StartReaper() func() {
 }
 
 // WaitUntilRead reads from the given reader until the wanted string is found
-// or until timeout.
+// or until timeout. The caller owns r; after a timeout, it must release any
+// blocked Read (for example by closing the reader) to let the scanner exit.
 func WaitUntilRead(r io.Reader, want string, timeout time.Duration) error {
-	sc := bufio.NewScanner(r)
-	// done must be accessed atomically. A value greater than 0 indicates
-	// that the read loop can exit.
-	doneCh := make(chan bool)
-	defer close(doneCh)
-	go func() {
-		for sc.Scan() {
-			t := sc.Text()
-			if strings.Contains(t, want) {
-				doneCh <- true
-				return
-			}
-			select {
-			case <-doneCh:
-				return
-			default:
-			}
-		}
-		doneCh <- false
-	}()
-
+	cancel := make(chan struct{})
+	defer close(cancel)
+	result := readUntil(r, want, cancel)
 	select {
 	case <-time.After(timeout):
 		return fmt.Errorf("timeout waiting to read %q", want)
-	case res := <-doneCh:
-		if !res {
+	case found := <-result:
+		if !found {
 			return fmt.Errorf("reader closed while waiting to read %q", want)
 		}
 		return nil
 	}
+}
+
+// readUntil owns the scanner and result channel. Its single result can be
+// published even after the waiter has canceled and stopped receiving.
+func readUntil(r io.Reader, want string, cancel <-chan struct{}) <-chan bool {
+	sc := bufio.NewScanner(r)
+	result := make(chan bool, 1)
+	go func() {
+		defer close(result)
+		for sc.Scan() {
+			t := sc.Text()
+			if strings.Contains(t, want) {
+				result <- true
+				return
+			}
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+		}
+		result <- false
+	}()
+	return result
 }
 
 // KillCommand kills the process running cmd unless it hasn't been started. It
@@ -656,4 +828,25 @@ func TestIndicesForShard(numTests int) ([]int, error) {
 		}
 	}
 	return indices, nil
+}
+
+// Partition returns the current partition number (1-indexed).
+func Partition() int {
+	return *partition
+}
+
+// TotalPartitions returns the total number of partitions.
+func TotalPartitions() int {
+	return *totalPartitions
+}
+
+// ShouldRun returns true if the test should run on the current partition/shard.
+func ShouldRun(testName string) bool {
+	if *totalPartitions <= 1 {
+		return true
+	}
+	h := fnv.New32a()
+	h.Write([]byte(testName))
+	idx := int(h.Sum32() % uint32(*totalPartitions))
+	return idx == (*partition - 1)
 }

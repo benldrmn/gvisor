@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -8,6 +8,7 @@ package(
 go_library(
     name = "cli",
     srcs = ["cli.go"],
+    importpath = "gvisor.dev/gvisor/tools/nogo/cli",
     visibility = ["//tools:__subpackages__"],
     deps = [
         "//runsc/flag",
@@ -17,6 +18,19 @@ go_library(
         "//tools/nogo/flags",
         "@com_github_google_subcommands//:go_default_library",
         "@in_gopkg_yaml_v2//:go_default_library",
+        "@org_golang_x_mod//modfile:go_default_library",
         "@org_golang_x_term//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "cli_test",
+    size = "small",
+    srcs = ["cli_test.go"],
+    data = ["//tools/nogo"],
+    embed = [":cli"],
+    deps = [
+        "//pkg/test/testutil",
+        "//tools/nogo/flags",
     ],
 )

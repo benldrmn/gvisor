@@ -35,6 +35,18 @@ import (
 // Name is the filesystem name.
 const Name = "devpts"
 
+// rootMode is the mode of the root directory. Linux fixes it and never applies
+// the mode mount option to it. See fs/devpts/inode.c:devpts_fill_super().
+const rootMode = linux.FileMode(0755)
+
+// defaultReplicaMode is the mode of a replica when the mode mount option is
+// absent. See fs/devpts/inode.c:DEVPTS_DEFAULT_MODE.
+const defaultReplicaMode = linux.FileMode(0600)
+
+// defaultPtmxMode is the mode of ptmx when the ptmxmode mount option is absent.
+// See fs/devpts/inode.c:DEVPTS_DEFAULT_PTMX_MODE.
+const defaultPtmxMode = linux.FileMode(0000)
+
 // FilesystemType implements vfs.FilesystemType.
 //
 // +stateify savable
@@ -48,11 +60,18 @@ type FilesystemType struct {
 	root *vfs.Dentry
 }
 
+// +stateify savable
 type fileSystemOpts struct {
 	mode     linux.FileMode
 	ptmxMode linux.FileMode
 	uid      auth.KUID
 	gid      auth.KGID
+
+	// setuid and setgid record whether the uid and gid mount options were
+	// given. Replicas fall back to the credentials of the process creating
+	// them when they were not. See fs/devpts/inode.c:devpts_pty_new().
+	setuid bool
+	setgid bool
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -64,10 +83,10 @@ func (*FilesystemType) Name() string {
 func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsOpts := fileSystemOpts{
-		mode:     0555,
-		ptmxMode: 0666,
-		uid:      creds.EffectiveKUID,
-		gid:      creds.EffectiveKGID,
+		mode:     defaultReplicaMode,
+		ptmxMode: defaultPtmxMode,
+		uid:      creds.FilesystemKUID,
+		gid:      creds.FilesystemKGID,
 	}
 	if modeStr, ok := mopts["mode"]; ok {
 		delete(mopts, "mode")
@@ -100,6 +119,7 @@ func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Vir
 			return nil, nil, linuxerr.EINVAL
 		}
 		fsOpts.uid = kuid
+		fsOpts.setuid = true
 	}
 	if gidStr, ok := mopts["gid"]; ok {
 		delete(mopts, "gid")
@@ -114,6 +134,7 @@ func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Vir
 			return nil, nil, linuxerr.EINVAL
 		}
 		fsOpts.gid = kgid
+		fsOpts.setgid = true
 	}
 	newinstance := false
 	if _, ok := mopts["newinstance"]; ok {
@@ -180,9 +201,12 @@ func (fstype *FilesystemType) newFilesystem(ctx context.Context, vfsObj *vfs.Vir
 
 	// Construct the root directory. This is always inode id 1.
 	root := &rootInode{
+		opts:     opts,
 		replicas: make(map[uint32]*replicaInode),
 	}
-	root.InodeAttrs.InitWithIDs(ctx, opts.uid, opts.gid, linux.UNNAMED_MAJOR, devMinor, 1, linux.ModeDirectory|opts.mode)
+	// Linux fixes the root mode and ownership independently of mount options.
+	// See fs/devpts/inode.c:devpts_fill_super() and fs/inode.c:inode_init_always().
+	root.InodeAttrs.InitWithIDs(ctx, creds.UserNamespace.MapToKUID(auth.RootUID), creds.UserNamespace.MapToKGID(auth.RootGID), linux.UNNAMED_MAJOR, devMinor, 1, linux.ModeDirectory|rootMode)
 	root.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	root.InitRefs()
 
@@ -194,7 +218,7 @@ func (fstype *FilesystemType) newFilesystem(ctx context.Context, vfsObj *vfs.Vir
 	master := &masterInode{
 		root: root,
 	}
-	master.InodeAttrs.InitWithIDs(ctx, opts.uid, opts.gid, linux.UNNAMED_MAJOR, devMinor, 2, linux.ModeCharacterDevice|opts.ptmxMode)
+	master.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, devMinor, 2, linux.ModeCharacterDevice|opts.ptmxMode)
 
 	// Add the master as a child of the root.
 	links := root.OrderedChildren.Populate(map[string]kernfs.Inode{
@@ -237,19 +261,27 @@ type rootInode struct {
 	// master is the master pty inode. Immutable.
 	master *masterInode
 
-	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`
 
+	// opts is the mount options this filesystem was created with. Immutable.
+	opts fileSystemOpts
+
 	// replicas maps pty ids to replica inodes.
+	//
+	// +checklocks:mu
 	replicas map[uint32]*replicaInode
 
-	// nextIdx is the next pty index to use. Must be accessed atomically.
+	// nextIdx is the next pty index to use.
+	//
+	// +checklocks:mu
 	nextIdx uint32
 }
 
 var _ kernfs.Inode = (*rootInode)(nil)
 
 // allocateTerminal creates a new Terminal and installs a pts node for it.
+//
+// +checklocksexclude:i.mu
 func (i *rootInode) allocateTerminal(ctx context.Context, creds *auth.Credentials) (*Terminal, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -276,15 +308,26 @@ func (i *rootInode) allocateTerminal(ctx context.Context, creds *auth.Credential
 		root: i,
 		t:    t,
 	}
+	// The uid and gid options name the owner of a replica. Without them it is
+	// owned by whoever created it. See fs/devpts/inode.c:devpts_pty_new().
+	uid, gid := creds.FilesystemKUID, creds.FilesystemKGID
+	if i.opts.setuid {
+		uid = i.opts.uid
+	}
+	if i.opts.setgid {
+		gid = i.opts.gid
+	}
 	// Linux always uses pty index + 3 as the inode id. See
 	// fs/devpts/inode.c:devpts_pty_new().
-	replica.InodeAttrs.Init(ctx, creds, i.InodeAttrs.DevMajor(), i.InodeAttrs.DevMinor(), uint64(idx+3), linux.ModeCharacterDevice|0600)
+	replica.InodeAttrs.InitWithIDs(ctx, uid, gid, i.InodeAttrs.DevMajor(), i.InodeAttrs.DevMinor(), uint64(idx+3), linux.ModeCharacterDevice|i.opts.mode)
 	i.replicas[idx] = replica
 
 	return t, nil
 }
 
 // masterClose is called when the master end of t is closed.
+//
+// +checklocksexclude:i.mu
 func (i *rootInode) masterClose(ctx context.Context, t *Terminal) {
 	// When the master is closed, hang up the slave (replica) side.
 	// This corresponds to Linux's pty_close() calling tty_vhangup(tty->link).
@@ -318,6 +361,8 @@ func (i *rootInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.D
 }
 
 // Lookup implements kernfs.Inode.Lookup.
+//
+// +checklocksexclude:i.mu
 func (i *rootInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
 	// Check if a static entry was looked up.
 	if d, err := i.OrderedChildren.Lookup(ctx, name); err == nil {
@@ -340,6 +385,11 @@ func (i *rootInode) Lookup(ctx context.Context, name string) (kernfs.Inode, erro
 }
 
 // IterDirents implements kernfs.Inode.IterDirents.
+//
+// cb runs with i.mu held and must not call methods that acquire the same mutex.
+// checklocks cannot convey this receiver's lock through the callback interface.
+//
+// +checklocksexclude:i.mu
 func (i *rootInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()

@@ -28,6 +28,20 @@ type CapabilitySet uint64
 // AllCapabilities is a CapabilitySet containing all valid capabilities.
 var AllCapabilities = CapabilitySetOf(linux.CAP_LAST_CAP+1) - 1
 
+// FilesystemCapabilities is the set of effective capabilities that
+// setfsuid(2) drops or restores when the filesystem UID leaves or returns to
+// root. Analogous to Linux's CAP_FS_SET.
+var FilesystemCapabilities = CapabilitySetOfMany([]linux.Capability{
+	linux.CAP_CHOWN,
+	linux.CAP_MKNOD,
+	linux.CAP_DAC_OVERRIDE,
+	linux.CAP_DAC_READ_SEARCH,
+	linux.CAP_FOWNER,
+	linux.CAP_FSETID,
+	linux.CAP_MAC_OVERRIDE,
+	linux.CAP_LINUX_IMMUTABLE,
+})
+
 // CapabilitySetOf returns a CapabilitySet containing only the given
 // capability.
 func CapabilitySetOf(cp linux.Capability) CapabilitySet {
@@ -226,17 +240,11 @@ func handlePrivilegedRoot(c *Credentials, f *FilePrivileges, filename string) {
 //     Both noNewPrivs and allowSUID prevent ID gain, but allowSUID does not by itself prevent cap
 //     gain. Note also that while noNewPrivs brings down the effective IDs down to the real IDs,
 //     allowSUID at most prevents further ID gain due the SUID/GID bits.
-//
-// Note that gVisor does not support Ambient capabilities.
 func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
 	noNewPrivs bool, stopPrivGain bool, allowSUID bool) (*Credentials, bool, error) {
 	if noNewPrivs || !allowSUID {
 		f.SetUserID = NoID
 		f.SetGroupID = NoID
-	}
-	if noNewPrivs {
-		f.HasCaps = false
-		f.Effective = false
 	}
 	// "...if either the user or the group ID of the file has no mapping inside the namespace, the
 	// set-user-ID (set-group-ID) bit is silently ignored: the new program is executed, but the
@@ -301,6 +309,8 @@ func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
 	}
 	newC.SavedKUID = newC.EffectiveKUID
 	newC.SavedKGID = newC.EffectiveKGID
+	newC.FilesystemKUID = newC.EffectiveKUID
+	newC.FilesystemKGID = newC.EffectiveKGID
 
 	// P'(effective) = effective ? P'(permitted) : P'(ambient).
 	newC.EffectiveCaps = ambientCaps

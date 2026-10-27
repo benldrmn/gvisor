@@ -15,12 +15,20 @@
 // Subset of socket tests that need Linux-specific headers (compared to POSIX
 // headers).
 
+#include <linux/capability.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include <cerrno>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/util/capability_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/linux_capability_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 
@@ -72,8 +80,13 @@ TEST(SocketTest, SetMarkNeedsNetAdminOrRaw) {
 
   AutoCapability cap_admin(CAP_NET_ADMIN, false);
   AutoCapability cap_raw(CAP_NET_RAW, false);
-  EXPECT_THAT(setsockopt(bound.get(), SOL_SOCKET, SO_MARK, &mark, sizeof(mark)),
-              SyscallFailsWithErrno(EPERM));
+  const int ret =
+      setsockopt(bound.get(), SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+  if (ret == 0 && GvisorPlatform() == Platform::kNative) {
+    // Some kernels or cgroup policies allow SO_MARK without these capabilities.
+    GTEST_SKIP() << "SO_MARK was allowed without CAP_NET_ADMIN or CAP_NET_RAW";
+  }
+  EXPECT_THAT(ret, SyscallFailsWithErrno(EPERM));
 
   int get_mark = 0;
   socklen_t optlen = sizeof(get_mark);

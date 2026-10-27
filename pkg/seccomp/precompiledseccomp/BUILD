@@ -7,7 +7,11 @@ package(
 
 go_library(
     name = "precompiledseccomp",
-    srcs = ["precompiledseccomp.go"],
+    srcs = [
+        "precompiledseccomp.go",
+        "syscalls.go",
+    ],
+    importpath = "gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp",
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/bpf",
@@ -42,9 +46,14 @@ bzl_library(
 
 go_test(
     name = "precompiledseccomp_test",
-    srcs = ["precompiledseccomp_test.go"],
-    library = ":precompiledseccomp",
+    srcs = [
+        "precompiledseccomp_test.go",
+        "syscalls_test.go",
+    ],
+    embed = [":precompiledseccomp"],
     deps = [
+        "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/seccomp",
         "@org_golang_x_sys//unix:go_default_library",
     ],

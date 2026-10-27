@@ -23,11 +23,20 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <unistd.h>
 
+#include <cerrno>
+#include <climits>
+#include <cstring>
+#include <vector>
+
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/memory/memory.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "test/util/file_descriptor.h"
+#include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/socket_util.h"
 #include "test/util/temp_path.h"
@@ -100,6 +109,7 @@ TEST_P(TCPSocketPairTest, CheckTcpInfoFields) {
   // Validates the received tcp_info fields.
   EXPECT_EQ(opt.tcpi_ca_state, TCP_CA_OPEN);
   EXPECT_GT(opt.tcpi_snd_cwnd, 0);
+  EXPECT_GT(opt.tcpi_snd_mss, 0);
   EXPECT_GT(opt.tcpi_rto, 0);
 }
 
@@ -204,7 +214,7 @@ TEST_P(TCPSocketPairTest, RSTSentOnCloseWithUnreadDataAllowsReadBuffered) {
               SyscallFailsWithErrno(ECONNRESET));
 }
 
-// This test will verify that a clean shutdown (FIN) is preformed when there
+// This test will verify that a clean shutdown (FIN) is performed when there
 // is unread data but only the write side is closed.
 TEST_P(TCPSocketPairTest, FINSentOnShutdownWrWithUnreadData) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());

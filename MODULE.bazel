@@ -3,45 +3,52 @@ module(
     version = "0.0.1",
 )
 
-bazel_dep(name = "rules_go", version = "0.59.0", repo_name = "io_bazel_rules_go")
-bazel_dep(name = "gazelle", version = "0.47.0", repo_name = "bazel_gazelle")
+bazel_dep(name = "rules_go", version = "0.63.0", repo_name = "io_bazel_rules_go")
+bazel_dep(name = "gazelle", version = "0.51.3", repo_name = "bazel_gazelle")
 bazel_dep(name = "rules_license", version = "1.0.0")
-bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "bazel_lib", version = "3.2.2")
+bazel_dep(name = "yq.bzl", version = "0.4.0")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
-bazel_dep(name = "rules_cc", version = "0.2.16")
-bazel_dep(name = "grpc", version = "1.76.0", repo_name = "com_github_grpc_grpc")
-bazel_dep(name = "protobuf", version = "33.4", repo_name = "com_google_protobuf")
-bazel_dep(name = "platforms", version = "1.0.0")
-bazel_dep(name = "abseil-cpp", version = "20250814.1", repo_name = "com_google_absl")
-bazel_dep(name = "googletest", version = "1.17.0", repo_name = "com_google_googletest")
-bazel_dep(name = "google_benchmark", version = "1.8.4", repo_name = "com_google_benchmark")
-bazel_dep(name = "nlohmann_json", version = "3.11.3")
-bazel_dep(name = "rules_python", version = "1.7.0")
-bazel_dep(name = "zstd", version = "1.5.5", repo_name = "llvm_zstd")
+bazel_dep(name = "rules_img", version = "0.3.23")
+bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "llvm", version = "0.8.24")
+bazel_dep(name = "libbpf", version = "1.7.0.bcr.1")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "grpc", version = "1.84.0", repo_name = "com_github_grpc_grpc")
+
+# gRPC's older minimum imports a removed Google APIs extension repository.
+bazel_dep(name = "envoy_api", version = "0.0.0-20260130-84e8436")
+bazel_dep(name = "protobuf", version = "35.1", repo_name = "com_google_protobuf")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "abseil-cpp", version = "20260817.0", repo_name = "com_google_absl")
+bazel_dep(name = "googletest", version = "1.18.0", repo_name = "com_google_googletest")
+bazel_dep(name = "google_benchmark", version = "1.10.0", repo_name = "com_google_benchmark")
+bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.2")
+bazel_dep(name = "rules_python", version = "2.0.2")
+bazel_dep(name = "zstd", version = "1.5.7.bcr.1", repo_name = "llvm_zstd")
 bazel_dep(name = "protoc-gen-validate", version = "1.3.0")
 bazel_dep(name = "xds", version = "0.0.0-20251210-ee656c7")
 bazel_dep(name = "cel-spec", version = "0.25.1")
 
-archive_override(
+governance = use_extension("//governance/tools/maintainers:repositories.bzl", "governance")
+use_repo(governance, "governance_areas")
+
+single_version_override(
     module_name = "rules_go",
-    integrity = "sha256-pynI7SRHyQ/hQAd2iQecoKz7dYDsQWN/MS1lDOnZPZY=",
-    patch_args = ["-p1"],
+    patch_strip = 1,
     patches = [
         "//tools:rules_go_symbols.patch",
-        "//tools:rules_go_sdk.patch",
         "//tools:rules_cgo.patch",
         "//tools:rules_go_export.patch",
     ],
-    url = "https://github.com/bazel-contrib/rules_go/releases/download/v0.57.0/rules_go-v0.57.0.zip",
+    version = "0.63.0",
 )
 
-archive_override(
-    module_name = "grpc",
-    integrity = "sha256-MdbAHDv6CjWEUyZlcV5IdwPrENdrswtIdeV9E5wTu/k=",
-    patch_args = ["-p1"],
-    patches = ["//tools:grpc_extra_deps.patch"],
-    strip_prefix = "grpc-1.75.0",
-    url = "https://github.com/grpc/grpc/archive/refs/tags/v1.75.0.tar.gz",
+single_version_override(
+    module_name = "google_benchmark",
+    patch_strip = 1,
+    patches = ["//tools:benchmark-umbrella-exports.patch"],
 )
 
 ### LLVM
@@ -81,6 +88,10 @@ use_repo(coral_crosstool_extension, "coral_crosstool")
 crosstool = use_extension("//tools/bazeldefs:extensions/crosstool.bzl", "crosstool_extension")
 use_repo(crosstool, "crosstool")
 
+### Linux headers
+kernel_headers = use_extension("@llvm//kernel/extension:kernel_headers.bzl", "kernel_headers")
+use_repo(kernel_headers, "kernel_headers")
+
 ### zlib-ng
 # TODO: try using "zlib-ng" from BCR
 llvm_zlib = use_extension("//tools/bazeldefs:extensions/llvm_zlib.bzl", "llvm_zlib_extension")
@@ -99,14 +110,130 @@ new_local_repository(
 
 http_file(
     name = "buildkite_pipeline_schema",
-    sha256 = "3369c58038b4d55c08928affafb653716eb1e7b3cabb4a391aef979dd921f4e1",
-    urls = ["https://raw.githubusercontent.com/buildkite/pipeline-schema/f7a0894074d194bcf19eec5411fec0528f7f4180/schema.json"],
+    sha256 = "c0340a344ebb83f72e4969e09818d945055abe7ac0bb0c49226a60e7d33f84f6",
+    urls = ["https://raw.githubusercontent.com/buildkite/pipeline-schema/3413455899dadd5f721f481ca247bc55e78bf5b9/schema.json"],
+)
+
+http_archive(
+    name = "actionlint_darwin_amd64",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_darwin_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_darwin_arm64",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_darwin_arm64.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_freebsd_386",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "7170cc3db006f83154583dc385c84bea3f6ee767a167bb9ca41de6593ebbb186",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_freebsd_386.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_freebsd_amd64",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "3de1b027d0b749e81d6d972cbf5d14dc708a275248da1ba4eed4a9af707d1339",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_freebsd_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_linux_386",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "72a44b32c2d032700e6d0c23ca2f540b67519ec68db098ddfcfa96059e61f723",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_386.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_linux_amd64",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_linux_arm64",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_arm64.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_linux_armv6",
+    build_file_content = 'exports_files(["actionlint"])',
+    sha256 = "ae4a0a5227578e66f5d00ee02788d5c64fdae1fa6484ab88ceaeee9359c28fa4",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_armv6.tar.gz"],
+)
+
+http_archive(
+    name = "actionlint_windows_386",
+    build_file_content = 'exports_files(["actionlint.exe"])',
+    sha256 = "cdc8643b2c8dc890c76ad16095da97e75f86572805cc3573cc13f31ea0f19127",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_windows_386.zip"],
+)
+
+http_archive(
+    name = "actionlint_windows_amd64",
+    build_file_content = 'exports_files(["actionlint.exe"])',
+    sha256 = "6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_windows_amd64.zip"],
+)
+
+http_archive(
+    name = "actionlint_windows_arm64",
+    build_file_content = 'exports_files(["actionlint.exe"])',
+    sha256 = "cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_windows_arm64.zip"],
 )
 
 http_file(
     name = "github_workflow_schema",
     sha256 = "7499ccb3e75975504ea1ee7c70291e0c9f6c1f684678091d013061fe263e3ddb",
     urls = ["https://raw.githubusercontent.com/SchemaStore/schemastore/166136b96a14f103a948053903e9339e63ad9170/src/schemas/json/github-workflow.json"],
+)
+
+# Statically-linked QEMU user-mode emulators.
+QEMU_USER_EXPORTS = 'exports_files(["usr/bin/qemu-aarch64", "usr/bin/qemu-riscv64", "usr/bin/qemu-x86_64"])'
+
+deb_data = use_repo_rule("//tools/bazeldefs:extensions/deb_data.bzl", "deb_data")
+
+http_archive(
+    name = "qemu_user_amd64",
+    build_file_content = 'exports_files(["data.tar.xz"])',
+    sha256 = "ca6ede739327a20ae5a3498230c8a3a9a072c586e131bc6bcc1201eb1725e336",
+    type = "deb",
+    urls = [
+        "https://snapshot.debian.org/archive/debian/20260905T205002Z/pool/main/q/qemu/qemu-user_10.0.13%2Bds-0%2Bdeb13u1_amd64.deb",
+        "https://deb.debian.org/debian/pool/main/q/qemu/qemu-user_10.0.13%2Bds-0%2Bdeb13u1_amd64.deb",
+    ],
+)
+
+deb_data(
+    name = "qemu_user_amd64_files",
+    build_file_content = QEMU_USER_EXPORTS,
+    data = "@qemu_user_amd64//:data.tar.xz",
+)
+
+http_archive(
+    name = "qemu_user_arm64",
+    build_file_content = 'exports_files(["data.tar.xz"])',
+    sha256 = "c73711af02b97cd5e2667e735d9c06890c57165517110ca4e646c95a7083158d",
+    type = "deb",
+    urls = [
+        "https://snapshot.debian.org/archive/debian/20260905T205002Z/pool/main/q/qemu/qemu-user_10.0.13%2Bds-0%2Bdeb13u1_arm64.deb",
+        "https://deb.debian.org/debian/pool/main/q/qemu/qemu-user_10.0.13%2Bds-0%2Bdeb13u1_arm64.deb",
+    ],
+)
+
+deb_data(
+    name = "qemu_user_arm64_files",
+    build_file_content = QEMU_USER_EXPORTS,
+    data = "@qemu_user_arm64//:data.tar.xz",
 )
 
 # Root certificates.
@@ -118,6 +245,52 @@ http_file(
     urls = [
         "https://pki.goog/roots.pem",
     ],
+)
+
+### Docker integration test images
+# LTP provides the standalone fsstress filesystem workload.
+http_archive(
+    name = "ltp",
+    build_file = "//images/basic:ltp.BUILD",
+    sha256 = "b9837481134fa6eabce91c2fba57d96695f81360468f83e11e6982584ad4d29d",
+    strip_prefix = "ltp-full-20260930",
+    urls = ["https://github.com/linux-test-project/ltp/releases/download/20260930/ltp-full-20260930.tar.xz"],
+)
+
+# Pin both architectures of the existing test distributions. Image assembly
+# uses declared layers and does not require a Docker daemon.
+img_pull = use_repo_rule("@rules_img//img:pull.bzl", "pull")
+
+# CI workers share a Docker Hub pull quota. Try the mirror first.
+DOCKER_HUB_REGISTRIES = [
+    "mirror.gcr.io",
+    "index.docker.io",
+]
+
+img_pull(
+    name = "test_alpine",
+    digest = "sha256:b276d875eeed9c7d3f1cfa7edb06b22ed22b14219a7d67c52c56612330348239",
+    layer_handling = "eager",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64",
+    ],
+    registries = DOCKER_HUB_REGISTRIES,
+    repository = "library/alpine",
+    tag = "3.11.5",
+)
+
+img_pull(
+    name = "test_busybox",
+    digest = "sha256:95cf004f559831017cdf4628aaf1bb30133677be8702a8c5f2994629f637a209",
+    layer_handling = "eager",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64",
+    ],
+    registries = DOCKER_HUB_REGISTRIES,
+    repository = "library/busybox",
+    tag = "1.31.1",
 )
 
 ### Toolchains
@@ -176,7 +349,7 @@ use_repo(
     "com_github_google_btree",
     "com_github_google_gnostic_models",
     "com_github_google_go_cmp",
-    "com_github_google_go_github_v56",
+    "com_github_google_go_github_v84",
     "com_github_google_go_querystring",
     "com_github_google_gopacket",
     "com_github_google_pprof",
@@ -221,6 +394,7 @@ use_repo(
     "com_google_cloud_go_bigquery",
     "com_google_cloud_go_compute_metadata",
     "com_google_cloud_go_container",
+    "com_google_cloud_go_firestore",
     "com_google_cloud_go_iam",
     "com_google_cloud_go_storage",
     "in_gopkg_evanphx_json_patch_v4",
@@ -249,6 +423,7 @@ use_repo(
     "org_golang_x_sys",
     "org_golang_x_telemetry",
     "org_golang_x_term",
+    "org_golang_x_text",
     "org_golang_x_time",
     "org_golang_x_tools",
     "org_golang_x_xerrors",
@@ -283,38 +458,38 @@ go_deps.module(
 )
 go_deps.module(
     path = "golang.org/x/crypto",
-    sum = "h1:chiH31gIWm57EkTXpwnqf8qeuMUi0yekh6mT2AvFlqI=",
-    version = "v0.42.0",
+    sum = "h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=",
+    version = "v0.57.0",
 )
 go_deps.module(
     path = "golang.org/x/mod",
-    sum = "h1:gQBtGhjxykdjY9YhZpSlZIsbnaE2+PgjfLWUQTnoZ1U=",
-    version = "v0.28.0",
+    sum = "h1:qJmnOUb4YB+FsEuM3HcWucdZASCPGhsX6uljO6pog0c=",
+    version = "v0.41.0",
 )
 go_deps.module(
     path = "golang.org/x/sync",
-    sum = "h1:l60nONMj9l5drqw6jlhIELNv9I0A4OFgRsG9k2oT9Ug=",
-    version = "v0.17.0",
+    sum = "h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=",
+    version = "v0.23.0",
 )
 go_deps.module(
     path = "golang.org/x/sys",
-    sum = "h1:KVRy2GtZBrk1cBYA7MKu5bEZFxQk4NIDV6RLVcC8o0k=",
-    version = "v0.36.0",
+    sum = "h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=",
+    version = "v0.48.0",
 )
 go_deps.module(
     path = "golang.org/x/tools",
-    sum = "h1:DVSRzp7FwePZW356yEAChSdNcQo6Nsp+fex1SUW09lE=",
-    version = "v0.37.0",
+    sum = "h1:k4Xc/1Om9jwkBJBo4NVLMSARBoWtK10mx+W5BnXCeAI=",
+    version = "v0.51.0",
 )
 go_deps.module(
     path = "golang.org/x/term",
-    sum = "h1:bZBVKBudEyhRcajGcNc3jIfWPqV4y/Kt2XcoigOWtDQ=",
-    version = "v0.35.0",
+    sum = "h1:3+OXuTbaKDgwk8jTi3aSLHRlmWqHEUDUtxnbFigO4YE=",
+    version = "v0.46.0",
 )
 go_deps.module(
     path = "golang.org/x/net",
-    sum = "h1:evd8IRDyfNBMBTTY5XRF1vaZlD+EmWx6x8PkhR04H/I=",
-    version = "v0.44.0",
+    sum = "h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=",
+    version = "v0.60.0",
 )
 go_deps.module(
     path = "github.com/google/go-cmp",
@@ -417,14 +592,9 @@ go_deps.module(
     version = "v2.3.3",
 )
 go_deps.module(
-    path = "github.com/google/go-github/v56",
-    sum = "h1:TysL7dMa/r7wsQi44BjqlwaHvwlFlqkK8CtBWCX3gb4=",
-    version = "v56.0.0",
-)
-go_deps.module(
     path = "github.com/google/go-querystring",
-    sum = "h1:AnCroh3fv4ZBgVIf1Iwtovgjaw/GiKJo8M8yD/fhyJ8=",
-    version = "v1.1.0",
+    sum = "h1:yhqkPbu2/OH+V9BfpCVPZkNmUXhb2gBxJArfhIxNtP0=",
+    version = "v1.2.0",
 )
 go_deps.module(
     path = "github.com/google/uuid",
@@ -663,13 +833,18 @@ go_deps.module(
 )
 go_deps.module(
     path = "golang.org/x/telemetry",
-    sum = "h1:dHQOQddU4YHS5gY33/6klKjq7Gp3WwMyOXGNp5nzRj8=",
-    version = "v0.0.0-20250908211612-aef8a434d053",
+    sum = "h1:DftxASHKl6JolFPqoN+2WrFO53JvkHwRXvFqf8gsivA=",
+    version = "v0.0.0-20260924152758-ed294f943157",
 )
 go_deps.module(
     path = "golang.org/x/xerrors",
     sum = "h1:H2TDz8ibqkAF6YGhCdN3jS9O0/s90v0rJh3X/OLHEUk=",
     version = "v0.0.0-20220907171357-04be3eba64a2",
+)
+go_deps.module_override(
+    patch_strip = 1,
+    patches = ["//tools:protobuf.disable-binary-reading-on-init.patch"],
+    path = "google.golang.org/protobuf",
 )
 go_deps.gazelle_override(
     directives = [

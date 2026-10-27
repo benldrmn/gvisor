@@ -20,11 +20,14 @@ import (
 	"os"
 
 	"gvisor.dev/gvisor/pkg/erofs"
+	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // afterLoad is called by stateify.
 func (fs *filesystem) afterLoad(ctx context.Context) {
+	fs.memoryFile = pgalloc.MemoryFileFromContext(ctx)
 	fdmap := vfs.RestoreFilesystemFDMapFromContext(ctx)
 	fd, ok := fdmap[fs.iopts.UniqueID]
 	if !ok {
@@ -50,4 +53,11 @@ func (d *dentry) saveParent() *dentry {
 // loadParent is called by stateify.
 func (d *dentry) loadParent(_ context.Context, parent *dentry) {
 	d.parent.Store(parent)
+}
+
+// afterLoad is called by stateify.
+func (d *dentry) afterLoad(context.Context) {
+	if d.refs.Load() != -1 {
+		refs.Register(d)
+	}
 }

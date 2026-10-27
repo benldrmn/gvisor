@@ -74,6 +74,10 @@ const (
 
 	// RuleReturn indicates the packet should return to the previous chain.
 	RuleReturn
+
+	// RuleContinue indicates that traversal should continue with the next
+	// rule, like Linux XT_CONTINUE.
+	RuleContinue
 )
 
 // IPTables holds all the tables for a netstack.
@@ -283,7 +287,9 @@ func (fl IPHeaderFilter) match(pkt *PacketBuffer, hook Hook, inNicName, outNicNa
 
 	case header.IPv6ProtocolNumber:
 		hdr := header.IPv6(pkt.NetworkHeader().Slice())
-		transProto = hdr.TransportProtocol()
+		// The transport protocol may be preceded by IPv6 extension headers, so
+		// use the protocol from parsing (see IPv6.TransportProtocol).
+		transProto = pkt.TransportProtocolNumber
 		dstAddr = hdr.DestinationAddress()
 		srcAddr = hdr.SourceAddress()
 

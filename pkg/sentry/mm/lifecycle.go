@@ -19,17 +19,21 @@ import (
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safecopy"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 // NewMemoryManager returns a new MemoryManager with no mappings and 1 user.
 func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManager, error) {
-	as, err := p.NewAddressSpace()
+	as, err := p.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -57,10 +61,67 @@ func (mm *MemoryManager) SetMmapLayout(ac *arch.Context64, r *limits.LimitSet) (
 	return layout, nil
 }
 
+// isolatePMAToVMALocked advances vseg to the vma containing pseg.Start(), and
+// splits pseg at that vma's boundaries so that it lies entirely within it. It
+// returns the updated iterators. If there is a remainder to the pma, it
+// becomes the one following the returned one. The returned vseg can be used
+// to find the vma of the pma.
+//
+// Preconditions:
+//   - A vma must contain pseg.Start(), and vseg must not be after it.
+//
+// +checklocksread:mm.mappingMu
+// +checklocks:mm.activeMu
+func (mm *MemoryManager) isolatePMAToVMALocked(pseg pmaIterator, vseg vmaIterator) (pmaIterator, vmaIterator) {
+	vseg = vseg.seekNextLowerBound(pseg.Start())
+	if checkInvariants {
+		if !vseg.Ok() {
+			panic(fmt.Sprintf("no vma covers pma range %v", pseg.Range()))
+		}
+		if pseg.Start() < vseg.Start() {
+			panic(fmt.Sprintf("vma %v ran ahead of pma %v", vseg.Range(), pseg.Range()))
+		}
+	}
+	return mm.pmas.Isolate(pseg, vseg.Range()), vseg
+}
+
+// abortForkLocked releases the references and mappings established for a
+// MemoryManager under construction by Fork, when Fork fails while copying
+// pmas, similar to Linux's copy_page_range() fail. It returns the updated
+// aborted mappings via droppedIDs.
+//
+// Preconditions:
+//   - mm must not yet be visible outside of Fork.
+//
+// +checklocks:mm.activeMu
+func (mm *MemoryManager) abortForkLocked(ctx context.Context, droppedIDs []memmap.MappingIdentity) []memmap.MappingIdentity {
+	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		pseg.ValuePtr().file.DecRef(pseg.fileRange())
+	}
+	mm.pmas.RemoveAll()
+	// Fork still exclusively owns mm2's VMA and mapping-accounting
+	// state. AddMapping only exposes its activeMu-protected
+	// invalidation state.
+	_, droppedIDs = mm.removeVMAsLocked(ctx, mm.applicationAddrRange(), droppedIDs) // +checklocksignore
+	mm.as.Release()
+	return droppedIDs
+}
+
 // Fork creates a copy of mm with 1 user, as for Linux syscalls fork() or
 // clone() (without CLONE_VM).
+//
+// +checklocksexclude:mm.metadataMu
+// +checklocksexclude:mm.mappingMu
+// +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
-	as, err := mm.p.NewAddressSpace()
+	// Systrap cares about the GS register: see systrap.go/NewAddressSpace.
+	mm.activeMu.RLock()
+	gsInUse := mm.gsInUse
+	mm.activeMu.RUnlock()
+
+	as, err := mm.p.NewAddressSpace(platform.AddressSpaceOptions{
+		DisableSyscallPatching: gsInUse,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -101,12 +162,14 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 		// IncRef'd below, once we know that there isn't an error.
 		executable:        mm.executable,
 		dumpability:       atomicbitops.FromInt32(mm.dumpability.Load()),
+		userNS:            mm.userNS,
 		aioManager:        aioManager{contexts: make(map[uint64]*AIOContext)},
 		vdsoSigReturnAddr: mm.vdsoSigReturnAddr,
 	}
 
 	// Copy vmas.
 	dontforks := false
+	var eagerForkARs []hostarch.AddrRange
 	dstvgap := mm2.vmas.FirstGap()
 	for srcvseg := mm.vmas.FirstSegment(); srcvseg.Ok(); srcvseg = srcvseg.NextSegment() {
 		vma := srcvseg.ValuePtr().copy()
@@ -121,11 +184,17 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 			dontforks = true
 			continue
 		}
+		if vma.eagerForkCopy {
+			eagerForkARs = append(eagerForkARs, vmaAR)
+		}
 
 		// Inform the Mappable, if any, of the new mapping.
 		if vma.mappable != nil {
 			if err := vma.mappable.AddMapping(ctx, mm2, vmaAR, vma.off, vma.canWriteMappableLocked()); err != nil {
-				_, droppedIDs = mm2.removeVMAsLocked(ctx, mm2.applicationAddrRange(), droppedIDs)
+				// Fork still exclusively owns mm2's VMA and mapping-accounting
+				// state. AddMapping only exposes its activeMu-protected
+				// invalidation state.
+				_, droppedIDs = mm2.removeVMAsLocked(ctx, mm2.applicationAddrRange(), droppedIDs) // +checklocksignore
 				as.Release()
 				return nil, err
 			}
@@ -151,12 +220,18 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 	defer mm.activeMu.Unlock()
 	mm2.activeMu.NestedLock(activeLockForked)
 	defer mm2.activeMu.NestedUnlock(activeLockForked)
-	if dontforks {
+	mm2.gsInUse = gsInUse
+	if dontforks || mm.hasPinned {
 		defer mm.pmas.MergeInsideRange(mm.applicationAddrRange())
 	}
 	srcvseg := mm.vmas.FirstSegment()
 	dstpgap := mm2.pmas.FirstGap()
 	var unmapAR hostarch.AddrRange
+	defer func() {
+		if unmapAR.Length() != 0 {
+			mm.unmapASLocked(unmapAR)
+		}
+	}()
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	for srcpseg := mm.pmas.FirstSegment(); srcpseg.Ok(); srcpseg = srcpseg.NextSegment() {
 		pma := srcpseg.ValuePtr()
@@ -164,24 +239,72 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 			continue
 		}
 
-		if dontforks {
-			// Find the 'vma' that contains the starting address
-			// associated with the 'pma' (there must be one).
-			srcvseg = srcvseg.seekNextLowerBound(srcpseg.Start())
-			if checkInvariants {
-				if !srcvseg.Ok() {
-					panic(fmt.Sprintf("no vma covers pma range %v", srcpseg.Range()))
-				}
-				if srcpseg.Start() < srcvseg.Start() {
-					panic(fmt.Sprintf("vma %v ran ahead of pma %v", srcvseg.Range(), srcpseg.Range()))
-				}
-			}
+		// Skip eager fork ranges that end before srcpseg. Since pmas are
+		// visited in increasing order, they can't overlap any later pmas.
+		for len(eagerForkARs) != 0 && eagerForkARs[0].End <= srcpseg.Start() {
+			eagerForkARs = eagerForkARs[1:]
+		}
 
-			srcpseg = mm.pmas.Isolate(srcpseg, srcvseg.Range())
-			if srcvseg.ValuePtr().dontfork {
+		eager := len(eagerForkARs) != 0 && eagerForkARs[0].Overlaps(srcpseg.Range())
+		if dontforks || eager {
+			srcpseg, srcvseg = mm.isolatePMAToVMALocked(srcpseg, srcvseg)
+			srcvma := srcvseg.ValuePtr()
+			if srcvma.dontfork {
 				continue
 			}
+
 			pma = srcpseg.ValuePtr()
+			if srcvma.eagerForkCopy {
+				var err error
+				if dstpgap, err = mm.forkCopyPMALocked(mm2, srcpseg, dstpgap, memCgID); err != nil {
+					// Dropped IDs need to be updated so that deferred
+					// ref decrements are done correctly.
+					droppedIDs = mm2.abortForkLocked(ctx, droppedIDs)
+					return nil, err
+				}
+				continue
+			}
+		}
+
+		if mm.hasPinned && !pma.needCOW {
+			// Pinned pages must not be made copy-on-write: breaking
+			// copy-on-write moves the writing process to a new copy of the
+			// page, while any DMA registered against the original page
+			// continues to target it, causing the two to diverge. Instead,
+			// give the child a copy of possibly-pinned pages immediately,
+			// leaving the parent's mappings unchanged; compare Linux's
+			// mm/memory.c:copy_present_ptes() => folio_needs_cow_for_dma().
+			// Since Pin() breaks copy-on-write on the pinned range,
+			// possibly-pinned pages are exactly those in private
+			// non-copy-on-write pmas with more than one reference.
+			if sfr, ok := mm.mf.FirstSharedRange(srcpseg.fileRange()); ok {
+				sar := hostarch.AddrRange{
+					Start: srcpseg.Start() + hostarch.Addr(sfr.Start-pma.off),
+					End:   srcpseg.Start() + hostarch.Addr(sfr.End-pma.off),
+				}
+				if sar.Start > srcpseg.Start() {
+					// Isolate the pages preceding sar and fall through to
+					// make only those copy-on-write; the remainder of the
+					// pma is revisited on the next iteration.
+					srcpseg = mm.pmas.Isolate(
+						srcpseg,
+						hostarch.AddrRange{
+							Start: srcpseg.Start(),
+							End:   sar.Start},
+					)
+					pma = srcpseg.ValuePtr()
+				} else {
+					// Copy the possibly-pinned pages for the child now.
+					srcpseg = mm.pmas.Isolate(srcpseg, sar)
+					var err error
+					dstpgap, err = mm.forkCopyPMALocked(mm2, srcpseg, dstpgap, memCgID)
+					if err != nil {
+						droppedIDs = mm2.abortForkLocked(ctx, droppedIDs)
+						return nil, err
+					}
+					continue
+				}
+			}
 		}
 
 		if !pma.needCOW {
@@ -212,9 +335,6 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 		mm2.addRSSLocked(addrRange)
 		dstpgap = mm2.pmas.Insert(dstpgap, addrRange, *pma).NextGap()
 	}
-	if unmapAR.Length() != 0 {
-		mm.unmapASLocked(unmapAR)
-	}
 
 	// Between when we call memmap.Mappable.AddMapping while copying vmas and
 	// when we lock mm2.activeMu to copy pmas, calls to mm2.Invalidate() are
@@ -244,8 +364,54 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 
 	if mm2.executable != nil {
 		mm2.executable.IncRef()
+		mm2.executable.DenyWriteAccess()
 	}
 	return mm2, nil
+}
+
+// forkCopyPMALocked copies the contents of the private pma represented by
+// srcpseg in mm into newly-allocated memory, and inserts a pma mapping that
+// memory into mm2 at the same address range, as Fork requires for pages that
+// may be pinned for DMA. It returns the gap after the inserted pma.
+//
+// Preconditions:
+//   - srcpseg.ValuePtr().private == true.
+//   - dstpgap must be the gap in mm2.pmas at which the new pma should be
+//     inserted.
+//
+// +checklocks:mm.activeMu
+// +checklocks:mm2.activeMu
+func (mm *MemoryManager) forkCopyPMALocked(mm2 *MemoryManager, srcpseg pmaIterator, dstpgap pmaGapIterator, memCgID uint32) (pmaGapIterator, error) {
+	if err := srcpseg.getInternalMappingsLocked(); err != nil {
+		return dstpgap, err
+	}
+	copyAR := srcpseg.Range()
+	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(srcpseg, copyAR)}
+	huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
+	fr, err := mm.mf.Allocate(uint64(copyAR.Length()), pgalloc.AllocOpts{
+		Kind:       usage.Anonymous,
+		MemCgID:    memCgID,
+		Mode:       pgalloc.AllocateAndWritePopulate,
+		Huge:       huge,
+		ReaderFunc: reader.ReadToBlocks,
+	})
+	if err != nil {
+		if _, ok := err.(safecopy.BusError); ok {
+			// Compare Linux's mm/memory.c:copy_present_page() =>
+			// copy_mc_user_highpage().
+			err = linuxerr.EHWPOISON
+		}
+		if fr.Length() != 0 {
+			mm.mf.DecRef(fr)
+		}
+		return dstpgap, err
+	}
+	newpma := srcpseg.Value()
+	newpma.off = fr.Start
+	newpma.huge = huge
+	newpma.internalMappings = safemem.BlockSeq{}
+	mm2.addRSSLocked(copyAR)
+	return mm2.pmas.Insert(dstpgap, copyAR, newpma).NextGap(), nil
 }
 
 // IncUsers increments mm's user count and returns true. If the user count is
@@ -264,6 +430,11 @@ func (mm *MemoryManager) IncUsers() bool {
 
 // DecUsers decrements mm's user count. If the user count reaches 0, all
 // mappings in mm are unmapped.
+//
+// +checklocksexclude:mm.aioManager.mu
+// +checklocksexclude:mm.metadataMu
+// +checklocksexclude:mm.activeMu
+// +checklocksexclude:mm.mappingMu
 func (mm *MemoryManager) DecUsers(ctx context.Context) {
 	if users := mm.users.Add(-1); users > 0 {
 		return
@@ -278,6 +449,7 @@ func (mm *MemoryManager) DecUsers(ctx context.Context) {
 	mm.executable = nil
 	mm.metadataMu.Unlock()
 	if exe != nil {
+		exe.AllowWriteAccess()
 		exe.DecRef(ctx)
 	}
 

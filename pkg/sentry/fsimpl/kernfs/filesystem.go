@@ -56,19 +56,20 @@ func (fs *Filesystem) stepExistingLocked(ctx context.Context, rp *vfs.ResolvingP
 		return d, false, nil
 	}
 	if name == ".." {
+		parent := d.parent.Load()
 		if isRoot, err := rp.CheckRoot(ctx, d.VFSDentry()); err != nil {
 			return nil, false, err
-		} else if isRoot || d.parent.Load() == nil {
+		} else if isRoot || parent == nil {
 			rp.Advance()
 			return d, false, nil
 		}
-		if err := rp.CheckMount(ctx, d.Parent().VFSDentry()); err != nil {
+		if err := rp.CheckMount(ctx, parent.VFSDentry()); err != nil {
 			return nil, false, err
 		}
 		rp.Advance()
-		return d.parent.Load(), false, nil
+		return parent, false, nil
 	}
-	if len(name) > linux.NAME_MAX {
+	if len(name) > linux.NAME_MAX && !fs.NoNegativeDentries {
 		return nil, false, linuxerr.ENAMETOOLONG
 	}
 	next, err := fs.revalidateChildLocked(ctx, rp.VirtualFilesystem(), d, name)
@@ -231,19 +232,34 @@ func (fs *Filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.Resolving
 	return d, nil
 }
 
-// checkCreateLocked checks that a file named rp.Component() may be created in
-// directory parent, then returns rp.Component().
+// checkCreateLocked checks that a file named name may be created in parent.
+// forSyntheticMountpoint permits creating a synthetic mountpoint even if the
+// filesystem does not create negative dentries.
 //
 // Preconditions:
-//   - Filesystem.mu must be locked for at least reading.
-//   - isDir(parentInode) == true.
-func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string, parent *Dentry) error {
+//   - Filesystem.mu must be locked for writing.
+//   - parent.dirMu must be locked; it may be temporarily released and reacquired.
+//   - parent.isDir().
+//
+// Postcondition: Caller must call fs.processDeferredDecRefs*.
+func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string, parent *Dentry, forSyntheticMountpoint bool) error {
 	// Order of checks is important. First check if parent directory can be
 	// executed, then check for existence, and lastly check if mount is writable.
 	if err := parent.inode.CheckPermissions(ctx, creds, vfs.MayExec); err != nil {
 		return err
 	}
 	if name == "." || name == ".." {
+		return linuxerr.EEXIST
+	}
+	if parent.fs.NoNegativeDentries && !forSyntheticMountpoint {
+		// revalidateChildLocked takes dirMu. The caller holds fs.mu for writing,
+		// so parent.children cannot change while dirMu is released.
+		parent.dirMu.Unlock()
+		defer parent.dirMu.Lock()
+		_, err := parent.fs.revalidateChildLocked(ctx, parent.fs.vfsfs.VirtualFilesystem(), parent, name)
+		if err != nil {
+			return err
+		}
 		return linuxerr.EEXIST
 	}
 	if len(name) > linux.NAME_MAX {
@@ -353,10 +369,7 @@ func (fs *Filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 	if err := d.inode.CheckPermissions(ctx, creds, ats); err != nil {
 		return err
 	}
-	if ats.MayWrite() && rp.Mount().ReadOnly() {
-		return linuxerr.EROFS
-	}
-	return nil
+	return vfs.CheckMountAccess(rp, ats, d.inode.Mode())
 }
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
@@ -408,6 +421,13 @@ func (fs *Filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		return err
 	}
 
+	if fs.NoNegativeDentries {
+		// Linux's do_linkat looks up the destination before checking the
+		// mounts or source inode. Here no lookup can leave a negative dentry.
+		parent.dirMu.Lock()
+		defer parent.dirMu.Unlock()
+		return checkCreateLocked(ctx, rp.Credentials(), rp.Component(), parent, false)
+	}
 	if rp.Mount() != vd.Mount() {
 		return linuxerr.EXDEV
 	}
@@ -415,13 +435,13 @@ func (fs *Filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 	if inode.Mode().IsDir() {
 		return linuxerr.EPERM
 	}
-	if err := vfs.MayLink(rp.Credentials(), inode.Mode(), inode.UID(), inode.GID()); err != nil {
+	if err := vfs.MayLink(rp.Credentials(), inode.Mode(), nil, inode.UID(), inode.GID()); err != nil {
 		return err
 	}
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
 	pc := rp.Component()
-	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent, false); err != nil {
 		return err
 	}
 	if rp.MustBeDir() {
@@ -460,7 +480,7 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
 	pc := rp.Component()
-	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent, opts.ForSyntheticMountpoint); err != nil {
 		return err
 	}
 	if err := rp.Mount().CheckBeginWrite(); err != nil {
@@ -497,7 +517,7 @@ func (fs *Filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
 	pc := rp.Component()
-	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent, false); err != nil {
 		return err
 	}
 	if rp.MustBeDir() {
@@ -518,6 +538,17 @@ func (fs *Filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	return nil
 }
 
+// mayExecFile rejects FileExec opens of non-regular files before invoking the
+// inode's open handler, which may block or have side effects (e.g. acquiring
+// a controlling terminal), as in Linux's fs/namei.c:may_open(). Symlinks are
+// exempt so that they produce ELOOP, also per may_open().
+func mayExecFile(d *Dentry, opts vfs.OpenOptions) error {
+	if opts.FileExec && !d.isRegular() && !d.isSymlink() {
+		return linuxerr.EACCES
+	}
+	return nil
+}
+
 // OpenAt implements vfs.FilesystemImpl.OpenAt.
 func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(&opts)
@@ -534,6 +565,10 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			return nil, err
 		}
 		if err := d.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil {
+			fs.mu.RUnlock()
+			return nil, err
+		}
+		if err := mayExecFile(d, opts); err != nil {
 			fs.mu.RUnlock()
 			return nil, err
 		}
@@ -579,6 +614,9 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		if err := start.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil {
 			return nil, err
 		}
+		if err := mayExecFile(start, opts); err != nil {
+			return nil, err
+		}
 		if trunc && start.isRegular() {
 			if err := mnt.CheckBeginWrite(); err != nil {
 				return nil, err
@@ -610,7 +648,7 @@ afterTrailingSymlink:
 	if pc == "." || pc == ".." {
 		return nil, linuxerr.EISDIR
 	}
-	if len(pc) > linux.NAME_MAX {
+	if len(pc) > linux.NAME_MAX && !fs.NoNegativeDentries {
 		return nil, linuxerr.ENAMETOOLONG
 	}
 	if parent.VFSDentry().IsDead() {
@@ -631,7 +669,7 @@ afterTrailingSymlink:
 		start = parent
 		goto afterTrailingSymlink
 	}
-	if linuxerr.Equals(linuxerr.ENOENT, err) {
+	if linuxerr.Equals(linuxerr.ENOENT, err) && !fs.NoNegativeDentries {
 		// Already checked for searchability above; now check for writability.
 		if err := parent.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
 			return nil, err
@@ -672,6 +710,9 @@ afterTrailingSymlink:
 		return nil, linuxerr.ENOTDIR
 	}
 	if err := child.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil {
+		return nil, err
+	}
+	if err := mayExecFile(child, opts); err != nil {
 		return nil, err
 	}
 	if trunc && child.isRegular() {
@@ -753,11 +794,20 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	defer mnt.EndWrite()
 	oldParentDir := oldParentVD.Dentry().Impl().(*Dentry).Inode()
-	if err := oldParentDir.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
-		return err
-	}
-	if err := dstDir.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
-		return err
+	if fs.NoNegativeDentries {
+		// As in Linux's do_renameat2, look up both names before checking
+		// whether either directory can be modified. checkCreateLocked will
+		// check search permission on dstDir when it looks up the destination.
+		if err := oldParentDir.CheckPermissions(ctx, rp.Credentials(), vfs.MayExec); err != nil {
+			return err
+		}
+	} else {
+		if err := oldParentDir.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+			return err
+		}
+		if err := dstDir.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+			return err
+		}
 	}
 
 	srcDirVFSD := oldParentVD.Dentry()
@@ -767,9 +817,10 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	// Can we remove the src dentry?
-	if err := checkDeleteLocked(ctx, rp, src); err != nil {
-		return err
+	if !fs.NoNegativeDentries {
+		if err := checkDeleteLocked(ctx, rp, src); err != nil {
+			return err
+		}
 	}
 
 	// Can we create the dst dentry?
@@ -781,11 +832,20 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 		return linuxerr.EBUSY
 	}
-	if len(newName) > linux.NAME_MAX {
+	if !fs.NoNegativeDentries && len(newName) > linux.NAME_MAX {
 		return linuxerr.ENAMETOOLONG
 	}
 
-	err = checkCreateLocked(ctx, rp.Credentials(), newName, dstDir)
+	err = func() error {
+		dstDir.dirMu.Lock()
+		defer dstDir.dirMu.Unlock()
+		err := checkCreateLocked(ctx, rp.Credentials(), newName, dstDir, false)
+		if linuxerr.Equals(linuxerr.EEXIST, err) {
+			// A successful revalidation leaves the child in dstDir.children.
+			dst = dstDir.children[newName]
+		}
+		return err
+	}()
 	switch {
 	case err == nil:
 		// Ok, continue with rename as replacement.
@@ -794,9 +854,20 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			// Won't overwrite existing node since RENAME_NOREPLACE was requested.
 			return linuxerr.EEXIST
 		}
-		dst = dstDir.children[newName]
 		if dst == nil {
 			panic(fmt.Sprintf("Child %q for parent Dentry %+v disappeared inside atomic section?", newName, dstDir))
+		}
+		if fs.NoNegativeDentries {
+			// vfs_rename succeeds for the same inode before may_delete.
+			if src.inode == dst.inode {
+				return nil
+			}
+			if err := checkDeleteLocked(ctx, rp, src); err != nil {
+				return err
+			}
+			if err := dstDir.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
+				return err
+			}
 		}
 		if err := vfs.CheckDeleteSticky(
 			rp.Credentials(),
@@ -834,14 +905,16 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	srcVFSD := src.VFSDentry()
-	if err := virtfs.PrepareRenameDentry(mntns, srcVFSD, dstVFSD); err != nil {
+	handle, err := virtfs.PrepareRenameDentry(mntns, srcVFSD, dstVFSD)
+	if err != nil {
 		return err
 	}
 	err = srcDir.inode.Rename(ctx, src.name, newName, src.inode, dstDir.inode)
 	if err != nil {
-		virtfs.AbortRenameDentry(srcVFSD, dstVFSD)
+		virtfs.AbortRenameDentry(&handle, srcVFSD, dstVFSD)
 		return err
 	}
+	virtfs.RenameBegin(&handle)
 	delete(srcDir.children, src.name)
 	if srcDir != dstDir {
 		fs.deferDecRef(srcDir) // child (src) drops ref on old parent.
@@ -862,7 +935,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		replaced.setDeleted()
 	}
 	vfs.InotifyRename(ctx, src.inode.Watches(), srcDir.inode.Watches(), dstDir.inode.Watches(), oldName, newName, src.isDir())
-	for _, rc := range virtfs.CommitRenameReplaceDentry(ctx, srcVFSD, replaceVFSD) { // +checklocksforce: to may be nil, that's okay.
+	for _, rc := range virtfs.CommitRenameReplaceDentry(ctx, &handle, srcVFSD, replaceVFSD) { // +checklocksforce: to may be nil, that's okay.
 		fs.deferDecRef(rc)
 	}
 	return nil
@@ -963,7 +1036,12 @@ func (fs *Filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 // StatAt implements vfs.FilesystemImpl.StatAt.
 func (fs *Filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
 	if rp.Done() && opts.Sync == linux.AT_STATX_DONT_SYNC {
-		return rp.Start().Impl().(*Dentry).inode.Stat(ctx, fs.VFSFilesystem(), opts)
+		stat, err := rp.Start().Impl().(*Dentry).inode.Stat(ctx, fs.VFSFilesystem(), opts)
+		if err != nil {
+			return linux.Statx{}, err
+		}
+		rp.AddMountRootAttr(rp.Start(), &stat)
+		return stat, nil
 	}
 
 	fs.mu.RLock()
@@ -973,7 +1051,12 @@ func (fs *Filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	if err != nil {
 		return linux.Statx{}, err
 	}
-	return d.inode.Stat(ctx, fs.VFSFilesystem(), opts)
+	stat, err := d.inode.Stat(ctx, fs.VFSFilesystem(), opts)
+	if err != nil {
+		return linux.Statx{}, err
+	}
+	rp.AddMountRootAttr(d.VFSDentry(), &stat)
+	return stat, nil
 }
 
 // StatFSAt implements vfs.FilesystemImpl.StatFSAt.
@@ -1004,7 +1087,7 @@ func (fs *Filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 	defer parent.dirMu.Unlock()
 
 	pc := rp.Component()
-	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent, false); err != nil {
 		return err
 	}
 	if rp.MustBeDir() {
@@ -1129,8 +1212,12 @@ func (fs *Filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 		mode := d.inode.Mode()
 		kuid := d.inode.UID()
 		kgid := d.inode.GID()
-		if err := vfs.GenericCheckPermissions(creds, vfs.MayRead, mode, kuid, kgid); err != nil {
-			return "", err
+		// Linux only skips the read permission check for reads of security.*,
+		// system.*, and trusted.* xattrs, see fs/xattr.c:xattr_permission().
+		if vfs.XattrReadNeedsFilePermission(opts.Name) {
+			if err := vfs.GenericCheckPermissions(creds, vfs.MayRead, mode, nil, kuid, kgid); err != nil {
+				return "", err
+			}
 		}
 		if err := vfs.CheckXattrPermissions(creds, vfs.MayRead, mode, kuid, opts.Name); err != nil {
 			return "", err
@@ -1155,7 +1242,7 @@ func (fs *Filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 		mode := d.inode.Mode()
 		kuid := d.inode.UID()
 		kgid := d.inode.GID()
-		if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, kuid, kgid); err != nil {
+		if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, nil, kuid, kgid); err != nil {
 			return err
 		}
 		if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, kuid, opts.Name); err != nil {
@@ -1181,7 +1268,7 @@ func (fs *Filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 		mode := d.inode.Mode()
 		kuid := d.inode.UID()
 		kgid := d.inode.GID()
-		if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, kuid, kgid); err != nil {
+		if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, nil, kuid, kgid); err != nil {
 			return err
 		}
 		if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, kuid, name); err != nil {
@@ -1191,6 +1278,32 @@ func (fs *Filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 	}
 	// kernfs currently does not support extended attributes.
 	return linuxerr.ENOTSUP
+}
+
+// GetPosixACLAt implements vfs.FilesystemImpl.GetPosixACLAt.
+func (fs *Filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType) (*vfs.PosixACL, error) {
+	fs.mu.RLock()
+	defer fs.processDeferredDecRefs(ctx)
+	defer fs.mu.RUnlock()
+	_, err := fs.walkExistingLocked(ctx, rp)
+	if err != nil {
+		return nil, err
+	}
+	// kernfs currently does not support POSIX ACLs.
+	return nil, nil
+}
+
+// SetPosixACLAt implements vfs.FilesystemImpl.SetPosixACLAt.
+func (fs *Filesystem) SetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
+	fs.mu.RLock()
+	defer fs.processDeferredDecRefs(ctx)
+	defer fs.mu.RUnlock()
+	_, err := fs.walkExistingLocked(ctx, rp)
+	if err != nil {
+		return nil, 0, err
+	}
+	// kernfs currently does not support POSIX ACLs.
+	return nil, 0, linuxerr.EOPNOTSUPP
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.

@@ -16,14 +16,19 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/capability.h>
+#include <linux/limits.h>
+#include <sched.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -38,6 +43,7 @@
 #include "test/util/linux_capability_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 
@@ -115,6 +121,25 @@ TEST_F(XattrTest, XattrInvalidPrefix) {
               SyscallFailsWithErrno(EOPNOTSUPP));
   EXPECT_THAT(removexattr(path, name.c_str()),
               SyscallFailsWithErrno(EOPNOTSUPP));
+}
+
+// getxattr of a name outside the security/system/trusted namespaces requires
+// read permission on the file, per Linux's fs/xattr.c:xattr_permission().
+TEST_F(XattrTest, UnknownPrefixRequiresReadPermission) {
+  // A caller-owned mode-0000 file is unreadable even to its owner once the
+  // DAC-bypassing capabilities are dropped, without requiring an ownership
+  // change (which an unprivileged host gofer cannot perform).
+  const char* path = test_file_name_.c_str();
+
+  // Do not allow save/restore cycles after making the test file inaccessible,
+  // as the restore will fail to reopen it.
+  DisableSave ds;
+  ASSERT_THAT(chmod(path, 0000), SyscallSucceeds());
+
+  AutoCapability cap_override(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap_read_search(CAP_DAC_READ_SEARCH, false);
+  EXPECT_THAT(getxattr(path, "ceph.file.layout", nullptr, 0),
+              SyscallFailsWithErrno(EACCES));
 }
 
 TEST_F(XattrTest, SecurityCapacityXattr) {
@@ -849,6 +874,8 @@ TEST_F(XattrTest, TrustedNamespaceWithCapSysAdminInNewUserns) {
 }  // namespace testing
 }  // namespace gvisor
 
+using gvisor::testing::UnshareAndSetxattrInNewUserns;
+
 int main(int argc, char** argv) {
   // TrustedNamespaceWithCapSysAdminInNewUserns will exec with the following
   // flag, but we avoid using absl::GetFlag because we intend to unshare(), an
@@ -859,8 +886,7 @@ int main(int argc, char** argv) {
     if (arg == gvisor::testing::kUnshareAndSetTrustedXattrInNewUserns) {
       // The next argument is the path to set the trusted xattr on.
       if (i + 1 < argc) {
-        return gvisor::testing::UnshareAndSetxattrInNewUserns(
-            argv[i + 1]);
+        return UnshareAndSetxattrInNewUserns(argv[i + 1]);
       }
       return 4;
     }

@@ -46,8 +46,7 @@ go_test(
         "metric_test.go",
         "utils_test.go",
     ],
-    library = ":metric",
-    tags = ["not_run:arm"],
+    embed = [":metric"],
     deps = [
         ":metric_go_proto",
         "//pkg/eventchannel",
@@ -67,7 +66,7 @@ go_test(
         "condmetric_profiling_enabled_test.go",
         "utils_test.go",
     ],
-    library = ":metric",
+    embed = [":metric"],
     deps = [
         ":metric_go_proto",
         "//pkg/eventchannel",

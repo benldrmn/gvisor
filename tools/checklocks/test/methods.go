@@ -97,7 +97,7 @@ type ptrToTestMethodsWithParameters *testMethodsWithParameters
 // +checklocks:a.mu
 func (t *testMethodsWithParameters) methodLockedWithParameters(a *testMethodsWithParameters, b *testMethodsWithParameters) {
 	t.guardedField = a.guardedField
-	b.guardedField = a.guardedField // +checklocksfail
+	b.guardedField = a.guardedField // +checklocksfail=locks: &({param:a}.mu) exclusively,&({param:t}.mu) exclusively
 }
 
 // +checklocks:t.mu
@@ -109,7 +109,8 @@ func (t *testMethodsWithParameters) methodLockedWithPtrType(a *testMethodsWithPa
 }
 
 // +checklocks:a.mu
-func standaloneFunctionWithGuard(a *testMethodsWithParameters) {
+// Also fails at the implicit return: a.mu is required on exit, but released.
+func standaloneFunctionWithGuard(a *testMethodsWithParameters) { // +checklocksfail
 	a.guardedField = 1
 	a.mu.Unlock()
 	a.guardedField = 1 // +checklocksfail

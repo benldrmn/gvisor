@@ -67,16 +67,17 @@ func (dev *frontendDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.D
 	if err != nil {
 		return nil, err
 	}
+	fd.internalEntry.Init(fd, waiter.AllEvents)
+	fd.internalQueue.EventRegister(&fd.internalEntry)
+	if err := fdnotifier.AddFD(fd.hostFD, &fd.internalQueue); err != nil {
+		unix.Close(int(fd.hostFD))
+		return nil, err
+	}
 	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 		SpecialFile:       true,
 	}); err != nil {
-		unix.Close(int(fd.hostFD))
-		return nil, err
-	}
-	fd.internalEntry.Init(fd, waiter.AllEvents)
-	fd.internalQueue.EventRegister(&fd.internalEntry)
-	if err := fdnotifier.AddFD(fd.hostFD, &fd.internalQueue); err != nil {
+		fdnotifier.RemoveFD(fd.hostFD)
 		unix.Close(int(fd.hostFD))
 		return nil, err
 	}
@@ -97,6 +98,7 @@ type frontendFD struct {
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
 	memmap.MappableNoTrackMappings
+	memmap.MappableNoHugepages
 
 	dev           *frontendDevice
 	containerName string
@@ -234,7 +236,7 @@ func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, 
 	}
 
 	// nr determines the argument type.
-	// Implementors:
+	// Implementers:
 	// - To map nr to a symbol, look in
 	// src/nvidia/arch/nvalloc/unix/include/nv_escape.h,
 	// kernel-open/common/inc/nv-ioctl-numbers.h, and
@@ -367,6 +369,125 @@ func frontendRegisterFD(fi *frontendIoctlState) (uintptr, error) {
 	ioctlParams.CtlFD = ctlFile.hostFD
 	// The returned ctl_fd can't change, so skip copying out.
 	return frontendIoctlInvokeNoStatus(fi, &ioctlParams)
+}
+
+// frontendExportToDMABufFD handles NV_ESC_EXPORT_TO_DMABUF_FD. CUDA uses this
+// to export GPU memory as a dma-buf fd for ibv_reg_dmabuf_mr (GPUDirect RDMA).
+func frontendExportToDMABufFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Params]](fi *frontendIoctlState) (uintptr, error) {
+	var ioctlParamsValue Params
+	ioctlParams := PtrParams(&ioctlParamsValue)
+	if int(fi.ioctlParamsSize) != ioctlParams.SizeBytes() {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+
+	// The FD field is both input and output (see nv_dma_buf_export() in
+	// kernel-open/nvidia/nv-dmabuf.c):
+	//   - FD == -1: the driver creates a new dma-buf and returns its fd by
+	//     updating the ioctlParams. We wrap that host fd in a new application
+	//     FD installed in the task's fd table and return it via ioctlParams to
+	//     the app, so the app can hand it to the RDMA verbs library.
+	//   - FD >= 0: the app is appending more handles to a dma-buf it exported
+	//     in an earlier call, identified by that fd. The value is an app FD,
+	//     we translate it back to the host fd of the dma-buf we wrapped
+	//     before. The driver leaves the host fd unchanged, so we restore the
+	//     app fd on the way out.
+	if appFD := ioctlParams.GetFrontendFD(); appFD >= 0 {
+		fileGeneric, _ := fi.t.FDTable().Get(appFD)
+		if fileGeneric == nil {
+			return 0, linuxerr.EINVAL
+		}
+		defer fileGeneric.DecRef(fi.ctx)
+		wrapper, ok := fileGeneric.Impl().(*dmaBufFDWrapper)
+		if !ok {
+			return 0, linuxerr.EINVAL
+		}
+		ioctlParams.SetFrontendFD(wrapper.hostFD)
+		n, err := frontendIoctlInvokeNoStatus(fi, ioctlParams)
+		ioctlParams.SetFrontendFD(appFD)
+		if err != nil {
+			return n, err
+		}
+		if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+			return n, err
+		}
+		return n, nil
+	}
+
+	// Create path: FD == -1 (any other negative value is rejected by the
+	// driver, so FD < -1 will fail below).
+	n, err := frontendIoctlInvokeNoStatus(fi, ioctlParams)
+	if err != nil {
+		return n, err
+	}
+
+	// The driver only allocates a dma-buf fd when the export succeeded.
+	if ioctlParams.GetStatus() == nvgpu.NV_OK && ioctlParams.GetFrontendFD() >= 0 {
+		sandboxFD, err := newDMABufFDWrapper(fi.t, ioctlParams.GetFrontendFD())
+		if err != nil {
+			return n, err
+		}
+		ioctlParams.SetFrontendFD(sandboxFD)
+		if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+			// Roll back the fd we installed so the guest doesn't retain a
+			// dma-buf it never learned the number of. Remove drops the table's
+			// reference; DecRef releases it (closing the host fd).
+			if removed := fi.t.FDTable().Remove(fi.ctx, sandboxFD); removed != nil {
+				removed.DecRef(fi.ctx)
+			}
+			return n, err
+		}
+		return n, nil
+	}
+
+	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// dmaBufFDWrapper wraps a host dma-buf fd returned by the NVIDIA driver's
+// export operation as an application FD. It implements vfs.HostFDProvider so
+// that rdmaproxy can recover the host fd to hand to ibv_reg_dmabuf_mr.
+//
+// +stateify savable
+type dmaBufFDWrapper struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.DentryMetadataFileDescriptionImpl
+	vfs.NoLockFD
+
+	hostFD int32
+}
+
+// HostFD implements vfs.HostFDProvider.HostFD.
+func (fd *dmaBufFDWrapper) HostFD() int {
+	return int(fd.hostFD)
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *dmaBufFDWrapper) Release(ctx context.Context) {
+	unix.Close(int(fd.hostFD))
+}
+
+// newDMABufFDWrapper takes ownership of hostFD, wraps it in an application
+// FileDescription and installs it in t's FD table. It returns the application
+// FD number.
+func newDMABufFDWrapper(t *kernel.Task, hostFD int32) (int32, error) {
+	vfsObj := t.Kernel().VFS()
+	vd := vfsObj.NewAnonVirtualDentry("[nvidia-dmabuf]")
+	defer vd.DecRef(t)
+	w := &dmaBufFDWrapper{hostFD: hostFD}
+	if err := w.vfsfd.Init(w, linux.O_RDWR, t.Credentials(), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
+		UseDentryMetadata: true,
+	}); err != nil {
+		unix.Close(int(hostFD))
+		return -1, err
+	}
+	defer w.vfsfd.DecRef(t)
+	return t.NewFDFrom(0, &w.vfsfd, kernel.FDFlags{CloseOnExec: true})
 }
 
 func frontendIoctlHasFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Params]](fi *frontendIoctlState) (uintptr, error) {
@@ -542,51 +663,52 @@ func rmAllocMemorySimple(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	return n, nil
 }
 
-var madvPopulateWriteDisabled atomicbitops.Bool
+var madvPopulateDisabled atomicbitops.Bool
 
-func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02ParametersWithFD) (uintptr, error) {
-	// Compare src/nvidia/arch/nvalloc/unix/src/escape.c:RmAllocOsDescriptor()
-	// => RmCreateOsDescriptor().
-	appAddr := addrFromP64(ioctlParams.Params.PMemory)
-	if !appAddr.IsPageAligned() {
-		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_NOT_SUPPORTED)
-	}
-	arLen := ioctlParams.Params.Limit + 1
-	if arLen == 0 { // integer overflow
-		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_LIMIT)
-	}
-	var ok bool
-	arLen, ok = hostarch.PageRoundUp(arLen)
-	if !ok {
-		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ADDRESS)
-	}
-	appAR, ok := appAddr.ToRange(arLen)
-	if !ok {
-		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ADDRESS)
-	}
+// appMirror is application memory that is pinned and mapped contiguously into
+// the sentry's address space. The host driver pins pages by walking the
+// caller's address space from a single base address, so callers pass it the
+// mirror's address in place of the application's.
+type appMirror struct {
+	pinnedRanges []mm.PinnedRange
 
-	// The host driver will collect pages from our address space starting at
-	// PMemory, so we need a contiguous mapping equivalent to the
-	// application's.
-	at := hostarch.Read
-	if ((ioctlParams.Params.Flags >> 21) & 0x1) == 0 /* NVOS02_FLAGS_ALLOC_USER_READ_ONLY_NO */ {
-		at.Write = true
+	// If m is non-zero, it is the start address of a mapping of length len
+	// that is unmapped when the appMirror is released. The host driver only
+	// needs the mapping while it pins the pages, but unmapping can be very
+	// expensive and pinning tends to be on a critical path, so unmapping is
+	// deferred.
+	m   uintptr
+	len uintptr
+}
+
+func (am *appMirror) release(ctx context.Context) {
+	if am.m != 0 {
+		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, am.m, am.len, 0); errno != 0 {
+			ctx.Warningf("nvproxy: failed to unmap %#x-%#x: %v", am.m, am.m+am.len, errno)
+		}
 	}
-	prs, err := fi.t.MemoryManager().Pin(fi.ctx, appAR, at, false /* ignorePermissions */)
-	unpinCleanup := cleanup.Make(func() {
-		mm.Unpin(prs)
+	mm.Unpin(am.pinnedRanges)
+}
+
+// mirrorAppRange pins the application memory in ar, which must be
+// page-aligned, and maps it contiguously into the sentry's address space. It
+// returns the sentry address of the mirror.
+func mirrorAppRange(ctx context.Context, t *kernel.Task, ar hostarch.AddrRange, at hostarch.AccessType) (appMirror, uintptr, error) {
+	prs, err := t.MemoryManager().Pin(ctx, ar, at, false /* ignorePermissions */)
+	am := appMirror{pinnedRanges: prs}
+	releaseMirror := cleanup.Make(func() {
+		am.release(ctx)
 	})
-	defer unpinCleanup.Clean()
+	defer releaseMirror.Clean()
 	if err != nil {
-		return 0, err
+		return appMirror{}, 0, err
 	}
 	var m uintptr
-	mOwned := false
 	if len(prs) == 1 {
 		pr := prs[0]
 		ims, err := pr.File.MapInternal(memmap.FileRange{pr.Offset, pr.Offset + uint64(pr.Source.Length())}, at)
 		if err != nil {
-			return 0, err
+			return appMirror{}, 0, err
 		}
 		if ims.NumBlocks() == 1 {
 			// We can use this singular internal mapping directly.
@@ -596,57 +718,87 @@ func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	if m == 0 {
 		// Reserve a range in our address space.
 		var errno unix.Errno
-		m, _, errno = unix.RawSyscall6(unix.SYS_MMAP, 0 /* addr */, uintptr(arLen), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS, ^uintptr(0) /* fd */, 0 /* offset */)
+		m, _, errno = unix.RawSyscall6(unix.SYS_MMAP, 0 /* addr */, uintptr(ar.Length()), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS, ^uintptr(0) /* fd */, 0 /* offset */)
 		if errno != 0 {
-			return 0, errno
+			return appMirror{}, 0, errno
 		}
-		mOwned = true
-		unpinCleanup.Add(func() {
-			unix.RawSyscall(unix.SYS_MUNMAP, m, uintptr(arLen), 0)
-		})
+		am.m = m
+		am.len = uintptr(ar.Length())
 		// Mirror application mappings into the reserved range.
-		sentryAddr := uintptr(m)
+		sentryAddr := m
 		for _, pr := range prs {
 			ims, err := pr.File.MapInternal(memmap.FileRange{pr.Offset, pr.Offset + uint64(pr.Source.Length())}, at)
 			if err != nil {
-				return 0, err
+				return appMirror{}, 0, err
 			}
 			for !ims.IsEmpty() {
 				im := ims.Head()
 				if _, _, errno := unix.RawSyscall6(unix.SYS_MREMAP, im.Addr(), 0 /* old_size */, uintptr(im.Len()), linux.MREMAP_MAYMOVE|linux.MREMAP_FIXED, sentryAddr, 0); errno != 0 {
-					return 0, errno
+					return appMirror{}, 0, errno
 				}
 				sentryAddr += uintptr(im.Len())
 				ims = ims.Tail()
 			}
 		}
 	}
-	if !madvPopulateWriteDisabled.Load() {
-		// In the kernel driver,
+	if !madvPopulateDisabled.Load() {
+		// The host driver pins mirrored pages with NV_PIN_USER_PAGES() =>
+		// (Linux) mm/gup.c:pin_user_pages(), e.g. in
 		// src/nvidia/arch/nvalloc/unix/src/escape.c:RmAllocOsDescriptor() =>
 		// RmCreateOsDescriptor() =>
-		// kernel-open/nvidia/os-mlock.c:os_lock_user_pages() will call
-		// NV_PIN_USER_PAGES() => (Linux) mm/gup.c:pin_user_pages() with
-		// gup_flags=FOLL_WRITE|FOLL_LONGTERM. pin_user_pages() calls
-		// is_valid_gup_args(locked=NULL), so FOLL_UNLOCKABLE is *not* added to
-		// gup_flags. Consequently, if pin_user_pages() needs to fault in
-		// pages, it will not unlock mmap_lock while doing so.
+		// kernel-open/nvidia/os-mlock.c:os_lock_user_pages() and
+		// kernel-open/nvidia-uvm/uvm_tools.c:map_user_pages().
+		// pin_user_pages() calls is_valid_gup_args(locked=NULL), so
+		// FOLL_UNLOCKABLE is *not* added to gup_flags. Consequently, if
+		// pin_user_pages() needs to fault in pages, it will not unlock
+		// mmap_lock while doing so.
 		//
 		// If another thread attempts to lock mmap_lock for writing (in this
 		// context, this typically occurs when another process also tries to
-		// rmAllocOSDescriptor() and calls mmap or mremap above), that thread
-		// will block until mmap_lock is released, and will also prevent other
-		// threads from locking mmap_lock for reading.
+		// mirror application memory and calls mmap or mremap above), that
+		// thread will block until mmap_lock is released, and will also prevent
+		// other threads from locking mmap_lock for reading.
 		//
-		// To avoid this, fault in these pages via MADV_POPULATE_WRITE;
+		// To avoid this, fault in these pages via MADV_POPULATE_READ or
+		// MADV_POPULATE_WRITE, matching the access type of the pin;
 		// mm/madvise.c:madvise_populate() => mm/gup.c:faultin_page_range()
 		// does pass FOLL_UNLOCKABLE to __get_user_pages_locked().
-		if _, _, errno := unix.Syscall(unix.SYS_MADVISE, m, uintptr(arLen), unix.MADV_POPULATE_WRITE); errno != 0 {
-			if !madvPopulateWriteDisabled.Swap(true) {
-				log.Infof("nvproxy: disabling MADV_POPULATE_WRITE before NV01_MEMORY_SYSTEM_OS_DESCRIPTOR allocation: %s", errno)
+		advice := unix.MADV_POPULATE_READ
+		if at.Write {
+			advice = unix.MADV_POPULATE_WRITE
+		}
+		if _, _, errno := unix.Syscall(unix.SYS_MADVISE, m, uintptr(ar.Length()), uintptr(advice)); errno != 0 {
+			if !madvPopulateDisabled.Swap(true) {
+				log.Infof("nvproxy: disabling MADV_POPULATE_READ/WRITE before host driver pinning: %s", errno)
 			}
 		}
 	}
+	releaseMirror.Release()
+	return am, m, nil
+}
+
+func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02ParametersWithFD) (uintptr, error) {
+	// Compare src/nvidia/arch/nvalloc/unix/src/escape.c:RmAllocOsDescriptor()
+	// => RmCreateOsDescriptor().
+	if ioctlParams.Params.HObjectNew.Val == nvgpu.NV01_NULL_OBJECT {
+		// The driver would generate a handle for the descriptor without
+		// returning it, so we couldn't track the pinned memory.
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_OBJECT_HANDLE)
+	}
+	at := hostarch.Read
+	if ((ioctlParams.Params.Flags >> 21) & 0x1) == 0 /* NVOS02_FLAGS_ALLOC_USER_READ_ONLY_NO */ {
+		at.Write = true
+	}
+	obj, m, status, err := pinOSDescriptor(fi, ioctlParams.Params.PMemory, ioctlParams.Params.Limit, at)
+	if err != nil {
+		return 0, err
+	}
+	if status != nvgpu.NV_OK {
+		return 0, frontendFailWithStatus(fi, ioctlParams, status)
+	}
+	releaseObj := cleanup.Make(obj.Release(fi.ctx))
+	defer releaseObj.Clean()
+
 	origPMemory := ioctlParams.Params.PMemory
 	ioctlParams.Params.PMemory = nvgpu.P64(uint64(m))
 	// NV01_MEMORY_SYSTEM_OS_DESCRIPTOR shouldn't use ioctlParams.FD; clobber
@@ -656,27 +808,16 @@ func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 
 	client, unlock := fi.fd.dev.nvp.getClientWithLock(fi.ctx, ioctlParams.Params.HRoot)
 	if client == nil {
+		ioctlParams.Params.PMemory = origPMemory
+		ioctlParams.FD = origFD
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
 	n, err := frontendIoctlInvoke(fi, ioctlParams)
 	if err == nil && ioctlParams.Params.Status == nvgpu.NV_OK {
-		// Transfer ownership of pinned pages to an osDescMem object, to be
-		// unpinned when the driver OsDescMem is freed.
-		obj := &osDescMem{
-			pinnedRanges: prs,
-		}
-		if mOwned {
-			// Transfer ownership of the temporary mapping as well. It isn't
-			// actually needed anymore, but unmapping can be very expensive and
-			// allocation tends to be a critical path, so not unmapping it
-			// until the osDescMem object is released improves performance.
-			obj.m = m
-			obj.len = uintptr(arLen)
-		}
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.Params.HObjectNew, ioctlParams.Params.HClass, obj, ioctlParams.Params.HObjectParent)
-		unpinCleanup.Release()
+		releaseObj.Release()
 		if fi.ctx.IsLogging(log.Debug) {
-			fi.ctx.Debugf("nvproxy: pinned %d bytes for OS descriptor with handle %v", arLen, ioctlParams.Params.HObjectNew)
+			fi.ctx.Debugf("nvproxy: pinned %d bytes for OS descriptor with handle %v", ioctlParams.Params.Limit+1, ioctlParams.Params.HObjectNew)
 		}
 	}
 	unlock()
@@ -691,6 +832,37 @@ func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	}
 
 	return n, nil
+}
+
+// pinOSDescriptor pins the application memory described by an
+// NV01_MEMORY_SYSTEM_OS_DESCRIPTOR allocation's address and limit, and returns
+// an osDescMem owning the pin and the address of an equivalent contiguous
+// mapping in the sentry. If the address or limit is invalid, it returns the
+// status that the host driver would.
+func pinOSDescriptor(fi *frontendIoctlState, pMemory nvgpu.P64, limit uint64, at hostarch.AccessType) (*osDescMem, uintptr, uint32, error) {
+	// Compare src/nvidia/arch/nvalloc/unix/src/escape.c:RmCreateOsDescriptor().
+	appAddr := addrFromP64(pMemory)
+	if !appAddr.IsPageAligned() {
+		return nil, 0, nvgpu.NV_ERR_NOT_SUPPORTED, nil
+	}
+	arLen := limit + 1
+	if arLen == 0 { // integer overflow
+		return nil, 0, nvgpu.NV_ERR_INVALID_LIMIT, nil
+	}
+	var ok bool
+	arLen, ok = hostarch.PageRoundUp(arLen)
+	if !ok {
+		return nil, 0, nvgpu.NV_ERR_INVALID_ADDRESS, nil
+	}
+	appAR, ok := appAddr.ToRange(arLen)
+	if !ok {
+		return nil, 0, nvgpu.NV_ERR_INVALID_ADDRESS, nil
+	}
+	am, m, err := mirrorAppRange(fi.ctx, fi.t, appAR, at)
+	if err != nil {
+		return nil, 0, nvgpu.NV_OK, err
+	}
+	return &osDescMem{appMirror: am}, m, nvgpu.NV_OK, nil
 }
 
 func rmDupObject(fi *frontendIoctlState) (uintptr, error) {
@@ -786,7 +958,7 @@ func rmControl(fi *frontendIoctlState) (uintptr, error) {
 		// Consequently, its parameters cannot reasonably contain pointers.
 		return rmControlSimple(fi, &ioctlParams)
 	}
-	// Implementors:
+	// Implementers:
 	// - Top two bytes of Cmd specifies class; third byte specifies category;
 	// fourth byte specifies "message ID" (command within class/category).
 	//   e.g. 0x800288:
@@ -868,6 +1040,40 @@ func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *front
 	ctrlParams.SetFrontendFD(ctlFile.hostFD)
 	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
 	ctrlParams.SetFrontendFD(origFD)
+	if err != nil {
+		return n, err
+	}
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// ctrlOsUnixMemacctGetLimits translates cgroupFd. Compare
+// src/nvidia/arch/nvalloc/unix/src/os.c:cliresCtrlCmdOsUnixMemacctGetLimits_IMPL().
+func ctrlOsUnixMemacctGetLimits(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	var ctrlParams nvgpu.NV0000_CTRL_OS_UNIX_MEMACCT_GET_LIMITS_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	origCgroupFD := ctrlParams.CgroupFD
+	if origCgroupFD != nvgpu.NV0000_CTRL_CMD_OS_UNIX_MEMACCT_CURRENT_PROCESS {
+		// The driver only accepts cgroup v2 directory FDs; see (Linux)
+		// kernel/cgroup/cgroup.c:cgroup_get_from_fd().
+		if _, err := fi.t.GetCgroup2NodeFromFD(uint64(origCgroupFD)); err != nil {
+			return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ARGUMENT)
+		}
+		// The sentry's cgroup is the nearest host ancestor of every sandbox
+		// cgroup, and is what the driver uses for CURRENT_PROCESS.
+		ctrlParams.CgroupFD = nvgpu.NV0000_CTRL_CMD_OS_UNIX_MEMACCT_CURRENT_PROCESS
+	}
+
+	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
+	ctrlParams.CgroupFD = origCgroupFD
 	if err != nil {
 		return n, err
 	}
@@ -1104,7 +1310,7 @@ func rmAlloc(fi *frontendIoctlState) (uintptr, error) {
 	if log.IsLogging(log.Debug) {
 		fi.ctx.Debugf("nvproxy: allocation class %v", ioctlParams.HClass)
 	}
-	// Implementors:
+	// Implementers:
 	// - To map hClass to a symbol, look in
 	// src/nvidia/generated/g_allclasses.h.
 	// - See src/nvidia/src/kernel/rmapi/resource_list.h for table mapping class
@@ -1197,6 +1403,50 @@ func rmAllocSimpleParams[Params any, PtrParams marshalPtr[Params]](fi *frontendI
 
 func rmAllocNoParams(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocInvoke[byte](fi, ioctlParams, nil, isNVOS64, addSimpleObjDepParentLocked)
+}
+
+// rmAllocEventBuffer handles NV_EVENT_BUFFER allocation.
+func rmAllocEventBuffer(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	var allocParams nvgpu.NV_EVENT_BUFFER_ALLOC_PARAMETERS
+	if _, err := allocParams.CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return 0, err
+	}
+	if allocParams.HBufferHeader.Val == 0 {
+		fi.ctx.Warningf("nvproxy: rejecting NV_EVENT_BUFFER allocation with HBufferHeader == 0 (no translation available)")
+		return 0, linuxerr.EINVAL
+	}
+
+	// notificationHandle is a frontend FD, which the driver translates for
+	// non-kernel clients; 0 leaves the event buffer without a notification
+	// handle. See
+	// src/nvidia/src/kernel/rmapi/event_buffer.c:eventbufferConstruct_IMPL()
+	// => osUserHandleToKernelPtr().
+	origNotificationHandle := allocParams.NotificationHandle
+	if origNotificationHandle != 0 {
+		eventFileGeneric, _ := fi.t.FDTable().Get(int32(origNotificationHandle))
+		if eventFileGeneric == nil {
+			return 0, linuxerr.EINVAL
+		}
+		defer eventFileGeneric.DecRef(fi.ctx)
+		eventFile, ok := eventFileGeneric.Impl().(*frontendFD)
+		if !ok {
+			return 0, linuxerr.EINVAL
+		}
+		allocParams.NotificationHandle = uint64(eventFile.hostFD)
+	}
+
+	n, err := rmAllocInvoke(fi, ioctlParams, &allocParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_EVENT_BUFFER_ALLOC_PARAMETERS) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, &miscObject{}, ioctlParams.HObjectParent, allocParams.HBufferHeader, allocParams.HRecordBuffer, allocParams.HVardataBuffer)
+	})
+	if err != nil {
+		return n, err
+	}
+
+	allocParams.NotificationHandle = origNotificationHandle
+	if _, err := allocParams.CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 func rmAllocRootClient(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
@@ -1308,6 +1558,14 @@ func rmAllocChannelGroup(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 	})
 }
 
+// rmAllocChannelGroupV615 is the same as rmAllocChannelGroup, but for
+// 615.71.09.
+func rmAllocChannelGroupV615(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V615) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
+	})
+}
+
 func rmAllocChannel(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_ALLOC_PARAMS) {
 		// See
@@ -1390,6 +1648,39 @@ func rmAllocIMEXSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 
 	allocParams.CapDescriptor = origCapDescriptor
 	allocParams.POsEvent = origEventFD
+	if _, err := allocParams.CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func rmAllocMNCCSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	var allocParams nvgpu.NV77CC_ALLOC_PARAMETERS
+	if _, err := allocParams.CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return 0, err
+	}
+
+	origCapDescriptor := allocParams.CapDescriptor
+	capsFileGeneric, _ := fi.t.FDTable().Get(int32(allocParams.CapDescriptor))
+	if capsFileGeneric == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer capsFileGeneric.DecRef(fi.ctx)
+	capsFile, ok := capsFileGeneric.Impl().(*openOnlyFD)
+	if !ok {
+		fi.ctx.Warningf("nvproxy: rmAllocMNCCSession got capDescriptor file of incompatible type %T", capsFileGeneric.Impl())
+		return 0, linuxerr.EINVAL
+	}
+	allocParams.CapDescriptor = uint64(capsFile.hostFD)
+
+	n, err := rmAllocInvoke(fi, ioctlParams, &allocParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV77CC_ALLOC_PARAMETERS) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, &miscObject{}, ioctlParams.HObjectParent)
+	})
+	if err != nil {
+		return n, err
+	}
+
+	allocParams.CapDescriptor = origCapDescriptor
 	if _, err := allocParams.CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
 		return n, err
 	}
@@ -1479,6 +1770,16 @@ func rmIdleChannels(fi *frontendIoctlState) (uintptr, error) {
 }
 
 func rmVidHeapControl(fi *frontendIoctlState) (uintptr, error) {
+	return rmVidHeapControlCommon(fi, false /* allowAllocOSDescriptor */)
+}
+
+// rmVidHeapControlWithOSDescriptor is rmVidHeapControl for drivers on which
+// NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR can be passed through.
+func rmVidHeapControlWithOSDescriptor(fi *frontendIoctlState) (uintptr, error) {
+	return rmVidHeapControlCommon(fi, true /* allowAllocOSDescriptor */)
+}
+
+func rmVidHeapControlCommon(fi *frontendIoctlState, allowAllocOSDescriptor bool) (uintptr, error) {
 	var ioctlParams nvgpu.NVOS32_PARAMETERS
 	if fi.ioctlParamsSize != nvgpu.SizeofNVOS32Parameters {
 		return 0, linuxerr.EINVAL
@@ -1497,10 +1798,13 @@ func rmVidHeapControl(fi *frontendIoctlState) (uintptr, error) {
 	switch ioctlParams.Function {
 	case nvgpu.NVOS32_FUNCTION_ALLOC_SIZE:
 		return rmVidHeapControlAllocSize(fi, &ioctlParams)
-	default:
-		fi.ctx.Warningf("nvproxy: %s for VID_HEAP_CONTROL function %d", errUndefinedHandler.Error(), ioctlParams.Function)
-		return 0, linuxerr.EINVAL
+	case nvgpu.NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR:
+		if allowAllocOSDescriptor {
+			return rmVidHeapControlAllocOSDescriptor(fi, &ioctlParams)
+		}
 	}
+	fi.ctx.Warningf("nvproxy: %s for VID_HEAP_CONTROL function %d", errUndefinedHandler.Error(), ioctlParams.Function)
+	return 0, linuxerr.EINVAL
 }
 
 func rmMapMemory(fi *frontendIoctlState) (uintptr, error) {

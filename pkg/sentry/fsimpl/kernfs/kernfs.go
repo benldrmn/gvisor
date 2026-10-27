@@ -130,6 +130,11 @@ type Filesystem struct {
 	// defaults to 0 and kernfs does not cache any dentries. This is immutable.
 	MaxCachedDentries uint64
 
+	// NoNegativeDentries preserves lookup errors during creation, including for
+	// names longer than NAME_MAX, as in Linux's fs/proc/generic.c:proc_lookup_de().
+	// Synthetic mountpoint creation is exempt. This is immutable.
+	NoNegativeDentries bool
+
 	// root is the root dentry of this filesystem. Note that root may be nil for
 	// filesystems on a disconnected mount without a root (e.g. pipefs, sockfs,
 	// hostfs). Filesystem holds an extra reference on root to prevent it from
@@ -188,6 +193,11 @@ func (fs *Filesystem) processDeferredDecRefs(ctx context.Context) {
 // VFSFilesystem returns the generic vfs filesystem object.
 func (fs *Filesystem) VFSFilesystem() *vfs.Filesystem {
 	return &fs.vfsfs
+}
+
+// RootDentry returns the root dentry of this filesystem.
+func (fs *Filesystem) RootDentry() *Dentry {
+	return fs.root
 }
 
 // NextIno allocates a new inode number on this filesystem.
@@ -337,6 +347,24 @@ func (d *Dentry) Invalidate(ctx context.Context) {
 	}
 	delete(parent.children, d.name)
 	parent.dirMu.Unlock()
+
+	d.fs.invalidateRemovedChildLocked(ctx, d.fs.vfsfs.VirtualFilesystem(), child)
+}
+
+// InvalidateChild invalidates the cached child dentry with the given name and
+// all of its descendants, if present.
+func (d *Dentry) InvalidateChild(ctx context.Context, name string) {
+	d.fs.mu.RLock()
+	defer d.fs.processDeferredDecRefs(ctx)
+	defer d.fs.mu.RUnlock()
+	d.dirMu.Lock()
+	child, ok := d.children[name]
+	if !ok {
+		d.dirMu.Unlock()
+		return
+	}
+	delete(d.children, name)
+	d.dirMu.Unlock()
 
 	d.fs.invalidateRemovedChildLocked(ctx, d.fs.vfsfs.VirtualFilesystem(), child)
 }

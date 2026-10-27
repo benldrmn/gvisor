@@ -13,23 +13,30 @@
 // limitations under the License.
 
 #include <errno.h>
+#include <linux/capability.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <algorithm>
-#include <climits>
 #include <string>
 #include <vector>
 
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
 #include "absl/algorithm/container.h"
-#include "absl/strings/numbers.h"
-#include "absl/strings/str_split.h"
+#include "absl/strings/str_format.h"
 #include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
+#include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
+#include "test/util/multiprocess_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/proc_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -79,18 +86,22 @@ TEST(RlimitTest, UnprivilegedSetRlimit) {
   // Drop privileges if necessary.
   AutoCapability cap(CAP_SYS_RESOURCE, false);
 
-  struct rlimit rl = {};
-  rl.rlim_cur = 1000;
-  rl.rlim_max = 20000;
-  EXPECT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
+  // Lowering the hard limit is irreversible without CAP_SYS_RESOURCE, so use a
+  // subprocess. Zero is valid regardless of the inherited limit and does not
+  // affect already-open descriptors.
+  EXPECT_THAT(InForkedProcess([] {
+                struct rlimit rl = {};
+                TEST_PCHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
 
-  struct rlimit rl2 = {};
-  EXPECT_THAT(getrlimit(RLIMIT_NOFILE, &rl2), SyscallSucceeds());
-  EXPECT_EQ(rl.rlim_cur, rl2.rlim_cur);
-  EXPECT_EQ(rl.rlim_max, rl2.rlim_max);
+                struct rlimit rl2 = {};
+                TEST_PCHECK(getrlimit(RLIMIT_NOFILE, &rl2) == 0);
+                TEST_CHECK(rl2.rlim_cur == 0);
+                TEST_CHECK(rl2.rlim_max == 0);
 
-  rl.rlim_max = 100000;
-  EXPECT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallFailsWithErrno(EPERM));
+                rl.rlim_max = 1;
+                TEST_CHECK_ERRNO(setrlimit(RLIMIT_NOFILE, &rl), EPERM);
+              }),
+              IsPosixErrorOkAndHolds(0));
 }
 
 TEST(RlimitTest, SetSoftRlimitAboveHard) {
@@ -109,7 +120,7 @@ TEST(RlimitTest, RlimitNProc) {
   // The native test can be run in a user namespace without a mapping for
   // kNobody or there can be other processes that are running from the kNobody
   // user.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
 
   // Run the test in a sub-thread to avoid changing UID of the current thread.
   ScopedThread([&] {
@@ -130,11 +141,12 @@ TEST(RlimitTest, RlimitNProc) {
       for (int i = 0; i < kNProc; i++) {
         pid_t pid = fork();
         if (pid == 0) {
-          while (1) {
-            sleep(1);
+          // Child process: Wait passively until the parent terminates us.
+          while (true) {
+            pause();
           }
-          _exit(1);
         }
+        // Parent process: Record the child's PID and continue the test.
         EXPECT_THAT(pid, SyscallSucceeds());
         pids[i] = pid;
       }
@@ -159,15 +171,42 @@ TEST(RlimitTest, RlimitNProc) {
 TEST(RlimitTest, SetRlimitRtPrio) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_RESOURCE)));
 
+  struct rlimit old_rl = {};
+  EXPECT_THAT(getrlimit(RLIMIT_RTPRIO, &old_rl), SyscallSucceeds());
+
   struct rlimit rl = {
       .rlim_cur = 5,
       .rlim_max = 10,
   };
-  EXPECT_THAT(setrlimit(RLIMIT_RTPRIO, &rl), SyscallSucceeds());
+  int const ret = setrlimit(RLIMIT_RTPRIO, &rl);
+  if (ret == -1 && rl.rlim_max > old_rl.rlim_max) {
+    // In a non-init user namespace, raising rlim_max above the current hard
+    // limit fails with EPERM because CAP_SYS_RESOURCE is required in the
+    // initial user namespace.
+    EXPECT_EQ(errno, EPERM);
+    return;
+  }
+  EXPECT_THAT(ret, SyscallSucceeds());
 
   EXPECT_THAT(getrlimit(RLIMIT_RTPRIO, &rl), SyscallSucceeds());
   EXPECT_EQ(rl.rlim_cur, 5);
   EXPECT_EQ(rl.rlim_max, 10);
+}
+
+TEST(RlimitTest, SetRlimitMsgqueue) {
+  struct rlimit rl = {};
+  ASSERT_THAT(getrlimit(RLIMIT_MSGQUEUE, &rl), SyscallSucceeds());
+  EXPECT_THAT(setrlimit(RLIMIT_MSGQUEUE, &rl), SyscallSucceeds());
+
+  if (rl.rlim_cur > 0) {
+    rl.rlim_cur--;
+  }
+  EXPECT_THAT(setrlimit(RLIMIT_MSGQUEUE, &rl), SyscallSucceeds());
+
+  struct rlimit got = {};
+  EXPECT_THAT(getrlimit(RLIMIT_MSGQUEUE, &got), SyscallSucceeds());
+  EXPECT_EQ(got.rlim_cur, rl.rlim_cur);
+  EXPECT_EQ(got.rlim_max, rl.rlim_max);
 }
 
 TEST(RlimitTest, ParseProcPidLimits) {

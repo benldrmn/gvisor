@@ -13,10 +13,10 @@ go_test(
         "trace_test.go",
     ],
     data = [
-        "//runsc",
+        "//:release",
         "//test/trace/workload",
     ],
-    library = ":trace",
+    embed = [":trace"],
     deps = [
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/points:points_go_proto",

@@ -12,11 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <asm-generic/errno-base.h>
+#include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <climits>
+#include <cstddef>
+#include <memory>
+#include <string>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/base/macros.h"
 #include "test/util/file_descriptor.h"
@@ -65,7 +71,7 @@ class CloseRangeTest : public ::testing::Test {
   void OpenFilesRdwr() {
     fds_.clear();
     fds_.reserve(file_names_.size());
-    for (std::string &file_name : file_names_) {
+    for (std::string& file_name : file_names_) {
       int fd;
       ASSERT_THAT(fd = open(file_name.c_str(), O_RDWR), SyscallSucceeds());
       fds_.push_back(fd);
@@ -74,7 +80,7 @@ class CloseRangeTest : public ::testing::Test {
 
  private:
   void TearDown() override {
-    for (std::string &name : file_names_) {
+    for (std::string& name : file_names_) {
       unlink(name.c_str());
     }
   }
@@ -216,8 +222,11 @@ TEST_F(CloseRangeTest, CloexecFlagTest) {
   int num_files_in_range = 10;
   unsigned int flags = CLOSE_RANGE_CLOEXEC;
 
-  // CLOEXEC is only available on >=5.11 kernels.
-  SKIP_IF(close_range(1, 0, flags) < 0 && errno == EINVAL);
+  // Probe a valid range without open descriptors: an invalid range also returns
+  // EINVAL on kernels that support CLOEXEC (Linux >=5.11).
+  SKIP_IF(!IsRunningOnGvisor() &&
+          close_range(UINT_MAX, UINT_MAX, CLOSE_RANGE_CLOEXEC) < 0 &&
+          errno == EINVAL);
 
   CreateFiles(num_files_in_range);
   OpenFilesRdwr();
@@ -321,8 +330,11 @@ TEST_F(CloseRangeTest, CloexecAndUnshareFlagTest) {
   int num_files_in_range = 10;
   unsigned int flags = CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE;
 
-  // CLOEXEC is only available on >=5.11 kernels.
-  SKIP_IF(close_range(1, 0, flags) < 0 && errno == EINVAL);
+  // Probe a valid range without open descriptors: an invalid range also returns
+  // EINVAL on kernels that support CLOEXEC (Linux >=5.11).
+  SKIP_IF(!IsRunningOnGvisor() &&
+          close_range(UINT_MAX, UINT_MAX, CLOSE_RANGE_CLOEXEC) < 0 &&
+          errno == EINVAL);
 
   CreateFiles(num_files_in_range);
   OpenFilesRdwr();

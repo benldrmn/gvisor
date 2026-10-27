@@ -23,7 +23,6 @@ import (
 	errgrpc "github.com/containerd/errdefs/pkg/errgrpc"
 	runc "github.com/containerd/go-runc"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 )
@@ -92,8 +91,11 @@ func (s *createdState) Start(ctx context.Context, restoreConf *extension.Restore
 		// To work around that, we treat non-root container in start/restore
 		// failure state as stopped.
 		if !s.p.Sandbox {
-			s.p.io.Close()
-			s.p.setExited(internalErrorCode)
+			// p.io is nil when the process was created with a terminal.
+			if s.p.io != nil {
+				s.p.io.Close()
+			}
+			s.p.setExited(InternalErrorCode)
 			s.transition(stopped)
 		}
 		return err
@@ -124,11 +126,7 @@ func (s *createdState) Exec(ctx context.Context, path string, r *ExecConfig) (ex
 }
 
 func (s *createdState) State(ctx context.Context) (string, error) {
-	state, err := s.p.state(ctx)
-	if err == nil && state == statusStopped {
-		s.transition(stopped)
-	}
-	return state, err
+	return s.p.state(ctx)
 }
 
 func (s *createdState) Stats(ctx context.Context, id string) (*runc.Stats, error) {
@@ -178,11 +176,7 @@ func (s *runningState) Exec(_ context.Context, path string, r *ExecConfig) (exte
 }
 
 func (s *runningState) State(ctx context.Context) (string, error) {
-	state, err := s.p.state(ctx)
-	if err == nil && state == "stopped" {
-		s.transition(stopped)
-	}
-	return state, err
+	return s.p.state(ctx)
 }
 
 func (s *runningState) Stats(ctx context.Context, id string) (*runc.Stats, error) {

@@ -80,16 +80,27 @@ type regularFile struct {
 	// Protected by dataMu.
 	seals uint32
 
+	// Note on struct alignment: seals (4 bytes) leaves 4 bytes of padding
+	// before size (atomicbitops.Uint64, which requires 8-byte alignment).
+	// The 1-byte boolean flags below are placed in this padding slot. Adding
+	// more than 4 bytes of flags after seals will push size to a new 8-byte
+	// word and increase regularFile struct size.
+
 	// initiallyUnlinked is true if this file was created using NewZeroFile or
 	// NewMemfd => newUnlinkedRegularFileDescription. initiallyUnlinked should
 	// be true when the equivalent shmem file in Linux would use
 	// shmem_anon_vm_ops rather than shmem_vm_ops.
 	//
 	// initiallyUnlinked is immutable, but stored here since it fits into
-	// alignment padding.
+	// alignment padding after seals.
 	initiallyUnlinked bool
 
+	// memfd is true if this file was created using NewMemfd.
+	// Immutable; fits in padding.
+	memfd bool
+
 	// huge is true if pages in this file may be hugepage-backed.
+	// Fits in padding.
 	huge bool
 
 	// size is the size of data.
@@ -101,10 +112,15 @@ type regularFile struct {
 	size atomicbitops.Uint64
 }
 
+// newRegularFile creates a new regular file.
+//
+// If parentDir is not nil, certain fields (such as setgid and default ACL) will be inherited
+// from parentDir.
 func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, parentDir *directory) (*inode, error) {
 	file := &regularFile{
 		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
+		huge:            fs.huge,
 	}
 	err := file.inode.init(file, fs, kuid, kgid, linux.S_IFREG|mode, parentDir)
 	if err != nil {
@@ -128,7 +144,7 @@ func newUnlinkedRegularFileDescription(ctx context.Context, creds *auth.Credenti
 		panic("tmpfs.newUnlinkedRegularFileDescription() called with non-tmpfs mount")
 	}
 
-	inode, err := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, 0777, nil /* parentDir */)
+	inode, err := fs.newRegularFile(creds.FilesystemKUID, creds.FilesystemKGID, 0777, nil /* parentDir */)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +189,10 @@ func NewMemfd(ctx context.Context, creds *auth.Credentials, mount *vfs.Mount, al
 	if err != nil {
 		return nil, err
 	}
+	rf := fd.inode().impl.(*regularFile)
+	rf.memfd = true
 	if allowSeals {
-		fd.inode().impl.(*regularFile).seals = 0
+		rf.seals = 0
 	}
 	return &fd.vfsfd, nil
 }
@@ -271,7 +289,7 @@ func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, a
 		pagesBefore := rf.writableMappingPages
 
 		// ar is guaranteed to be page aligned per memmap.Mappable.
-		rf.writableMappingPages += uint64(ar.Length() / hostarch.PageSize)
+		rf.writableMappingPages += uint64(ar.Length() >> hostarch.PageShift)
 
 		if rf.writableMappingPages < pagesBefore {
 			panic(fmt.Sprintf("Overflow while mapping potentially writable pages pointing to a tmpfs file. Before %v, after %v", pagesBefore, rf.writableMappingPages))
@@ -292,7 +310,7 @@ func (rf *regularFile) RemoveMapping(ctx context.Context, ms memmap.MappingSpace
 		pagesBefore := rf.writableMappingPages
 
 		// ar is guaranteed to be page aligned per memmap.Mappable.
-		rf.writableMappingPages -= uint64(ar.Length() / hostarch.PageSize)
+		rf.writableMappingPages -= uint64(ar.Length() >> hostarch.PageShift)
 
 		if rf.writableMappingPages > pagesBefore {
 			panic(fmt.Sprintf("Underflow while unmapping potentially writable pages pointing to a tmpfs file. Before %v, after %v", pagesBefore, rf.writableMappingPages))
@@ -310,11 +328,26 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	mayHuge := rf.huge && rf.inode.fs.mf.HugepagesEnabled()
 
+	// Constrain allocation to required, rounded to the nearest
+	// faultAroundAlignment.
+	faultAroundAlignment := uint64(64 << 10) // 64 KB, matches Linux's default fault_around_pages
+	if mayHuge {
+		faultAroundAlignment = hostarch.HugePageSize
+	}
+	faultAroundMask := faultAroundAlignment - 1
+	fillRange := memmap.MappableRange{
+		Start: required.Start &^ faultAroundMask,
+		End:   required.End,
+	}
+	if fillEnd := (required.End + faultAroundMask) &^ faultAroundMask; fillRange.End < fillEnd { // no overflow
+		fillRange.End = fillEnd
+	}
+
 	rf.dataMu.Lock()
 	defer rf.dataMu.Unlock()
 
-	// Constrain translations to f.attr.Size (rounded up) to prevent
-	// translation to pages that may be concurrently truncated.
+	// Constrain both allocation and translation to f.attr.Size (rounded up) to
+	// avoid pages that may be concurrently truncated.
 	pgend := offsetPageEnd(int64(rf.size.RacyLoad()))
 	var beyondEOF bool
 	if required.End > pgend {
@@ -324,17 +357,13 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		beyondEOF = true
 		required.End = pgend
 	}
+	if fillRange.End > pgend {
+		fillRange.End = pgend
+	}
 	if optional.End > pgend {
 		optional.End = pgend
 	}
 
-	// fillRange bounds how far Translate allocates ("fills") ahead of the
-	// faulting page. It is kept small to bound speculative allocation against
-	// tmpfs size limits (see filesystem.accountPages): a fault that touches a
-	// hole must not commit an unbounded number of pages and prematurely exhaust
-	// the mount's size limit. This matches gofer.maxFillRange().
-	const maxFillBytes = 64 << 10 // 64 KiB
-	fillRange := maxOptionalRange(required, optional, maxFillBytes)
 	pagesToFill := rf.data.PagesToFill(required, fillRange)
 	if !rf.inode.fs.accountPages(pagesToFill) {
 		// If we can not accommodate pagesToFill pages, then retry with just
@@ -346,9 +375,18 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		}
 		fillRange = required
 	}
+	// The first access to any page of a huge page commits all of it, so when
+	// the fill is whole huge pages that each contain part of required, the
+	// application commits every page of the fill as soon as it touches it.
+	// Existing pages in the range make Fill() allocate small pages instead.
+	allocMode := pgalloc.AllocateUncommitted
+	if mayHuge && hostarch.IsHugePageAligned(fillRange.Start) && hostarch.IsHugePageAligned(fillRange.End) && pagesToFill<<hostarch.PageShift == fillRange.Length() {
+		allocMode = pgalloc.AllocateCallerIndirectCommit
+	}
 	pagesAlloced, cerr := rf.data.Fill(ctx, required, fillRange, rf.size.RacyLoad(), rf.inode.fs.mf, pgalloc.AllocOpts{
 		Kind:    rf.memoryUsageKind,
 		MemCgID: memCgID,
+		Mode:    allocMode,
 		Huge:    mayHuge,
 	}, nil)
 	// rf.data.Fill() may fail mid-way. We still want to account any pages that
@@ -412,6 +450,11 @@ func maxOptionalRange(required, optional memmap.MappableRange, maxBytes uint64) 
 	return optional
 }
 
+// MayUseHugepages implements memmap.Mappable.MayUseHugepages.
+func (rf *regularFile) MayUseHugepages() bool {
+	return rf.huge && rf.inode.fs.mf.HugepagesEnabled()
+}
+
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 func (*regularFile) InvalidateUnsavable(context.Context) error {
 	return nil
@@ -471,6 +514,7 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		// Advance curPgStart.
 		curPgStart = curPgEnd
 	}
+	f.inode.touchCMtimeLocked()
 	return nil
 }
 
@@ -845,7 +889,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		case gap.Ok():
 			// Allocate memory for the write.
 			gapMR := gap.Range().Intersect(pgMR)
-			pagesToFill := gapMR.Length() / hostarch.PageSize
+			pagesToFill := gapMR.Length() >> hostarch.PageShift
 			pagesReserved := fs.accountPagesPartial(pagesToFill)
 			if pagesReserved == 0 {
 				if done == 0 {
@@ -855,7 +899,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 				retErr = nil
 				goto exitLoop
 			}
-			gapMR.End = gapMR.Start + (hostarch.PageSize * pagesReserved)
+			gapMR.End = gapMR.Start + (uint64(hostarch.PageSize) * pagesReserved)
 			allocMode := pgalloc.AllocateAndWritePopulate
 			if fs.mf.IsDiskBacked() {
 				// Don't populate pages for disk-backed files. Benchmarking showed that
@@ -898,13 +942,18 @@ exitLoop:
 	return done, retErr
 }
 
+// hostWriteThreshold is the smallest contiguous write to a disk-backed
+// MemoryFile that is issued as a host write syscall rather than copied
+// through the internal mapping. Disk-backed pages are not pre-populated, so
+// copying faults them in one by one, while a single write syscall faults
+// them all at once. Below the threshold the syscall dominates: on platforms
+// where the sentry runs in guest mode (KVM) a host syscall costs a VM exit,
+// far more than a page fault, and rewrites of already-populated pages cost
+// nothing when copied.
+var hostWriteThreshold = 16 * uint64(hostarch.PageSize)
+
 func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.BlockSeq) (uint64, error) {
-	if rw.file.inode.fs.mf.IsDiskBacked() {
-		// Disk-backed files are not prepopulated. The safemem.CopySeq() approach
-		// used below incurs a lot of page faults without page prepopulation, which
-		// causes a lot of context switching. Use write(2) host syscall instead,
-		// which makes one context switch and faults all the pages that are touched
-		// during the write.
+	if rw.file.inode.fs.mf.IsDiskBacked() && fr.Length() >= hostWriteThreshold {
 		fd, err := rw.file.inode.fs.mf.DataFD(fr)
 		if err != nil {
 			return 0, err
@@ -964,4 +1013,28 @@ func AddSeals(fd *vfs.FileDescription, val uint32) error {
 	// Seals can only be added, never removed.
 	rf.seals |= val
 	return nil
+}
+
+// IsMemfd returns whether fd represents a memfd.
+func IsMemfd(fd *vfs.FileDescription) bool {
+	if fd == nil {
+		return false
+	}
+	return IsMemfdDentry(fd.Dentry())
+}
+
+// IsMemfdDentry returns whether d represents a memfd.
+func IsMemfdDentry(d *vfs.Dentry) bool {
+	if d == nil {
+		return false
+	}
+	f, ok := d.Impl().(*dentry)
+	if !ok {
+		return false
+	}
+	rf, ok := f.inode.impl.(*regularFile)
+	if !ok {
+		return false
+	}
+	return rf.memfd
 }

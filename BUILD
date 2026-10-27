@@ -1,5 +1,10 @@
+load("@bazel_lib//lib:write_source_files.bzl", "write_source_files")
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
+load("//tools:gazelle.bzl", "GAZELLE_PACKAGES")
+load("//tools:release.bzl", "RELEASE_RUNSC", "RELEASE_SIDECARS", "release_files")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
 load("//website:defs.bzl", "doc")
@@ -15,11 +20,37 @@ license(
 )
 
 exports_files([
+    "CODEOWNERS",
     "LICENSE",
     "README.md",
     "SECURITY.md",
     "GOVERNANCE.md",
+    "MAINTAINERS.md",
+    "ADOPTERS.md",
 ])
+
+write_source_files(
+    name = "governance-regen",
+    files = {
+        "CODEOWNERS": "//governance:generated/CODEOWNERS",
+        "MAINTAINERS.md": "//governance:generated/MAINTAINERS.md",
+    },
+)
+
+test_suite(
+    name = "governance-check",
+    tests = [":governance-regen_tests"],
+)
+
+release_files(
+    name = "release",
+    bins = [
+        "//shim:containerd-shim-runsc-v1",
+    ],
+    runsc = RELEASE_RUNSC,
+    sidecars = RELEASE_SIDECARS,
+    visibility = ["//visibility:public"],
+)
 
 nogo_config(
     name = "nogo_config",
@@ -58,6 +89,16 @@ doc(
 )
 
 doc(
+    name = "adopters",
+    src = "ADOPTERS.md",
+    category = "Project",
+    permalink = "/users/",
+    subcategory = "Community",
+    visibility = ["//website:__pkg__"],
+    weight = "25",
+)
+
+doc(
     name = "code_of_conduct",
     src = "CODE_OF_CONDUCT.md",
     category = "Project",
@@ -73,10 +114,53 @@ yaml_test(
     schema = "//tools/nogo/config:schema.json",
 )
 
+GITHUB_WORKFLOWS = glob(
+    [
+        ".github/workflows/**/*.yaml",
+        ".github/workflows/**/*.yml",
+    ],
+    allow_empty = True,
+) or fail("No GitHub workflow YAML files were found")
+
+filegroup(
+    name = "github_workflows",
+    srcs = GITHUB_WORKFLOWS,
+)
+
 yaml_test(
     name = "github_workflows_test",
-    srcs = glob([".github/workflows/*.yml"]),
+    srcs = [":github_workflows"],
     schema = "@github_workflow_schema//file",
+)
+
+# actionlint discovers project configuration and local actions by finding .git.
+# It only stats the marker; Git metadata and history are not needed.
+write_file(
+    name = "actionlint_project_marker",
+    out = ".git",
+    content = [],
+)
+
+# A real runfiles tree is needed for project/configuration discovery. On
+# Windows, enable Bazel symlink support and pass --enable_runfiles.
+native_test(
+    name = "github_actions_test",
+    src = "//tools/actionlint",
+    args = [
+        "-no-color",
+        "-oneline",
+        "-shellcheck=",
+        "-pyflakes=",
+    ] + ['"$(rootpath %s)"' % workflow for workflow in GITHUB_WORKFLOWS],
+    # These optional configuration files may be absent.
+    # buildifier: disable=constant-glob
+    data = GITHUB_WORKFLOWS + [":actionlint_project_marker"] + glob(
+        [
+            ".github/actionlint.yaml",
+            ".github/actionlint.yml",
+        ],
+        allow_empty = True,
+    ),
 )
 
 filegroup(
@@ -104,6 +188,7 @@ build_test(
     targets = [
         "//test/e2e:integration_test",
         "//test/image:image_test",
+        "//test/root:crictl_test",
         "//test/root:root_test",
         "//test/benchmarks/base:startup_test",
         "//test/benchmarks/base:size_test",
@@ -139,6 +224,7 @@ go_path(
         # binaries have been factored into a cli package, which is
         # a good practice in any case.
         "//runsc/cli/maincli",
+        "//runsc/cli/sentrycli",
         "//shim/v1/cli",
         "//webhook/pkg/cli",
         "//tools/checklocks",
@@ -160,7 +246,10 @@ go_path(
         "//pkg/tcpip/sample/tun_tcp_connect",
         "//pkg/tcpip/sample/tun_tcp_echo",
         "//pkg/tcpip/transport/tcpconntrack",
+        "//runsc/checkpointgofer/gcs",
+        "//runsc/metricserver",
         "//sandboxexec/sandbox",
+        "//tools/xdp/cmd",
     ],
 )
 
@@ -186,13 +275,54 @@ toolchain(
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 
-# gazelle is a set of build tools.
+# gazelle generates Go BUILD rules from sources.
 #
-# To update the WORKSPACE from go.mod, use:
-#   bazel run //:gazelle -- update-repos -from_file=go.mod
+# Packages listed in GAZELLE_PACKAGES must match gazelle's output; presubmit
+# runs //:gazelle_check to enforce this. To fix them, run:
+#   make gazelle-fix
+#
+# gazelle:prefix gvisor.dev/gvisor
+# gazelle:go_naming_convention import
+# gazelle:go_naming_convention_external go_default_library
+# gazelle:map_kind go_binary go_binary //tools:defs.bzl
+# gazelle:map_kind go_library go_library //tools:defs.bzl
+# gazelle:map_kind go_test go_test //tools:defs.bzl
+#
+# proto_library is a macro whose Go targets gazelle cannot see.
+# gazelle:proto disable_global
+# gazelle:resolve_regexp go ^gvisor\.dev/gvisor/(.+)/([^/]+)_go_proto$ //$1:${2}_go_proto
+#
+# These packages name a proto_library and a go_library alike, which gazelle
+# rejects when loading the BUILD file.
+# gazelle:exclude pkg/eventchannel
+# gazelle:exclude pkg/metric
+# gazelle:exclude pkg/sentry/strace
 gazelle(name = "gazelle")
+
+# Gazelle indexes go_library rules by importpath, which unmigrated BUILD files
+# omit, so resolve gvisor.dev/gvisor imports by path instead (-index=none).
+GAZELLE_ARGS = [
+    "-index=none",
+    "-r=false",
+] + GAZELLE_PACKAGES
+
+gazelle(
+    name = "gazelle_check",
+    args = GAZELLE_ARGS,
+    mode = "diff",
+)
+
+gazelle(
+    name = "gazelle_fix",
+    args = GAZELLE_ARGS,
+)
 
 exports_files([
     "go.sum",
     "go.mod",
 ])
+
+exports_files(
+    [".clang-format"],
+    visibility = ["//tools:__pkg__"],
+)

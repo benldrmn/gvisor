@@ -24,7 +24,6 @@ import (
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // payloadSet is an operation that sets data in the packet payload to the value
@@ -99,6 +98,12 @@ func (op *payloadSet) deepCopy() operation {
 	return &opCopy
 }
 
+// updateReferences implements operation.updateReferences.
+func (op *payloadSet) updateReferences(table *Table, sourceTable *Table, sourceOp operation) {}
+
+// destroy implements operation.destroy.
+func (op *payloadSet) destroy() {}
+
 // evaluate for PayloadSet sets data in the packet payload to the value in the
 // source register.
 func (op payloadSet) evaluate(regs *registerSet, evalCtx opEvalCtx) {
@@ -110,7 +115,7 @@ func (op payloadSet) evaluate(regs *registerSet, evalCtx opEvalCtx) {
 
 	// Breaks if could not retrieve packet data.
 	if payload == nil || len(payload) < offset+op.blen {
-		regs.verdict = stack.NFVerdict{Code: VC(linux.NFT_BREAK)}
+		regs.verdict = Verdict{Code: VC(linux.NFT_BREAK)}
 		return
 	}
 
@@ -119,6 +124,12 @@ func (op payloadSet) evaluate(regs *registerSet, evalCtx opEvalCtx) {
 
 	// Returns early if the source data is the same as the existing payload data.
 	if slices.Equal(regData, payload[offset:offset+op.blen]) {
+		return
+	}
+	// A failed checksum lookup must not modify the packet. Check before the
+	// deferred payload write, which also runs when evaluation returns early.
+	if op.csumType == linux.NFT_PAYLOAD_CSUM_INET && int(op.csumOffset)+2 > len(payload) {
+		regs.verdict = Verdict{Code: VC(linux.NFT_BREAK)}
 		return
 	}
 
@@ -160,11 +171,23 @@ func (op payloadSet) evaluate(regs *registerSet, evalCtx opEvalCtx) {
 		// Reads the old checksum from the packet payload.
 		oldTotalCsum := binary.BigEndian.Uint16(payload[op.csumOffset:])
 
+		updateUDPCsum := op.base == linux.NFT_PAYLOAD_TRANSPORT_HEADER && pkt.TransportProtocolNumber == header.UDPProtocolNumber
+
+		// If the UDP checksum is 0, it means the checksum is not set.
+		if updateUDPCsum && oldTotalCsum == 0 {
+			return
+		}
+
 		// New Total = Old Total - Old Data + New Data
 		// Logic is very similar to checksum.checksumUpdate2ByteAlignedUint16
 		// in gvisor/pkg/tcpip/header/checksum.go
 		newTotalCsum := checksum.Combine(^oldTotalCsum, checksum.Combine(newDataCsum, ^oldDataCsum))
-		checksum.Put(payload[op.csumOffset:], ^newTotalCsum)
+		csum := ^newTotalCsum
+		// If the UDP checksum is 0, set it to all ones.
+		if updateUDPCsum && csum == 0 {
+			csum = 0xFFFF
+		}
+		checksum.Put(payload[op.csumOffset:], csum)
 	}
 
 	// Separately updates the L4 checksum if the pseudo-header flag is set.
@@ -189,8 +212,16 @@ func (op payloadSet) evaluate(regs *registerSet, evalCtx opEvalCtx) {
 				transport = header.IGMP(tBytes)
 			}
 			if transport != nil { // only updates if the transport header is present.
+				isUDP := pkt.TransportProtocolNumber == header.UDPProtocolNumber
+				if isUDP && transport.Checksum() == 0 {
+					return
+				}
 				// New Total = Old Total - Old Data + New Data (same as above)
-				transport.SetChecksum(^checksum.Combine(^transport.Checksum(), checksum.Combine(newDataCsum, ^oldDataCsum)))
+				csum := ^checksum.Combine(^transport.Checksum(), checksum.Combine(newDataCsum, ^oldDataCsum))
+				if isUDP && csum == 0 {
+					csum = 0xFFFF
+				}
+				transport.SetChecksum(csum)
 			}
 		}
 	}
@@ -202,7 +233,7 @@ func (op payloadSet) GetExprName() string {
 
 func (op payloadSet) Dump() ([]byte, *syserr.AnnotatedError) {
 	m := &nlmsg.Message{}
-	m.PutAttr(linux.NFTA_PAYLOAD_SREG, nlmsg.PutU32(formatRegIdxForDump(op.sregIdx)))
+	m.PutAttr(linux.NFTA_PAYLOAD_SREG, formatRegIdxForDump(op.sregIdx))
 	m.PutAttr(linux.NFTA_PAYLOAD_BASE, nlmsg.PutU32(uint32(op.base)))
 	m.PutAttr(linux.NFTA_PAYLOAD_OFFSET, nlmsg.PutU32(uint32(op.offset)))
 	m.PutAttr(linux.NFTA_PAYLOAD_LEN, nlmsg.PutU32(uint32(op.blen)))

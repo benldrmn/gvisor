@@ -33,6 +33,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 
@@ -55,14 +56,8 @@ var (
 	releaseTagsErr error
 )
 
-// Hack! factFacts only provides facts loaded from directly imported packages
-// for efficiency (see importer.cache). In general, if you need a fact from a
-// package that isn't otherwise imported, the expectation is that you will add
-// a dummy import/use of the desired package to ensure it is a dependency.
-//
-// Unfortunately, some packages need facts from internal packages. Since
-// internal packages cannot be imported we explicitly import in this tool to
-// ensure the facts are available to ImportPackageFact.
+// Preload type information needed to decode facts from internal packages that
+// analyzed packages cannot import directly.
 var internalPackages = []string{
 	// Required by pkg/sync for internal/abi.MapType.
 	"internal/abi",
@@ -145,12 +140,25 @@ type importer struct {
 
 	analyzers map[*analysis.Analyzer]analyzer
 
-	// mu protects cache & bundles (see below).
-	mu    sync.Mutex
-	cache map[string]*importerEntry // key is package path (see sources above).
+	// mu protects cache, bundles, and factsErr (see below).
+	mu sync.Mutex
 
-	// bundles is protected by mu, but once set is immutable.
+	// cache is keyed by package path (see sources above).
+	//
+	// +checklocks:mu
+	cache map[string]*importerEntry
+
+	// bundles and each bundle's decoded-package cache are protected by mu.
+	// A bundle has no link to this importer, so checklocks cannot express
+	// that protection for the bundle's internal cache.
+	//
+	// +checklocks:mu
 	bundles []*facts.Bundle
+
+	// factsErr is the first error loading package facts.
+	//
+	// +checklocks:mu
+	factsErr error
 
 	// importsMu protects imports.
 	importsMu sync.Mutex
@@ -159,8 +167,7 @@ type importer struct {
 
 // loadBundles loads all bundle files.
 //
-// This should only be called from loadFacts, below. After calling this
-// function, i.bundles may be read freely without holding a lock.
+// This should only be called from loadFacts, below.
 func (i *importer) loadBundles() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -187,9 +194,8 @@ func (i *importer) loadBundles() error {
 
 // loadFacts returns all package facts for the given name.
 //
-// This should be called only from importPackage, as this may deserialize a
-// facts file (which is an expensive operation). Callers should generally rely
-// on fastFacts to access facts for packages that have already been imported.
+// This may deserialize a facts file. Callers should generally use fastFacts
+// to cache the result.
 func (i *importer) loadFacts(pkg *types.Package) (*facts.Package, error) {
 	// Attempt to load from the fact map.
 	filename, ok := flags.FactMap[pkg.Path()]
@@ -211,7 +217,10 @@ func (i *importer) loadFacts(pkg *types.Package) (*facts.Package, error) {
 		return nil, fmt.Errorf("error loading bundles: %w", err)
 	}
 
-	// Try to import from the bundle.
+	// Bundle.Package memoizes decoded packages, including across concurrent
+	// requests for facts from different packages.
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	for _, bundleFacts := range i.bundles {
 		localFacts, err := bundleFacts.Package(pkg)
 		if err != nil {
@@ -233,10 +242,14 @@ func (i *importer) loadFacts(pkg *types.Package) (*facts.Package, error) {
 func (i *importer) fastFacts(pkg *types.Package) *facts.Package {
 	i.mu.Lock()
 	e, ok := i.cache[pkg.Path()]
-	i.mu.Unlock()
 	if !ok {
-		return nil
+		// Export data can introduce a package without importPackage. Cache
+		// its facts, but leave pkg nil so a later import still loads types
+		// or analyzes source instead of treating this as a completed import.
+		e = new(importerEntry)
+		i.cache[pkg.Path()] = e
 	}
+	i.mu.Unlock()
 
 	e.factsMu.Lock()
 	defer e.factsMu.Unlock()
@@ -249,9 +262,12 @@ func (i *importer) fastFacts(pkg *types.Package) *facts.Package {
 	// Load the facts.
 	facts, err := i.loadFacts(pkg)
 	if err != nil {
-		// There are no facts available, but no good way to propagate
-		// this minor error. It may be intentional that no analysis was
-		// performed on some part of the standard library, for example.
+		// Optional fact absence is not an error; unreadable inputs are.
+		i.mu.Lock()
+		if i.factsErr == nil {
+			i.factsErr = fmt.Errorf("loading facts for %q: %w", pkg.Path(), err)
+		}
+		i.mu.Unlock()
 		return nil
 	}
 	e.facts = facts // Cache the result.
@@ -517,6 +533,20 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 	// If packages are available locally, we can refer to those directly.
 	astFacts := facts.NewPackage()
 
+	// Analysis can refer to a package through a field or method selection on
+	// an imported type without importing that package directly.
+	packageFacts := map[*types.Package]*facts.Package{astPackage: astFacts}
+	for _, pkg := range astPackage.Imports() {
+		packageFacts[pkg] = i.fastFacts(pkg)
+	}
+	for _, obj := range typesInfo.Uses {
+		if pkg := obj.Pkg(); pkg != nil {
+			if _, ok := packageFacts[pkg]; !ok {
+				packageFacts[pkg] = i.fastFacts(pkg)
+			}
+		}
+	}
+
 	// Recursively visit all analyzers.
 	var (
 		resultsMu sync.RWMutex // protects results & errs, findings.
@@ -526,13 +556,21 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 		errs      = make(map[*analysis.Analyzer]error)
 		findings  = make(FindingSet, 0)
 	)
+	sortedAnalyzers := make([]*analysis.Analyzer, 0, len(i.analyzers))
 	for a := range i.analyzers {
+		sortedAnalyzers = append(sortedAnalyzers, a)
+	}
+	sort.Slice(sortedAnalyzers, func(i, j int) bool {
+		return sortedAnalyzers[i].Name < sortedAnalyzers[j].Name
+	})
+	for _, a := range sortedAnalyzers {
 		wg := new(sync.WaitGroup)
 		wg.Add(1) // For analysis.
 		ready[a] = wg
 	}
 	limit := make(chan struct{}, 1)
-	for a, wg := range ready {
+	for _, a := range sortedAnalyzers {
+		wg := ready[a]
 		go func(a *analysis.Analyzer, wg *sync.WaitGroup) {
 			defer wg.Done()
 
@@ -625,30 +663,12 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 				AllPackageFacts: func() (rv []analysis.PackageFact) {
 					factsMu.RLock()
 					defer factsMu.RUnlock()
-					// Pull all dependencies.
-					for _, importedPkg := range astPackage.Imports() {
-						otherFacts := i.fastFacts(importedPkg)
-						if otherFacts == nil {
-							continue
-						}
+					for pkg, fs := range packageFacts {
 						for typ := range localFactTypes {
-							v := reflect.New(typ.Elem())
-							if otherFacts.ImportFact(nil, v.Interface().(analysis.Fact)) {
-								rv = append(rv, analysis.PackageFact{
-									Package: importedPkg,
-									Fact:    v.Interface().(analysis.Fact),
-								})
+							fact := reflect.New(typ.Elem()).Interface().(analysis.Fact)
+							if fs.ImportFact(nil, fact) {
+								rv = append(rv, analysis.PackageFact{Package: pkg, Fact: fact})
 							}
-						}
-					}
-					// Pull all local facts.
-					for typ := range localFactTypes {
-						v := reflect.New(typ.Elem())
-						if astFacts.ImportFact(nil, v.Interface().(analysis.Fact)) {
-							rv = append(rv, analysis.PackageFact{
-								Package: astPackage,
-								Fact:    v.Interface().(analysis.Fact),
-							})
 						}
 					}
 					return
@@ -656,15 +676,19 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 				AllObjectFacts: func() (rv []analysis.ObjectFact) {
 					factsMu.RLock()
 					defer factsMu.RUnlock()
-					// Pull all local facts.
-					for obj := range astFacts.Objects {
-						for typ := range localFactTypes {
-							v := reflect.New(typ.Elem())
-							if astFacts.ImportFact(obj, v.Interface().(analysis.Fact)) {
-								rv = append(rv, analysis.ObjectFact{
-									Object: obj,
-									Fact:   v.Interface().(analysis.Fact),
-								})
+					for _, fs := range packageFacts {
+						if fs == nil {
+							continue
+						}
+						for obj := range fs.Objects {
+							if obj == nil {
+								continue // Package facts are not object facts.
+							}
+							for typ := range localFactTypes {
+								fact := reflect.New(typ.Elem()).Interface().(analysis.Fact)
+								if fs.ImportFact(obj, fact) {
+									rv = append(rv, analysis.ObjectFact{Object: obj, Fact: fact})
+								}
 							}
 						}
 					}
@@ -716,6 +740,12 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 	for _, wg := range ready {
 		// Wait for completion.
 		wg.Wait()
+	}
+	i.mu.Lock()
+	factsErr := i.factsErr
+	i.mu.Unlock()
+	if factsErr != nil {
+		return astPackage, findings, astFacts, factsErr
 	}
 	for a := range ready {
 		// Check the error. If we generate an error here, we report
@@ -778,13 +808,24 @@ func Package(path string, srcs []string) (FindingSet, facts.Serializer, error) {
 	return findings, facts, nil
 }
 
-// allFactsAndFindings returns all factsAndFindings from an importer.
+// allFactsAndFindings returns the collected findings and package facts.
+//
+// Imports and analysis must have completed: mu does not protect the cached
+// entries' findings and facts.
+//
+// +checklocks:i.mu
 func (i *importer) allFactsAndFindings() (FindingSet, *facts.Bundle) {
 	var (
 		findings = make(FindingSet, 0)
 		allFacts = facts.NewBundle()
 	)
-	for path, entry := range i.cache {
+	paths := make([]string, 0, len(i.cache))
+	for path := range i.cache {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		entry := i.cache[path]
 		findings = append(findings, entry.findings...)
 		if entry.facts != nil {
 			allFacts.Add(path, entry.facts)
@@ -814,7 +855,8 @@ func TemplateFuncs(path string, srcs []string) (map[string]any, any, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	_, allFacts := i.allFactsAndFindings()
+	// checkPackage joined all analyzers; this private importer is quiescent.
+	_, allFacts := i.allFactsAndFindings() // +checklocksignore
 	funcMap, err := facts.ResolveFuncs(pkg, localFacts, allFacts)
 	if err != nil {
 		return nil, nil, err
@@ -856,7 +898,7 @@ func SplitStdPackages(srcs []string, srcRootPrefix string) (map[string][]string,
 	sources := make(map[string][]string)
 	for _, filename := range srcs {
 		if !strings.HasPrefix(filename, srcRootPrefix) {
-			continue // Superflouous file.
+			continue // Superfluous file.
 		}
 		d := path.Dir(filename)
 		if len(srcRootPrefix) >= len(d) {
@@ -919,13 +961,19 @@ func Bundle(sources map[string][]string, roots []string) (FindingSet, facts.Seri
 		imports:   make(map[string]*types.Package),
 		analyzers: allAnalyzers,
 	}
+	pkgs := make([]string, 0, len(sources))
 	for pkg := range sources {
+		pkgs = append(pkgs, pkg)
+	}
+	sort.Strings(pkgs)
+	for _, pkg := range pkgs {
 		// Was there an error processing this package?
 		if _, err := i.importPackage(pkg, ""); err != nil {
 			return nil, nil, err
 		}
 	}
 
-	findings, facts := i.allFactsAndFindings()
+	// All imports and their analyzers completed; this importer is quiescent.
+	findings, facts := i.allFactsAndFindings() // +checklocksignore
 	return findings, facts, nil
 }

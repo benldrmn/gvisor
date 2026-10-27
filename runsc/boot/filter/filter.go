@@ -17,10 +17,13 @@
 package filter
 
 import (
+	"errors"
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
+	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/runsc/boot/filter/config"
 )
 
@@ -33,8 +36,17 @@ const debugFilter = false
 // Options is a re-export of the config Options type under this package.
 type Options = config.Options
 
+// HostVendorSyscalls returns the vendor-specific syscalls that may be used on
+// the current host.
+func HostVendorSyscalls() precompiledseccomp.VarSyscallNumbers {
+	return config.HostVendorSyscalls()
+}
+
 // Install seccomp filters based on the given platform.
-func Install(opt Options) error {
+//
+// timer, if non-nil, is used to record the duration of the individual steps
+// of filter installation. It may be nil.
+func Install(opt Options, timer *timing.Timer) error {
 	for _, warning := range config.Warnings(opt) {
 		log.Warningf("*** SECCOMP WARNING: %s", warning)
 	}
@@ -44,17 +56,21 @@ func Install(opt Options) error {
 		vars := opt.Vars()
 		log.Debugf("Loaded precompiled seccomp instructions for options %v, using variables: %v", key, vars)
 		insns, err := precompiled.RenderInstructions(vars)
-		if err != nil {
+		if err == nil {
+			timer.Reached("precompiled seccomp program rendered")
+			return seccomp.SetFilter(insns)
+		}
+		if !errors.Is(err, precompiledseccomp.ErrSyscallVarsNotRenderable) {
 			return fmt.Errorf("cannot render precompiled program for options %v / vars %v: %w", key, vars, err)
 		}
-		return seccomp.SetFilter(insns)
+		log.Warningf("Cannot use precompiled program for config options %v (%v), building seccomp program from scratch. This slows down sandbox startup.", key, err)
 	}
 	seccompOpts := config.SeccompOptions(opt)
 	if debugFilter {
 		log.Infof("Seccomp filter debugging is enabled; seccomp failures will result in a panic stack trace.")
 		seccompOpts.DefaultAction = seccomp.Trap
-	} else {
-		log.Infof("No precompiled program found for config options %v, building seccomp program from scratch. This may slow down container startup.", key)
+	} else if !usePrecompiled {
+		log.Warningf("No precompiled program found for config options %v, building seccomp program from scratch. This slows down sandbox startup.", key)
 		if log.IsLogging(log.Debug) {
 			precompiledKeys := ListPrecompiled()
 			log.Debugf("Precompiled seccomp-bpf program configuration option variants (%d):", len(precompiledKeys))
@@ -64,6 +80,7 @@ func Install(opt Options) error {
 		}
 	}
 	rules, denyRules := config.Rules(opt)
+	timer.Reached("seccomp rules computed")
 	program := &seccomp.Program{
 		RuleSets: []seccomp.RuleSet{
 			{
@@ -76,5 +93,5 @@ func Install(opt Options) error {
 		},
 		Options: seccompOpts,
 	}
-	return program.Install()
+	return program.Install(timer)
 }

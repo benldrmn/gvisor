@@ -1,5 +1,5 @@
 load("//pkg/sync/locking:locking.bzl", "declare_mutex")
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
@@ -173,6 +173,7 @@ go_library(
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
+        ":pgalloc_metadata_go_proto",
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/bitmap",
@@ -197,6 +198,7 @@ go_library(
         "//pkg/syncevent",
         "//pkg/timing",
         "//pkg/usermem",
+        "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -207,10 +209,19 @@ go_test(
     srcs = [
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
+        "save_restore_test.go",
     ],
-    library = ":pgalloc",
+    embed = [":pgalloc"],
     deps = [
         "//pkg/hostarch",
+        "//pkg/memutil",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/state/stateio",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+proto_library(
+    name = "pgalloc_metadata",
+    srcs = ["pgalloc.proto"],
 )

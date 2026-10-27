@@ -17,12 +17,14 @@
 package runsccmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -83,5 +85,93 @@ exit 0
 	}
 	if got.Memory == nil || got.Memory.Limit == nil || *got.Memory.Limit != limit {
 		t.Fatalf("stdin resources: got %+v, want memory limit %d", got.Memory, limit)
+	}
+}
+
+// TestCmdOutputDoesNotAliasPooledBuffer verifies that cmdOutput copies its
+// output before returning. Its buffers come from a sync.Pool and are released
+// on return, so an alias would be overwritten by the next runsc invocation
+// while the caller is still unmarshaling it.
+func TestCmdOutputDoesNotAliasPooledBuffer(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-runsc")
+	const want = "original output"
+	scriptBody := fmt.Sprintf("#!/bin/sh\nprintf '%%s' %q\n", want)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runsc{Command: script, Root: filepath.Join(dir, "root")}
+	out, _, err := cmdOutput(r.command(t.Context(), "state", "cid-1"), true)
+	if err != nil {
+		t.Fatalf("cmdOutput: %v", err)
+	}
+	if string(out) != want {
+		t.Fatalf("cmdOutput() = %q, want %q", out, want)
+	}
+
+	// Scribble over the pooled buffers, as a subsequent command would.
+	for i := 0; i < 8; i++ {
+		b := getBuf()
+		b.WriteString(strings.Repeat("X", len(want)*4))
+		putBuf(b)
+	}
+
+	if string(out) != want {
+		t.Errorf("cmdOutput() result was corrupted to %q; it aliases a pooled buffer", out)
+	}
+}
+
+// TestCmdOutputSeparateStderr verifies the non-combined path also copies.
+func TestCmdOutputSeparateStderr(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-runsc")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'out'\nprintf 'err' >&2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runsc{Command: script, Root: filepath.Join(dir, "root")}
+	stdout, stderr, err := cmdOutput(r.command(t.Context(), "state", "cid-1"), false)
+	if err != nil {
+		t.Fatalf("cmdOutput: %v", err)
+	}
+
+	for i := 0; i < 8; i++ {
+		b := getBuf()
+		b.WriteString(strings.Repeat("X", 64))
+		putBuf(b)
+	}
+
+	if string(stdout) != "out" {
+		t.Errorf("stdout = %q, want %q", stdout, "out")
+	}
+	if string(stderr) != "err" {
+		t.Errorf("stderr = %q, want %q", stderr, "err")
+	}
+}
+
+// TestCommandWaitDelayUnblocksWait covers a runsc that dies while a child still
+// holds the pipe cmdOutput gave it. Without WaitDelay, Wait stays blocked on
+// that fd and the caller keeps the container lock.
+func TestCommandWaitDelayUnblocksWait(t *testing.T) {
+	old := waitDelay
+	waitDelay = 200 * time.Millisecond
+	t.Cleanup(func() { waitDelay = old })
+
+	fake := filepath.Join(t.TempDir(), "fake-runsc")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 60 &\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake runsc: %v", err)
+	}
+
+	r := &Runsc{Command: fake}
+	start := time.Now()
+	if _, _, err := cmdOutput(r.command(context.Background()), false); err == nil {
+		t.Fatal("cmdOutput reported success for a command whose pipes never closed")
+	}
+	// Below waitDelay means the command failed at startup and never exercised
+	// the delay. Above the child lifetime means Wait sat on the inherited fd.
+	elapsed := time.Since(start)
+	if elapsed < 200*time.Millisecond || elapsed > 30*time.Second {
+		t.Fatalf("cmdOutput returned after %v, want between waitDelay and the child lifetime", elapsed)
 	}
 }

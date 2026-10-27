@@ -7,7 +7,11 @@ package(
 
 go_library(
     name = "drivers",
-    srcs = ["install_driver.go"],
+    srcs = [
+        "download.go",
+        "install_driver.go",
+    ],
+    importpath = "gvisor.dev/gvisor/tools/gpu/drivers",
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/log",
@@ -18,8 +22,11 @@ go_library(
 
 go_test(
     name = "drivers_test",
-    srcs = ["install_driver_test.go"],
-    library = ":drivers",
+    srcs = [
+        "download_test.go",
+        "install_driver_test.go",
+    ],
+    embed = [":drivers"],
     deps = [
         "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/devices/nvproxy/nvconf",

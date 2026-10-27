@@ -22,7 +22,7 @@ import (
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/prometheus"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -60,7 +60,7 @@ func (m *MetricExport) SetFlags(f *flag.FlagSet) {
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (m *MetricExport) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := m.loadContainer(conf, f, container.LoadOpts{})
+	c, err := m.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -75,7 +75,7 @@ func (m *MetricExport) Execute(ctx context.Context, f *flag.FlagSet, args ...any
 	}
 
 	conf := args[0].(*config.Config)
-	cont, err := m.loadContainer(conf, f, container.LoadOpts{})
+	cont, err := m.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
@@ -85,7 +85,7 @@ func (m *MetricExport) Execute(ctx context.Context, f *flag.FlagSet, args ...any
 		util.Fatalf("Cannot compute Prometheus labels of sandbox: %v", err)
 	}
 
-	snapshot, err := cont.Sandbox.ExportMetrics(control.MetricsExportOpts{
+	snapshot, err := cont.Sandbox.ExportMetrics(controlapi.MetricsExportOpts{
 		OnlyMetrics: m.sandboxMetricsFilter,
 	})
 	if err != nil {

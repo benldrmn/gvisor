@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -75,25 +76,12 @@ var (
 	globalErr  error
 )
 
-// OpenDevice opens the KVM device and returns the File.
-// If the devicePath is empty, it will default to /dev/kvm.
-func OpenDevice(devicePath string) (*fd.FD, error) {
-	if devicePath == "" {
-		devicePath = "/dev/kvm"
-	}
-	f, err := fd.Open(devicePath, unix.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("error opening KVM device file (%s): %v", devicePath, err)
-	}
-	return f, nil
-}
-
 // New returns a new KVM-based implementation of the platform interface.
 func New(deviceFile *fd.FD, config Config) (*KVM, error) {
-	if hostarch.PageSize != 4096 {
-		return nil, fmt.Errorf("KVM platform does not support %dK page size", hostarch.PageSize/1024)
+	if hostPageSize := unix.Getpagesize(); hostPageSize != hostarch.PageSize {
+		return nil, fmt.Errorf("KVM platform requires a %d-byte page host, but the host page size is %d bytes", hostarch.PageSize, hostPageSize)
 	}
-
+	mbCh := hostmm.Probe(true)
 	fd := deviceFile.FD()
 
 	// Ensure global initialization is done.
@@ -104,6 +92,7 @@ func New(deviceFile *fd.FD, config Config) (*KVM, error) {
 	if globalErr != nil {
 		return nil, globalErr
 	}
+	config.StartupTimer.Reached("kvm global state initialized")
 
 	// Create a new VM fd.
 	var (
@@ -122,16 +111,25 @@ func New(deviceFile *fd.FD, config Config) (*KVM, error) {
 	}
 	// We are done with the device file.
 	deviceFile.Close()
+	config.StartupTimer.Reached("kvm VM created")
+
+	// `kvm_destroy_vm` costs tens of milliseconds. Do that async.
+	config.PinRing.Add(int(vm))
 
 	// Create a VM context.
 	machine, err := newMachine(int(vm), &config)
 	if err != nil {
 		return nil, err
 	}
+	config.StartupTimer.Reached("kvm machine created")
 
-	// All set.
+	config.StartupTimer.Reached("waiting for membarrier")
+	memBarrier := <-mbCh
+	config.StartupTimer.Reached("host membarrier probed")
+
 	return &KVM{
-		machine: machine,
+		UseHostProcessMemoryBarrier: platform.UseHostProcessMemoryBarrier{MemBarrier: memBarrier},
+		machine:                     machine,
 	}, nil
 }
 
@@ -160,7 +158,7 @@ func (*KVM) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new pagetable root.
-func (k *KVM) NewAddressSpace() (platform.AddressSpace, error) {
+func (k *KVM) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	// Allocate page tables and install system mappings.
 	pageTables := pagetables.NewWithUpper(newAllocator(), k.machine.upperSharedPageTables, ring0.KernelStartAddress)
 
@@ -215,9 +213,21 @@ func (k *KVM) PreemptCPU(cpu int32) error {
 
 // NewContext returns an interruptible context.
 func (k *KVM) NewContext(pkgcontext.Context) platform.Context {
-	return &platformContext{
+	c := &platformContext{
 		machine: k.machine,
 	}
+	c.interrupt.Dst = c
+	return c
+}
+
+// TSCOffset implements platform.TSCAdjustablePlatform.
+func (k *KVM) TSCOffset() uint64 {
+	return k.machine.tscOffset
+}
+
+// TSCFrequency implements platform.TSCAdjustablePlatform.
+func (k *KVM) TSCFrequency() (uint64, bool) {
+	return k.machine.tscFrequency, k.machine.tscFrequency != 0
 }
 
 type constructor struct{}
@@ -227,16 +237,10 @@ func (*constructor) New(opts platform.Options) (platform.Platform, error) {
 	return New(opts.DeviceFile, Config{
 		ApplicationCores: opts.ApplicationCores,
 		UseCPUNums:       opts.UseCPUNums,
+		StartupTimer:     opts.StartupTimer,
+		PinRing:          opts.PinRing,
+		TSCOffset:        opts.TSCOffset,
 	})
-}
-
-func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {
-	return OpenDevice(devicePath)
-}
-
-// Flags implements platform.Constructor.Flags().
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{}
 }
 
 func init() {

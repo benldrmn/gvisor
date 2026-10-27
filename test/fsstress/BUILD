@@ -11,12 +11,10 @@ go_test(
     srcs = [
         "fsstress_test.go",
     ],
-    library = ":fsstress",
-    tags = [
-        # Requires docker and runsc to be configured before the test runs.
-        "manual",
-        "local",
-    ],
+    embed = [":fsstress"],
+    # Requires docker and runsc to be configured before the test runs.
+    local = True,
+    tags = ["manual"],
     deps = [
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",

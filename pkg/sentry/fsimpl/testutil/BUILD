@@ -11,6 +11,7 @@ go_library(
         "kernel.go",
         "testutil.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil",
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
@@ -30,8 +31,8 @@ go_library(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/kvm",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sentry/platform/ptrace",
-        "//pkg/sentry/seccheck",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",

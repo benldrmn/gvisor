@@ -22,10 +22,8 @@ import (
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // Register platforms to precompile filters for.
 	"gvisor.dev/gvisor/pkg/sync"
-
-	// Import platforms that we need to precompile filters for.
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms"
 )
 
 // Variable names used in precompiled filters.
@@ -73,16 +71,27 @@ func optionsToPrecompile() ([]Options, error) {
 			return newOpts, nil
 		},
 
-		// Only precompile options with host networking disabled.
+		// Precompile various networking options.
 		func(opt Options) ([]Options, error) {
-			opt.HostNetwork = false
-			return []Options{opt}, nil
+			netstack := opt
+			netstack.HostNetwork = false
+			netstack.HostNetworkRawSockets = false
+			hostNet := opt
+			hostNet.HostNetwork = true
+			hostNet.HostNetworkRawSockets = false
+			hostNetRaw := opt
+			hostNetRaw.HostNetwork = true
+			hostNetRaw.HostNetworkRawSockets = true
+			return []Options{netstack, hostNet, hostNetRaw}, nil
 		},
 
-		// Only precompile options with DirectFS enabled.
+		// Precompile options with DirectFS enabled & disabled.
 		func(opt Options) ([]Options, error) {
-			opt.HostFilesystem = true
-			return []Options{opt}, nil
+			directfs := opt
+			directfs.HostFilesystem = true
+			noDirectfs := opt
+			noDirectfs.HostFilesystem = false
+			return []Options{directfs, noDirectfs}, nil
 		},
 
 		// Expand NVProxy and its possible configurations.
@@ -111,6 +120,28 @@ func optionsToPrecompile() ([]Options, error) {
 			tpuProxyNo.TPUProxy = false
 			return []Options{tpuProxyYes, tpuProxyNo}, nil
 		},
+
+		// Expand RDMAProxy vs not.
+		func(opt Options) ([]Options, error) {
+			rdmaProxyYes := opt
+			rdmaProxyYes.RDMAProxy = true
+			rdmaProxyNo := opt
+			rdmaProxyNo.RDMAProxy = false
+			return []Options{rdmaProxyYes, rdmaProxyNo}, nil
+		},
+
+		// Expand the sets of vendor syscalls that may be available.
+		func(opt Options) ([]Options, error) {
+			noVendorSyscalls := opt
+			noVendorSyscalls.VendorSyscalls = nil
+			opts := []Options{noVendorSyscalls}
+			for _, names := range vendorSyscallSetsToPrecompile {
+				optCopy := opt
+				optCopy.VendorSyscalls = precompiledseccomp.PrecompileSyscallNumbers(names...)
+				opts = append(opts, optCopy)
+			}
+			return opts, nil
+		},
 	} {
 		var newOpts []Options
 		for _, opt := range opts {
@@ -127,6 +158,10 @@ func optionsToPrecompile() ([]Options, error) {
 
 // PrecompiledPrograms returns the set of seccomp programs to precompile.
 func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
+	return precompiledPrograms(precompiledseccomp.Parallelism())
+}
+
+func precompiledPrograms(parallelism int) ([]precompiledseccomp.Program, error) {
 	opts, err := optionsToPrecompile()
 	if err != nil {
 		return nil, err
@@ -134,6 +169,7 @@ func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
 	programs := make([]precompiledseccomp.Program, len(opts))
 	var programsMu sync.Mutex
 	var errGroup errgroup.Group
+	errGroup.SetLimit(parallelism)
 	for i, opt := range opts {
 		i, opt := i, opt
 		errGroup.Go(func() error {

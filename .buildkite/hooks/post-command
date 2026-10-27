@@ -28,6 +28,13 @@ make -s testlogs 2>/dev/null | grep // | sort | uniq | (
       echo " * [${target}](artifact://${log#/}) (${BUILDKITE_LABEL})" | \
         buildkite-agent annotate --style error --context failures --append
 
+      # Upload boot and gofer logs found in the test's directory (e.g. undeclared outputs).
+      log_dir=$(dirname "${log}")
+      find "${log_dir}" \( -iname "*.boot.txt" -o -iname "*.gofer.txt" \) \
+        -print 2>/dev/null | while read -r debug_log; do
+        buildkite-agent artifact upload "${debug_log}"
+      done
+
       # List the first 5 specific failing go tests as sub-bullets.
       sed -n '/^--- FAIL:/ {s/^--- FAIL: \([^ ]*\) (.*)/\1/p}' "${log}" | \
         grep -v 'main_test' | head -n 5 | xargs -I {} echo "   * {}" | \
@@ -62,6 +69,11 @@ if test -s "${profile_output}"; then
 fi
 rm -rf "${profile_output}"
 
+# Clean up any modifications made to pipeline.yaml during pipeline upload.
+if [[ "${BUILDKITE_COMMAND:-}" =~ "pipeline upload" ]]; then
+  git checkout -- .buildkite/pipeline.yaml 2>/dev/null || true
+fi
+
 # Clean the bazel cache, if there's failure.
 if test "${BUILDKITE_COMMAND_EXIT_STATUS}" -ne "0"; then
   set -x
@@ -91,6 +103,13 @@ else
   rm -f "${CONSECUTIVE_FAILURES_FILE}"
 fi
 
+# Track last job completed time and job assignment.
+JOB_ASSIGNED_FILE="/tmp/job_assigned"
+touch "${JOB_ASSIGNED_FILE}"
+LAST_JOB_COMPLETED_FILE="/tmp/last_job_completed_time"
+date +%s > "${LAST_JOB_COMPLETED_FILE}.tmp"
+mv "${LAST_JOB_COMPLETED_FILE}.tmp" "${LAST_JOB_COMPLETED_FILE}"
+
 clear_docker_containers
 
 set -euo pipefail
@@ -107,6 +126,7 @@ if [[ "${BUILDKITE_PIPELINE_INSTALL_RUNTIME:-}" == "true" ]]; then
     echo 'Removed all Docker runtimes; reloading Docker daemon with this new configuration:' >&2
     cat /etc/docker/daemon.json >&2
     bash -c "$DOCKER_RELOAD_COMMAND"
+    sleep 3  # Give some time for Docker to actually reload.
   fi
 fi
 

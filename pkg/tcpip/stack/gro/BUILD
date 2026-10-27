@@ -39,5 +39,9 @@ go_test(
     srcs = [
         "gro_test.go",
     ],
-    library = ":gro",
+    embed = [":gro"],
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/stack",
+    ],
 )

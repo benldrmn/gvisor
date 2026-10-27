@@ -50,6 +50,8 @@ const vfioPathDir = "/dev/vfio"
 // point which has had the requested id mapping configured using mount_setattr().
 //
 // The caller is responsible for closing the returned file.
+//
+// If nil, the current process opens mount sources itself.
 type MountOpener func(m *specs.Mount, flags uint32) (*os.File, error)
 
 // NewSocket creates a unet.Socket from a file descriptor.
@@ -102,11 +104,12 @@ func WriteMounts(mountsFD int, mounts []specs.Mount) error {
 // spec.Root.Path with all the bind-mounts in place.
 //
 // To satisfy all of these requirements, this is the approach we take:
-//  1. We prepare all the bind-mounts in `spec.Root.Path` and execute the
-//     createContainer hooks.
-//  2. We create a new tmpfs mount at /proc/fs.
-//  3. We bind-mount host /proc and spec.Root.Path onto /proc/fs/proc and
-//     /proc/fs/root, respectively.
+//  1. We create a new tmpfs mount at /proc/fs and bind-mount host /proc at
+//     /proc/fs/proc.
+//  2. Without createContainer hooks, we bind-mount spec.Root.Path onto
+//     /proc/fs/root and prepare the bind-mounts there.
+//  3. With createContainer hooks, we instead prepare spec.Root.Path, execute
+//     the hooks, and then bind-mount the prepared root onto /proc/fs/root.
 //  4. We then pivot_root(2) into /proc/fs. Now host procfs is accessible via
 //     /proc/ and container rootfs is accessible via /root.
 //  5. We re-exec the gofer binary and drop extra capabilities.
@@ -119,6 +122,20 @@ func WriteMounts(mountsFD int, mounts []specs.Mount) error {
 // configuration and subsequent entries correspond to spec mounts with
 // mount configs.
 func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.GoferMountConf, devIoFD int, mountOpener MountOpener, containerID string, bundleDir string) error {
+	rootfsConf := mountConfs[0]
+	hasCreateContainerHooks := spec.Hooks != nil && len(spec.Hooks.CreateContainer) > 0
+	if rootfsConf.ShouldUseLisafs() && hasCreateContainerHooks {
+		root, err := filepath.EvalSymlinks(spec.Root.Path)
+		if err != nil {
+			return fmt.Errorf("resolving rootfs for createContainer hooks: %w", err)
+		}
+		// Hook preparation requires a self-bind mount, which cannot safely
+		// overmount the process root. Check aliases before changing any mounts.
+		if root == "/" {
+			return fmt.Errorf("createContainer hooks are not supported with rootfs %q resolving to /", spec.Root.Path)
+		}
+	}
+
 	// Convert all shared mounts into slaves to be sure that nothing will be
 	// propagated outside of our namespace.
 	procPath := "/proc"
@@ -171,14 +188,18 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 		procPath = "/proc/fs/proc"
 	}
 
-	rootfsConf := mountConfs[0]
 	if rootfsConf.ShouldUseLisafs() {
-		// Some CDI createContainer hooks pivot_root(2) into spec.Root.Path.
-		// pivot_root(2) requires the target to be a mount point, so we must
-		// self-bind-mount spec.Root.Path here. runc does this step unconditionally
-		// in libcontainer/rootfs_linux.go:prepareRoot().
-		if err := unix.Mount(containerRootFs, containerRootFs, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-			return fmt.Errorf("self-bind-mounting rootfs %q: %w", containerRootFs, err)
+		if !hasCreateContainerHooks {
+			// Prepare the root at its named staging path. When spec.Root.Path
+			// is "/", self-binding it would overmount the process's root;
+			// subsequent absolute lookups would still start beneath that mount.
+			containerRootFs = goferRootFs
+		}
+		// Hooks require the prepared root at spec.Root.Path and may pivot_root
+		// into it, so their path must still be self-bind-mounted. The root path
+		// is host-controlled and may contain symlinks (see runc prepareRoot).
+		if err := unix.Mount(spec.Root.Path, containerRootFs, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+			return fmt.Errorf("binding rootfs %q at %q: %w", spec.Root.Path, containerRootFs, err)
 		}
 
 		// Ensure the containerRootFs is set to the RootfsPropagation that the user
@@ -215,7 +236,7 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 	}
 
 	if rootfsConf.ShouldUseLisafs() {
-		if spec.Hooks != nil && len(spec.Hooks.CreateContainer) > 0 {
+		if hasCreateContainerHooks {
 			state := specs.State{
 				Version: specs.Version,
 				ID:      containerID,
@@ -230,12 +251,11 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 			if err := specutils.ExecuteHooks(spec.Hooks.CreateContainer, state); err != nil {
 				util.Fatalf("error executing CreateContainer hooks: %v", err)
 			}
-		}
 
-		// Now that spec.Root.Path has been prepared, we can bind-mount it to the
-		// new root. This will make the container rootfs visible in the gofer root.
-		if err := specutils.SafeMount(containerRootFs, goferRootFs, "", unix.MS_BIND|unix.MS_REC, "", procPath); err != nil {
-			return fmt.Errorf("binding prepared rootfs to gofer root: %v", err)
+			// Copy the root prepared for hooks into the gofer's filesystem.
+			if err := specutils.SafeMount(containerRootFs, goferRootFs, "", unix.MS_BIND|unix.MS_REC, "", procPath); err != nil {
+				return fmt.Errorf("binding prepared rootfs to gofer root: %v", err)
+			}
 		}
 
 		// Check if root needs to be remounted as readonly.
@@ -252,7 +272,7 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 				return fmt.Errorf("remounting root as read-only with source: %q, target: %q, flags: %#x, err: %v", goferRootFs, goferRootFs, flags, err)
 			}
 		}
-	} else if spec.Hooks != nil && len(spec.Hooks.CreateContainer) > 0 {
+	} else if hasCreateContainerHooks {
 		log.Warningf("CreateContainer hooks are not executed since container rootfs is not on lisafs")
 	}
 
@@ -378,13 +398,17 @@ func SetupMounts(conf *config.Config, mounts []specs.Mount, root, procPath strin
 		src := m.Source
 		var srcFile *os.File
 		if specutils.IsIDMappedMount(m) || unix.Access(src, unix.R_OK) != nil {
-			if mountOpener == nil {
-				return fmt.Errorf("cannot access mount source %q (or id mapped) and no mount opener provided", src)
+			switch {
+			case mountOpener != nil:
+				// The current process cannot open the source, or it
+				// is id-mapped, so need to open it through `mountOpener`.
+				srcFile, err = mountOpener(&m, flags)
+			case specutils.IsIDMappedMount(m):
+				return fmt.Errorf("cannot set up id-mapped mount source %q: no mount opener provided", src)
+			default:
+				// Open the source directly.
+				srcFile, err = os.OpenFile(src, unix.O_PATH|unix.O_CLOEXEC, 0)
 			}
-			// The current process doesn't have enough permissions
-			// to open the mount (or it is ID mapped), so let's try to open it via the
-			// caller-provided opener.
-			srcFile, err = mountOpener(&m, flags)
 			if err != nil {
 				return fmt.Errorf("opening %s: %w", m.Source, err)
 			}
@@ -484,7 +508,7 @@ func ShouldExposeNvidiaDevice(path string) bool {
 	if !strings.HasPrefix(path, "/dev/nvidia") {
 		return false
 	}
-	if path == "/dev/nvidiactl" || path == "/dev/nvidia-uvm" {
+	if path == "/dev/nvidiactl" || path == "/dev/nvidia-uvm" || path == "/dev/nvidia-uvm-tools" {
 		return true
 	}
 	nvidiaDevPathReg := regexp.MustCompile(`^/dev/nvidia(\d+)$`)
@@ -506,6 +530,13 @@ func ShouldExposeTpuDevice(path string) bool {
 	return valid || ShouldExposeVFIODevice(path)
 }
 
+// ShouldExposeRDMADevice returns true if path refers to an RDMA uverbs device.
+//
+// Precondition: rdmaproxy is enabled.
+func ShouldExposeRDMADevice(path string) bool {
+	return strings.HasPrefix(path, "/dev/infiniband/uverbs")
+}
+
 // SetupDev mounts devices from the OCI spec into the gofer's /dev directory.
 func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) error {
 	if err := os.MkdirAll(filepath.Join(root, "dev"), 0777); err != nil {
@@ -517,13 +548,20 @@ func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) erro
 	}
 	nvproxyEnabled := specutils.NVProxyEnabled(spec, conf)
 	tpuproxyEnabled := specutils.TPUProxyEnabled(spec, conf)
+	rdmaproxyEnabled := specutils.RDMAEnabled(spec, conf)
 	for _, dev := range spec.Linux.Devices {
 		shouldMount := (nvproxyEnabled && ShouldExposeNvidiaDevice(dev.Path)) ||
-			(tpuproxyEnabled && ShouldExposeTpuDevice(dev.Path))
+			(tpuproxyEnabled && ShouldExposeTpuDevice(dev.Path)) ||
+			(rdmaproxyEnabled && ShouldExposeRDMADevice(dev.Path))
 		if !shouldMount {
 			continue
 		}
-		dst := filepath.Join(root, dev.Path)
+		// The rootfs may contain symlinks at dev.Path; resolve them within
+		// root so the mount point is never created outside the rootfs.
+		dst, err := ResolveSymlinks(root, dev.Path)
+		if err != nil {
+			return fmt.Errorf("resolving symlinks to %q: %v", dev.Path, err)
+		}
 		log.Infof("Mounting device %q as bind mount at %q", dev.Path, dst)
 		if err := specutils.SafeSetupAndMount(dev.Path, dst, "bind", unix.MS_BIND, procPath); err != nil {
 			return fmt.Errorf("mounting %q: %v", dev.Path, err)

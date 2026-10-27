@@ -36,3 +36,38 @@ func testDeferInvalidAccess(tc *oneGuardStruct) {
 	}()
 	tc.mu.Unlock()
 }
+
+func testDeferClosureFrame(tc *oneGuardStruct) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	func() {
+		defer func() {
+			tc.guardedField = 1
+		}()
+	}()
+	// The inner function's defers must not run the caller's pending Unlock.
+	tc.guardedField = 2
+}
+
+func testDeferClosureArgument(tc, other *oneGuardStruct) {
+	p := tc
+	tc.mu.Lock()
+	defer func(arg *oneGuardStruct) {
+		arg.mu.Unlock()
+	}(p)
+	func() {
+		p = other
+	}()
+}
+
+func testDeferClosureIndex(tc []*oneGuardStruct) {
+	i := 0
+	tc[i].mu.Lock()
+	defer func(arg *oneGuardStruct) {
+		arg.mu.Unlock()
+	}(tc[i])
+	func() {
+		tc[i].guardedField = 1
+		i = 1
+	}()
+}

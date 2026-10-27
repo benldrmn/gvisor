@@ -150,25 +150,23 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 	case linux.TCGETS2:
 		return rfd.inode.t.ld.getTermios2(t, args)
 	case linux.TCSETS:
-		return rfd.inode.t.ld.setTermios(t, args)
+		return rfd.inode.t.ld.setTermios(t, args, false /* flushInput */)
 	case linux.TCSETSW:
-		// Note that this should drain the output queue first, but we
-		// don't implement that yet.
-		return rfd.inode.t.ld.setTermios(t, args)
+		// Draining output is a no-op for PTYs.
+		return rfd.inode.t.ld.setTermios(t, args, false /* flushInput */)
 	case linux.TCSETSF:
-		// This should drain the output queue and clear the input queue
-		// first, but we don't implement that yet.
-		return rfd.inode.t.ld.setTermios(t, args)
+		// Draining output is a no-op for PTYs, but pending input must be
+		// discarded.
+		return rfd.inode.t.ld.setTermios(t, args, true /* flushInput */)
 	case linux.TCSETS2:
-		return rfd.inode.t.ld.setTermios2(t, args)
+		return rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */)
 	case linux.TCSETSW2:
-		// Note that this should drain the output queue first, but we
-		// don't implement that yet.
-		return rfd.inode.t.ld.setTermios2(t, args)
+		// Draining output is a no-op for PTYs.
+		return rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */)
 	case linux.TCSETSF2:
-		// This should drain the output queue and clear the input queue
-		// first, but we don't implement that yet.
-		return rfd.inode.t.ld.setTermios2(t, args)
+		// Draining output is a no-op for PTYs, but pending input must be
+		// discarded.
+		return rfd.inode.t.ld.setTermios2(t, args, true /* flushInput */)
 	case linux.TCSBRK:
 		// TCSBRK with arg != 0 is tcdrain, which waits for output to
 		// drain. For a pty with no real hardware, this is a no-op.
@@ -191,7 +189,7 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 		return 0, t.ThreadGroup().SetControllingTTY(ctx, rfd.inode.t.replicaKTTY, steal, rfd.vfsfd.IsReadable())
 	case linux.TIOCNOTTY:
 		// Release this process's controlling terminal.
-		return 0, t.ThreadGroup().ReleaseControllingTTY(rfd.inode.t.replicaKTTY)
+		return 0, t.ThreadGroup().ReleaseControllingTTY(ctx, rfd.inode.t.replicaKTTY)
 	case linux.TIOCGPGRP:
 		// Get the foreground process group id.
 		pgid, err := t.ThreadGroup().ForegroundProcessGroupID(rfd.inode.t.replicaKTTY)
@@ -208,6 +206,16 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 			return 0, err
 		}
 		return 0, t.ThreadGroup().SetForegroundProcessGroupID(ctx, rfd.inode.t.replicaKTTY, kernel.ProcessGroupID(pgid))
+	case linux.TIOCGSID:
+		// Get the session id. The replica must be the caller's
+		// controlling terminal.
+		sid, err := t.ThreadGroup().SessionID(rfd.inode.t.replicaKTTY, true /* requireCtty */)
+		if err != nil {
+			return 0, err
+		}
+		ret := primitive.Int32(sid)
+		_, err = ret.CopyOut(t, args[2].Pointer())
+		return 0, err
 	default:
 		maybeEmitUnimplementedEvent(ctx, sysno, cmd)
 		return 0, linuxerr.ENOTTY

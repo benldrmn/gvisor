@@ -18,11 +18,13 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -87,6 +89,7 @@ func (t *syscallThread) init(seccompNotify bool) error {
 	}
 	fr, err := t.subproc.memoryFile.Allocate(syscallThreadMessageSize, opts)
 	if err != nil {
+		t.subproc.sysmsgStackPool.Put(t.thread.sysmsgStackID)
 		return err
 	}
 
@@ -139,7 +142,7 @@ func (t *syscallThread) destroy() {
 			arch.SyscallArgument{Value: t.stubAddr},
 			arch.SyscallArgument{Value: uintptr(syscallThreadMessageSize)})
 		if err != nil {
-			panic(fmt.Sprintf("munmap failed: %v", err))
+			t.thread.Warningf("munmap failed: %v", err)
 		}
 	}
 	t.subproc.memoryFile.DecRef(t.stackRange)
@@ -192,11 +195,12 @@ func (t *syscallThread) attach() error {
 	}
 	// We need to unblock signals, because the TRAP signal is used to run
 	// syscalls via ptrace.
-	t.unmaskAllSignalsAttached()
-	return nil
+	return t.unmaskAllSignalsAttached()
 }
 
 const maxErrno = 4095
+
+var stubSyscallErrorLogger = log.BasicRateLimitedLogger(time.Minute)
 
 func (t *syscallThread) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
 	if t.subproc.dead.Load() {
@@ -236,10 +240,22 @@ func (t *syscallThread) syscall(sysno uintptr, args ...arch.SyscallArgument) (ui
 
 	errno := -uintptr(stubMsg.ret)
 	if errno > 0 && errno < maxErrno {
-		return 0, fmt.Errorf("stub syscall (%x, %#v) failed with %w", sysno, args, unix.Errno(errno))
+		err := unix.Errno(errno)
+		stubSyscallErrorLogger.Infof("stub syscall (%x, %#v) failed with %v", sysno, args, err)
+		return 0, err
 	}
 
 	return uintptr(stubMsg.ret), nil
+}
+
+// kill marks subproc dead, wakes sleeping contexts, and kills the syscall
+// thread without acquiring aliveMu (avoiding self-deadlock when called from
+// s.syscall, which already holds s.aliveMu.RLock()).
+func (t *syscallThread) kill() {
+	if t.subproc != nil && t.subproc.dead.CompareAndSwap(false, true) {
+		t.subproc.wakeAllContexts()
+	}
+	t.thread.kill()
 }
 
 func (t *syscallThread) notifySeccompThread() error {
@@ -256,7 +272,7 @@ func (t *syscallThread) notifySeccompThread() error {
 				return fmt.Errorf("failed resynchronizing seccomp notify: %w", err)
 			}
 		default:
-			t.thread.kill()
+			t.kill()
 			return fmt.Errorf("failed sending request to syscall thread: %w", errno)
 		}
 	}

@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <errno.h>
+#include <linux/capability.h>
+#include <poll.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <memory>
+#include <ostream>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -29,7 +37,10 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/capability_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -80,9 +91,14 @@ int testSetPGIDOfZombie(void* arg) {
   pid_t cpid;
   TEST_PCHECK(ReadFd(p[0], &cpid, sizeof(cpid)) == sizeof(cpid));
 
-  // Wait when both child processes will die.
+  // Wait for both pipe writers to close.
   int c;
   TEST_PCHECK(ReadFd(p[0], &c, sizeof(c)) == 0);
+
+  // Pipe EOF can precede reparenting the second child. Wait for the first child
+  // to exit, but leave its zombie available for setpgid below.
+  siginfo_t info;
+  TEST_PCHECK(RetryEINTR(waitid)(P_PID, pid, &info, WEXITED | WNOWAIT) == 0);
 
   // Wait the second child process to collect its zombie.
   int status;
@@ -117,6 +133,172 @@ TEST(Processes, SetPGIDOfZombie) {
   ASSERT_THAT(RetryEINTR(waitpid)(pid, &status, 0),
               SyscallSucceedsWithValue(pid));
   EXPECT_EQ(status, 0);
+}
+
+// Sibling thread group C for SetsidOrphansSharedSignalHandlers below: it shares
+// its creator's signal handlers and idles in the process group until killed.
+int idleUntilKilled(void* arg) {
+  while (true) {
+    pause();
+  }
+  return 0;
+}
+
+// Runs as process B: create sibling C, a distinct thread group that shares B's
+// signal handlers (clone(CLONE_VM|CLONE_SIGHAND) without CLONE_THREAD) and
+// stays in B's process group, then call setsid(2).
+void setsidWithSharedSignalHandlersSibling() {
+  char stack[4096] __attribute__((aligned(16)));
+  pid_t c = clone(idleUntilKilled, stack + sizeof(stack),
+                  CLONE_VM | CLONE_SIGHAND | SIGCHLD, nullptr);
+  TEST_PCHECK(c > 0);
+
+  // setsid(2) moves B into a new session, orphaning its old process group while
+  // C, which shares B's signal handlers (and thus the signal mutex), remains in
+  // it. This previously self-deadlocked the sentry in
+  // ProcessGroup.handleOrphan.
+  int r = setsid();
+
+  // Reap C regardless of the outcome.
+  TEST_PCHECK(kill(c, SIGKILL) == 0);
+  int status;
+  TEST_PCHECK(RetryEINTR(waitpid)(c, &status, 0) == c);
+
+  TEST_PCHECK(r != -1);
+  _exit(0);
+}
+
+// Regression test: setsid(2) must not deadlock when it orphans a process group
+// that still contains a thread group sharing the caller's signal handlers.
+TEST(Processes, SetsidOrphansSharedSignalHandlers) {
+  pid_t a = fork();
+  if (a == 0) {
+    // Process A: create a fresh session so its process group has no ancestors
+    // (i.e. is an orphan), then fork B into it.
+    TEST_PCHECK(setsid() != -1);
+    pid_t b = fork();
+    if (b == 0) {
+      setsidWithSharedSignalHandlersSibling();
+      _exit(1);  // Unreachable.
+    }
+    TEST_PCHECK(b > 0);
+    int status;
+    TEST_PCHECK(RetryEINTR(waitpid)(b, &status, 0) == b);
+    TEST_PCHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    _exit(0);
+  }
+  ASSERT_THAT(a, SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(a, &status, 0), SyscallSucceedsWithValue(a));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "process A exited with status " << status;
+}
+
+// Forks a member of the caller's process group that stops itself and idles.
+// SIGHUP kills it, even if the test runner ignores SIGHUP: it restores the
+// default before stopping, so no SIGHUP can arrive while it is still ignored.
+pid_t forkStoppedMember() {
+  pid_t s = fork();
+  if (s == 0) {
+    TEST_PCHECK(signal(SIGHUP, SIG_DFL) != SIG_ERR);
+    TEST_PCHECK(raise(SIGSTOP) == 0);
+    while (true) {
+      pause();
+    }
+  }
+  TEST_PCHECK(s > 0);
+  int status;
+  TEST_PCHECK(RetryEINTR(waitpid)(s, &status, WUNTRACED) == s);
+  TEST_PCHECK(WIFSTOPPED(status));
+  return s;
+}
+
+// A member exiting from a process group that was already orphaned does not
+// orphan it, so its stopped members must not get SIGHUP and SIGCONT.
+TEST(Processes, ExitFromOrphanedGroupDoesNotSignalStoppedMembers) {
+  pid_t a = fork();
+  if (a == 0) {
+    // A new session's group is orphaned from the start.
+    TEST_PCHECK(setsid() != -1);
+    pid_t s = forkStoppedMember();
+
+    sigset_t hup;
+    sigemptyset(&hup);
+    sigaddset(&hup, SIGHUP);
+    TEST_PCHECK(sigprocmask(SIG_BLOCK, &hup, nullptr) == 0);
+
+    pid_t e = fork();
+    if (e == 0) {
+      _exit(0);
+    }
+    TEST_PCHECK(e > 0);
+    int status;
+    TEST_PCHECK(RetryEINTR(waitpid)(e, &status, 0) == e);
+
+    sigset_t pending;
+    TEST_PCHECK(sigpending(&pending) == 0);
+    bool signaled = sigismember(&pending, SIGHUP);
+    absl::SleepFor(absl::Milliseconds(100));
+    signaled |= RetryEINTR(waitpid)(s, &status, WNOHANG) == s;
+
+    TEST_PCHECK(kill(s, SIGKILL) == 0 || errno == ESRCH);
+    RetryEINTR(waitpid)(s, &status, 0);
+    _exit(signaled ? 1 : 0);
+  }
+  ASSERT_THAT(a, SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(a, &status, 0), SyscallSucceedsWithValue(a));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "the exit sent SIGHUP to an already orphaned group; status " << status;
+}
+
+// The exit that orphans a process group with a stopped member still sends it
+// SIGHUP, which kills it.
+TEST(Processes, ExitThatOrphansGroupSignalsStoppedMembers) {
+  int p[2];
+  ASSERT_THAT(pipe(p), SyscallSucceeds());
+
+  pid_t m = fork();
+  if (m == 0) {
+    // M's own session, so that once A exits, S's new parent is in another
+    // session and nothing outside the group keeps it from being orphaned.
+    TEST_PCHECK(setsid() != -1);
+    pid_t a = fork();
+    if (a == 0) {
+      // A leads group G, linked to M's group in the same session.
+      TEST_PCHECK(setpgid(0, 0) == 0);
+      pid_t s = forkStoppedMember();
+      TEST_PCHECK(WriteFd(p[1], &s, sizeof(s)) == sizeof(s));
+      _exit(0);
+    }
+    TEST_PCHECK(a > 0);
+    close(p[1]);
+    int status;
+    TEST_PCHECK(RetryEINTR(waitpid)(a, &status, 0) == a);
+    _exit(WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1);
+  }
+  ASSERT_THAT(m, SyscallSucceeds());
+  ASSERT_THAT(close(p[1]), SyscallSucceeds());
+
+  pid_t s;
+  ASSERT_THAT(ReadFd(p[0], &s, sizeof(s)), SyscallSucceedsWithValue(sizeof(s)));
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(m, &status, 0), SyscallSucceedsWithValue(m));
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  // S holds the pipe's last write end, so EOF means SIGHUP killed it.
+  struct pollfd pfd = {.fd = p[0], .events = POLLIN};
+  int n = RetryEINTR(poll)(&pfd, 1, 10000);
+  if (n != 1) {
+    kill(s, SIGKILL);
+  }
+  ASSERT_EQ(n, 1) << "stopped member was not signaled when its group became "
+                     "orphaned";
+  char c;
+  EXPECT_THAT(ReadFd(p[0], &c, 1), SyscallSucceedsWithValue(0));
+  close(p[0]);
 }
 
 void WritePIDToPipe(int* pipe_fds) {

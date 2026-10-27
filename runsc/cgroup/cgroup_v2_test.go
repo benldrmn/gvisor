@@ -17,7 +17,6 @@ package cgroup
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -42,10 +41,18 @@ func TestIO(t *testing.T) {
 		{
 			name: "simple",
 			spec: &specs.LinuxBlockIO{
-				Weight: uint16Ptr(1),
+				Weight: uint16Ptr(750),
 			},
 			path:  "io.weight",
-			wants: strconv.FormatUint(convertBlkIOToIOWeightValue(1), 10),
+			wants: "7475",
+		},
+		{
+			name: "bfq",
+			spec: &specs.LinuxBlockIO{
+				Weight: uint16Ptr(750),
+			},
+			path:  "io.bfq.weight",
+			wants: "750",
 		},
 		{
 			name: "throttlereadbps",
@@ -123,6 +130,31 @@ func TestIO(t *testing.T) {
 			got := strings.TrimSuffix(string(gotBytes), "\n")
 			if got != tc.wants {
 				t.Errorf("wrong file content, file: %q, want: %q, got: %q", tc.path, tc.wants, got)
+			}
+		})
+	}
+}
+
+func TestBFQDeviceWeightSupported(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		want     bool
+	}{
+		{name: "legacy", contents: "100\n", want: false},
+		{name: "per_device", contents: "default 100\n", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bfq, err := os.CreateTemp(t.TempDir(), "bfq")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer bfq.Close()
+			if _, err := bfq.WriteString(tc.contents); err != nil {
+				t.Fatal(err)
+			}
+			if got := bfqDeviceWeightSupported(bfq); got != tc.want {
+				t.Errorf("bfqDeviceWeightSupported(%q) = %t, want %t", tc.contents, got, tc.want)
 			}
 		})
 	}
@@ -468,7 +500,7 @@ func TestInstallPrecreatedCgroupV2SetsMemorySwap(t *testing.T) {
 	}
 }
 
-func TestParseCPUQuotaAndPeriod(t *testing.T) {
+func TestParseCPUMax(t *testing.T) {
 	cases := []struct {
 		quota     string
 		expQuota  int64
@@ -492,7 +524,7 @@ func TestParseCPUQuotaAndPeriod(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		quota, period, err := parseCPUQuotaAndPeriod(c.quota)
+		quota, period, err := ParseCPUMax(c.quota)
 		if c.expErr {
 			if err == nil {
 				t.Errorf("quota: %q, expected error, got (%d, %d), nil", c.quota, quota, period)
@@ -711,5 +743,16 @@ func TestUpdateUnified(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOwnsCPULimit(t *testing.T) {
+	cg := &cgroupV2{Mountpoint: "/sys/fs/cgroup", Path: "/parent/leaf"}
+	if OwnsCPULimit(cg) {
+		t.Errorf("OwnsCPULimit() = true for a pre-existing cgroup")
+	}
+	cg.Own = []string{"/sys/fs/cgroup/parent/leaf"}
+	if !OwnsCPULimit(cg) {
+		t.Errorf("OwnsCPULimit() = false for a cgroup created by Install")
 	}
 }

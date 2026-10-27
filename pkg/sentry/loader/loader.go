@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -96,6 +97,10 @@ type LoadArgs struct {
 
 	// AllowSUID indicates whether to allow ID elevation during execve.
 	AllowSUID bool
+
+	// StartupTimeline tracks this load as part of overall sandbox startup.
+	// Only set when loading the initial task image of the root container.
+	StartupTimeline *timing.Timeline
 }
 
 // openPath opens args.Filename and checks that it is valid for loading.
@@ -103,18 +108,14 @@ type LoadArgs struct {
 // openPath returns an *fs.Dirent and *fs.File for args.Filename, which is not
 // installed in the Task FDTable. The caller takes ownership of both.
 //
-// args.Filename must be a readable, executable, regular file.
+// args.Filename must be an executable, regular file. As on Linux, read
+// permission is not required.
 func openPath(ctx context.Context, args LoadArgs) (*vfs.FileDescription, error) {
 	if args.Filename == "" {
 		ctx.Infof("cannot open empty name")
 		return nil, linuxerr.ENOENT
 	}
 
-	// TODO(gvisor.dev/issue/160): Linux requires only execute permission,
-	// not read. However, our backing filesystems may prevent us from reading
-	// the file without read permission. Additionally, a task with a
-	// non-readable executable has additional constraints on access via
-	// ptrace and procfs.
 	opts := vfs.OpenOptions{
 		Flags:    linux.O_RDONLY,
 		FileExec: true,
@@ -139,6 +140,49 @@ func openPath(ctx context.Context, args LoadArgs) (*vfs.FileDescription, error) 
 		args.AfterOpen(fd)
 	}
 	return fd, nil
+}
+
+// wouldDumpState tracks the effect of Linux's fs/exec.c:would_dump() across
+// the files opened while loading a single image.
+type wouldDumpState struct {
+	// notDumpable is true if some file in the executable/interpreter chain
+	// was not readable by the caller, requiring the task to be made
+	// non-dumpable.
+	notDumpable bool
+
+	// userNS is the value for the image's mm_struct::user_ns: the caller's
+	// user namespace, lowered to the nearest ancestor privileged with respect
+	// to the owner of each non-readable file.
+	userNS *auth.UserNamespace
+}
+
+// wouldDump applies Linux's fs/exec.c:would_dump() for fd: if the credentials
+// in ctx may not read fd, the task must be made non-dumpable and wds.userNS
+// must contain fd's owner.
+func wouldDump(ctx context.Context, fd *vfs.FileDescription, wds *wouldDumpState) {
+	stat, err := fd.Stat(ctx, vfs.StatOptions{
+		Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+	})
+	if err != nil {
+		ctx.Debugf("wouldDump: failed to stat executable: %v", err)
+		wds.notDumpable = true
+		wds.userNS = wds.userNS.Root()
+		return
+	}
+	kuid := auth.KUID(stat.UID)
+	kgid := auth.KGID(stat.GID)
+	acl, err := fd.GetPosixACL(ctx, vfs.AccessACL)
+	if err == nil {
+		creds := auth.CredentialsFromContext(ctx)
+		err = vfs.GenericCheckPermissions(creds, vfs.MayRead, linux.FileMode(stat.Mode), acl, kuid, kgid)
+		if err == nil {
+			return
+		}
+	} else {
+		ctx.Debugf("wouldDump: failed to get POSIX ACL: %v", err)
+	}
+	wds.notDumpable = true
+	wds.userNS = wds.userNS.AncestorPrivilegedWrtIDs(kuid, kgid)
 }
 
 // checkIsRegularFile prevents us from trying to execute a directory, pipe, etc.
@@ -182,7 +226,7 @@ const (
 //   - arch.Context64 matching the binary arch
 //   - fs.Dirent of the binary file
 //   - Possibly updated args.Argv
-func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, *vfs.FileDescription, []string, error) {
+func loadExecutable(ctx context.Context, args LoadArgs, wds *wouldDumpState) (loadedELF, *arch.Context64, *vfs.FileDescription, []string, error) {
 	for i := 0; i < maxLoaderAttempts; i++ {
 		if args.File == nil {
 			var err error
@@ -218,7 +262,10 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Contex
 
 		switch {
 		case bytes.Equal(hdr[:], []byte(elfMagic)):
-			loaded, ac, err := loadELF(ctx, args)
+			// Linux applies would_dump() to the terminal binprm file, see
+			// fs/exec.c:begin_new_exec().
+			wouldDump(ctx, args.File, wds)
+			loaded, ac, err := loadELF(ctx, args, wds)
 			if err != nil {
 				ctx.Infof("Error loading ELF: %v", err)
 				return loadedELF{}, nil, nil, nil, err
@@ -240,7 +287,7 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Contex
 			*args.RemainingTraversals = linux.MaxSymlinkTraversals
 
 		default:
-			ctx.Infof("Unknown magic: %v", hdr)
+			ctx.Infof("Unknown magic for %s: %v", args.Filename, hdr)
 			return loadedELF{}, nil, nil, nil, linuxerr.ENOEXEC
 		}
 		// Set to nil in case we loop on a Interpreter Script.
@@ -258,6 +305,12 @@ type ImageInfo struct {
 	Arch *arch.Context64
 	// The base name of the binary.
 	Name string
+	// NotDumpable is true if the task must be made non-dumpable, see
+	// fs/exec.c:would_dump().
+	NotDumpable bool
+	// UserNamespace is the value for the image's mm_struct::user_ns, see
+	// fs/exec.c:would_dump().
+	UserNamespace *auth.UserNamespace
 }
 
 // Load loads args.File into a MemoryManager. If args.File is nil, the path
@@ -273,17 +326,20 @@ type ImageInfo struct {
 //   - Load is called on the Task goroutine.
 func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *VDSO) (ImageInfo, *auth.Credentials, bool, *syserr.Error) {
 	// Load the executable itself.
-	loaded, ac, file, newArgv, err := loadExecutable(ctx, args)
+	wds := wouldDumpState{userNS: auth.CredentialsFromContext(ctx).UserNamespace}
+	loaded, ac, file, newArgv, err := loadExecutable(ctx, args, &wds)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
 	defer file.DecRef(ctx)
+	args.StartupTimeline.Reached("executable loaded")
 
 	// Load the VDSO.
 	vdsoAddr, err := loadVDSO(ctx, args.MemoryManager, vdso, loaded)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("error loading VDSO: %v", err), syserr.FromError(err).ToLinux())
 	}
+	args.StartupTimeline.Reached("VDSO mapped")
 
 	// Setup the heap. brk starts at the next page after the end of the
 	// executable. Userspace can assume that the remainder of the page after
@@ -299,6 +355,7 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to allocate stack: %v", err), syserr.FromError(err).ToLinux())
 	}
+	args.StartupTimeline.Reached("stack allocated")
 
 	// Push the original filename to the stack, for AT_EXECFN.
 	if _, err := stack.PushNullTerminatedByteSlice([]byte(args.Filename)); err != nil {
@@ -315,6 +372,12 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to push random bytes: %v", err), syserr.FromError(err).ToLinux())
 	}
 	random := stack.Bottom
+
+	// Push the platform string which AT_PLATFORM will point to.
+	if _, err = stack.PushNullTerminatedByteSlice([]byte(loaded.arch.Platform())); err != nil {
+		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to push platform string: %v", err), syserr.FromError(err).ToLinux())
+	}
+	platform := stack.Bottom
 
 	filePrivs, err := file.GetFilePrivileges(ctx)
 	if err != nil {
@@ -340,7 +403,8 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		arch.AuxEntry{linux.AT_CLKTCK, linux.CLOCKS_PER_SEC},
 		arch.AuxEntry{linux.AT_EXECFN, execfn},
 		arch.AuxEntry{linux.AT_RANDOM, random},
-		arch.AuxEntry{linux.AT_PAGESZ, hostarch.PageSize},
+		arch.AuxEntry{linux.AT_PLATFORM, platform},
+		arch.AuxEntry{Key: linux.AT_PAGESZ, Value: hostarch.Addr(hostarch.PageSize)},
 		arch.AuxEntry{linux.AT_SYSINFO_EHDR, vdsoAddr},
 		arch.AuxEntry{linux.AT_HWCAP, hostarch.Addr(args.Features.AllowedHWCap1())},
 		arch.AuxEntry{linux.AT_HWCAP2, hostarch.Addr(args.Features.AllowedHWCap2())},
@@ -350,6 +414,7 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
 	}
+	args.StartupTimeline.Reached("stack contents loaded")
 
 	m := args.MemoryManager
 	m.SetArgvStart(sl.ArgvStart)
@@ -369,8 +434,10 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	}
 
 	return ImageInfo{
-		OS:   loaded.os,
-		Arch: ac,
-		Name: name,
+		OS:            loaded.os,
+		Arch:          ac,
+		Name:          name,
+		NotDumpable:   wds.notDumpable,
+		UserNamespace: wds.userNS,
 	}, c, secureExec, nil
 }

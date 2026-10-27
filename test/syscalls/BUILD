@@ -77,8 +77,16 @@ syscall_test(
 
 syscall_test(
     size = "large",
-    mount_cgroup_v2 = True,
+    in_sandbox_cgroup = "v2",
+    shard_count = more_shards,
     test = "//test/syscalls/linux:cgroup2_test",
+)
+
+# Transfers must run separately from tests that enter non-root memory cgroups:
+# memory charges survive task migration and cgroup removal and can pin controllers.
+syscall_test(
+    in_sandbox_cgroup = "v2",
+    test = "//test/syscalls/linux:cgroup2_transfer_test",
 )
 
 syscall_test(
@@ -175,6 +183,11 @@ syscall_test(
 )
 
 syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:copy_file_range_test",
+)
+
+syscall_test(
     add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:creat_test",
@@ -189,6 +202,11 @@ syscall_test(
     add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:dup_test",
+)
+
+syscall_test(
+    in_sandbox_cgroup = "v2",
+    test = "//test/syscalls/linux:cgroup2_ebpf_test",
 )
 
 syscall_test(
@@ -294,6 +312,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:getdents_test",
@@ -359,6 +378,36 @@ syscall_test(
 )
 
 syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v1_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v2_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v3_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v4_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v5_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v6_test",
+)
+
+syscall_test(
     add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:link_test",
@@ -413,6 +462,9 @@ syscall_test(
 
 syscall_test(
     timeout = "eternal",  # YES_I_REALLY_NEED_AN_ETERNAL_TEST
+    # This fixed page-table leak workload makes millions of calls and does not
+    # consume their trace output. Keep debug logs without per-syscall tracing.
+    args = ["--strace=false"],
     save = False,  # save tests incorrectly shorten timeout to "long"
     test = "//test/syscalls/linux:mmap_eternal_test",
 )
@@ -460,7 +512,6 @@ syscall_test(
 
 syscall_test(
     add_hostinet = True,
-    netstack_sr = True,
     test = "//test/syscalls/linux:network_namespace_test",
 )
 
@@ -478,8 +529,12 @@ syscall_test(
 )
 
 syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:openat2_test",
+)
+
+syscall_test(
     add_hostinet = True,
-    netstack_sr = True,
     test = "//test/syscalls/linux:packet_socket_dgram_test",
 )
 
@@ -513,6 +568,8 @@ syscall_test(
 syscall_test(
     size = "medium",
     add_hostinet = True,
+    # Host-network sockets also need descriptors in the sentry.
+    args = ["--host-nofile=131072"],
     # Takes too long under gotsan to run.
     tags = ["nogotsan"],
     test = "//test/syscalls/linux:ping_socket_test",
@@ -523,6 +580,10 @@ syscall_test(
     add_overlay = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:pipe_test",
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:pointer_auth_test",
 )
 
 syscall_test(
@@ -574,6 +635,13 @@ syscall_test(
     container = True,
     one_sandbox = False,
     test = "//test/syscalls/linux:proc_isolated_test",
+)
+
+# Linux's key quota is host-wide. Keep its readers and writers together and
+# prevent other local tests from overlapping this unsharded test target.
+syscall_test(
+    tags = ["exclusive-if-local"],
+    test = "//test/syscalls/linux:proc_keys_test",
 )
 
 syscall_test(
@@ -835,6 +903,7 @@ syscall_test(
 syscall_test(
     size = "large",
     add_hostinet = True,
+    limit_ephemeral_ports = True,
     shard_count = most_shards,
     # Takes too long for TSAN. Creates a lot of TCP sockets.
     tags = ["nogotsan"],
@@ -843,20 +912,17 @@ syscall_test(
 
 syscall_test(
     add_hostinet = True,
-    netstack_sr = True,
     test = "//test/syscalls/linux:socket_ipv4_udp_unbound_external_networking_test",
 )
 
 syscall_test(
     # TODO(b/446206378): TestJoinLeaveMulticast fails with add_hostinet.
-    netstack_sr = True,
     test = "//test/syscalls/linux:socket_ipv6_udp_unbound_external_networking_test",
 )
 
 syscall_test(
     size = "large",
     add_hostinet = True,
-    netstack_sr = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_tcp_generic_loopback_test",
 )
@@ -937,7 +1003,6 @@ syscall_test(
 
 syscall_test(
     add_hostinet = True,
-    netstack_sr = True,
     test = "//test/syscalls/linux:socket_ipv6_udp_unbound_loopback_netlink_test",
 )
 
@@ -958,7 +1023,6 @@ syscall_test(
 
 syscall_test(
     add_hostinet = True,
-    netstack_sr = True,
     test = "//test/syscalls/linux:socket_ip_unbound_netlink_test",
 )
 
@@ -979,6 +1043,11 @@ syscall_test(
 
 syscall_test(
     nftables = True,
+    save = False,
+    tags = [
+        "local",
+        "notap",
+    ],
     test = "//test/syscalls/linux:socket_netlink_netfilter_test",
 )
 
@@ -1075,7 +1144,6 @@ syscall_test(
 
 syscall_test(
     size = "medium",
-    netstack_sr = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_unix_stream_test",
 )
@@ -1132,6 +1200,7 @@ syscall_test(
 syscall_test(
     add_fusefs = True,
     add_overlay = True,
+    requires_atime = True,
     test = "//test/syscalls/linux:stat_times_test",
 )
 
@@ -1144,6 +1213,7 @@ syscall_test(
 syscall_test(
     add_fusefs = True,
     add_overlay = True,
+    requires_atime = True,
     test = "//test/syscalls/linux:symlink_test",
 )
 
@@ -1208,10 +1278,6 @@ syscall_test(
 )
 
 syscall_test(
-    # TODO(b/318948806): tun.tunEndpoint is leaked.
-    leak_check = False,
-    # TODO(b/110961832): /dev/net/tun does not support S/R.
-    save = False,
     test = "//test/syscalls/linux:tuntap_test",
 )
 
@@ -1228,19 +1294,18 @@ syscall_test(
 syscall_test(
     size = "medium",
     add_hostinet = True,
-    netstack_sr = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:udp_socket_test",
 )
 
 syscall_test(
     add_hostinet = True,
-    netstack_sr = True,
     test = "//test/syscalls/linux:udp_raw_socket_test",
 )
 
 syscall_test(
     test = "//test/syscalls/linux:uidgid_test",
+    use_tmpfs = True,  # uidgid tests chown files to scratch IDs.
 )
 
 syscall_test(
@@ -1304,6 +1369,9 @@ syscall_test(
 )
 
 syscall_test(
+    # Per-syscall tracing dominates the million deliberately invalid close calls.
+    # Keep debug logs without formatting a trace for every call.
+    args = ["--strace=false"],
     test = "//test/syscalls/linux:processes_test",
 )
 
@@ -1323,6 +1391,7 @@ syscall_test(
     test = "//test/syscalls/linux:close_range_test",
 )
 
+# Internal socket-option tests depend on these generated test targets.
 syscall_test(
     save = False,
     test = "//test/syscalls/linux:socketopt_test",
@@ -1337,4 +1406,11 @@ syscall_test(
     add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:xattr_test",
+)
+
+syscall_test(
+    size = "large",
+    # TODO(b/546149934): These tests timeout with s/r, fix them and then enable.
+    save = False,
+    test = "//test/syscalls/linux:posix_acl_test",
 )

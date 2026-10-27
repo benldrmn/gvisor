@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/memutil"
+	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs" // Required by Kernel.Init.
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -34,17 +35,12 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm" // Register the KVM platform.
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace" // Register the ptrace platform.
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-
-	// Platforms are pluggable.
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm"
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
-
-	// Cgroup2fs is required by Kernel.Init.
-	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 )
 
 var (
@@ -55,7 +51,6 @@ var (
 // Boot initializes a new bare bones kernel for test.
 func Boot() (*kernel.Kernel, error) {
 	cpuid.Initialize()
-	seccheck.Initialize()
 
 	if err := usage.Init(); err != nil {
 		return nil, fmt.Errorf("setting up memory accounting: %v", err)
@@ -65,7 +60,11 @@ func Boot() (*kernel.Kernel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("platform not found: %v", err)
 	}
-	deviceFile, err := platformCtr.OpenDevice(*platformDevicePathFlag)
+	platformDesc, err := platformdesc.Lookup(*platformFlag)
+	if err != nil {
+		return nil, fmt.Errorf("platform not found: %v", err)
+	}
+	deviceFile, err := platformDesc.OpenDevice(*platformDevicePathFlag)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %v", err)
 	}
@@ -93,7 +92,7 @@ func Boot() (*kernel.Kernel, error) {
 	// Create timekeeper.
 	tk := kernel.NewTimekeeper()
 	params := kernel.NewVDSOParamPage(k.MemoryFile(), vdso.ParamPage.FileRange())
-	tk.SetClocks(time.NewCalibratedClocks(), params)
+	tk.SetClocks(time.NewCalibratedClocks(false), params)
 
 	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
 
@@ -130,6 +129,11 @@ func Boot() (*kernel.Kernel, error) {
 }
 
 // CreateTask creates a new bare bones task for tests.
+//
+// Preconditions: tc must belong to the Kernel in ctx.
+//
+// +checklocksexclude:tc.pidns.owner.mu
+// +checklocksexclude:tc.signalHandlers.mu
 func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns *vfs.MountNamespace, root, cwd vfs.VirtualDentry) (*kernel.Task, error) {
 	k := kernel.KernelFromContext(ctx)
 	if k == nil {
@@ -156,12 +160,14 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 		AllowedCPUMask:   sched.NewFullCPUSet(k.ApplicationCores()),
 		UTSNamespace:     kernel.UTSNamespaceFromContext(ctx),
 		IPCNamespace:     kernel.IPCNamespaceFromContext(ctx),
+		CgroupNamespace:  k.RootCgroupNamespace(),
 		MountNamespace:   mntns,
 		FSContext:        kernel.NewFSContext(root, cwd, 0022),
 		FDTable:          k.NewFDTable(),
 		UserCounters:     k.GetUserCounters(creds.RealKUID),
 	}
 	config.NetworkNamespace.IncRef()
+	config.CgroupNamespace.IncRef()
 	config.Credentials.UserNamespace.IncRef()
 	t, err := k.TaskSet().NewTask(ctx, config)
 	if err != nil {

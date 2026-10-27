@@ -14,9 +14,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/posix_error.h"
 #include "test/util/socket_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -38,7 +41,7 @@ TEST(ReadaheadTest, UnsupportedFile) {
 
 TEST(ReadaheadTest, InvalidOffset) {
   // This test is not valid for some Linux Kernels.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   const TempPath in_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(in_file.path(), O_RDWR));
@@ -89,7 +92,7 @@ TEST(ReadaheadTest, WriteOnly) {
 
 TEST(ReadaheadTest, InvalidSize) {
   // This test is not valid on some Linux kernels.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   const TempPath in_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(in_file.path(), O_RDWR));

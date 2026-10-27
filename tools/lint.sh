@@ -1,0 +1,455 @@
+#!/bin/bash
+
+# Copyright 2026 The gVisor Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# lint.sh runs gVisor's source-level lint checks without a builder container.
+# The optional actions check runs the //:github_actions_test Bazel test, which
+# CI runs with the unit tests. Deep Go analysis is owned by gVisor nogo.
+#
+# Usage:
+#   tools/lint.sh                        # run every check
+#   tools/lint.sh goimports clang-format  # run only the named checks
+#   tools/lint.sh --fix                  # rewrite files in place where a check can
+#
+# Environment:
+#   LINT_CACHE_DIR   where to cache downloaded linters
+#                    (default: ~/.cache/gvisor/lint)
+
+set -euo pipefail
+
+declare REPO_DIR
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly REPO_DIR
+cd "${REPO_DIR}"
+
+declare CACHE_DIR="${LINT_CACHE_DIR:-${HOME}/.cache/gvisor/lint}"
+if ! mkdir -p "${CACHE_DIR}" 2>/dev/null; then
+  CACHE_DIR="/tmp/gvisor-lint-cache-$(id -u)"
+  mkdir -p "${CACHE_DIR}"
+fi
+readonly CACHE_DIR
+
+# Every check, in run order, named as tools/lint.sh accepts it.
+declare -ra ALL_CHECKS=(goimports clang-format cpplint buildifier spelling)
+# Only the formatters can rewrite a file; the rest have no safe autofix.
+declare -ra FIXABLE_CHECKS=(goimports clang-format buildifier)
+# These additional checks run only when named.
+declare -ra OPTIONAL_CHECKS=(actions clang-tidy)
+declare -ra KNOWN_CHECKS=("${ALL_CHECKS[@]}" "${OPTIONAL_CHECKS[@]}")
+
+declare -r CODESPELL_VERSION="2.3.0"
+declare -r CPPLINT_VERSION="1.4.0"
+declare -r CLANG_FORMAT_VERSION="23.1.1"
+declare -r CLANG_TIDY_VERSION="22.1.8"
+# Keep in sync with images/default/Dockerfile.
+declare -r BUILDIFIER_VERSION="8.5.1"
+
+# The codespell and cpplint wheels are architecture-independent.
+declare -r CODESPELL_URL="https://files.pythonhosted.org/packages/0e/20/b6019add11e84f821184234cea0ad91442373489ef7ccfa3d73a71b908fa/codespell-${CODESPELL_VERSION}-py3-none-any.whl"
+declare -r CODESPELL_SHA256="a9c7cef2501c9cfede2110fd6d4e5e62296920efe9abfb84648df866e47f58d1"
+declare -r CPPLINT_URL="https://files.pythonhosted.org/packages/6a/52/4ec97b6e4f55549973ce668285228ff0bb1913f058265ff7549c65b3a97d/cpplint-${CPPLINT_VERSION}-py3-none-any.whl"
+declare -r CPPLINT_SHA256="5031cb9671cd5bb3dbb4d3243eebd0d42cdf76388ab49c0d276f8a2d116e9928"
+
+case "$(uname -m)" in
+  x86_64|amd64)
+    declare -r BUILDIFIER_ARCH="amd64"
+    declare -r BUILDIFIER_SHA256="887377fc64d23a850f4d18a077b5db05b19913f4b99b270d193f3c7334b5a9a7"
+    declare -r CLANG_FORMAT_URL="https://files.pythonhosted.org/packages/42/ef/3f8e215916e79ecd435b5bc20810443f80fce3fb8bbfe6d2783ceb775c1b/clang_format-${CLANG_FORMAT_VERSION}-py2.py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
+    declare -r CLANG_FORMAT_SHA256="64900462c1203cee2fec364536c2dda708baf0619e15b52ceda926648cc82f56"
+    declare -r CLANG_TIDY_URL="https://files.pythonhosted.org/packages/82/19/0f2668f8f5e2452b096a2b898f2b6bcecbceb6dd0c7f75d1755ce1f18d8b/clang_tidy-${CLANG_TIDY_VERSION}-py2.py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
+    declare -r CLANG_TIDY_SHA256="1a3de07ba82d4403d8b692ae63a5520d4db5c606014c92c24bbcef9259057bf1"
+    ;;
+  aarch64|arm64)
+    declare -r BUILDIFIER_ARCH="arm64"
+    declare -r BUILDIFIER_SHA256="947bf6700d708026b2057b09bea09abbc3cafc15d9ecea35bb3885c4b09ccd04"
+    declare -r CLANG_FORMAT_URL="https://files.pythonhosted.org/packages/0e/b6/1a162e427d912b88653a66e99a22414d798eb885b761ffddb74dbc13963f/clang_format-${CLANG_FORMAT_VERSION}-py2.py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
+    declare -r CLANG_FORMAT_SHA256="09af54d2ef51680b34e36ed71b9f510bd399fb7b10b29a2a40843cd0e0344228"
+    declare -r CLANG_TIDY_URL="https://files.pythonhosted.org/packages/ac/b7/61ed8c319f2d9ddb9762a550a6fee434bdef7bdc46d5a4b50929f1c90ec0/clang_tidy-${CLANG_TIDY_VERSION}-py2.py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
+    declare -r CLANG_TIDY_SHA256="1eaddaa7415e8c5e39aeefbfd15174f1ab2a671c86f7ebb200eb523cf9465559"
+    ;;
+  *)
+    echo "lint: unsupported architecture $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+# FIX is set by --fix; checks that can rewrite files consult it.
+declare FIX=0
+
+# fetch <url> <sha256> <output> downloads a file and verifies its checksum,
+# leaving <output> in place only if the checksum matches.
+fetch() {
+  local -r url="$1" want="$2" out="$3"
+  local tmp
+  tmp="$(mktemp "${out}.XXXXXX")"
+  if ! curl --fail --silent --show-error --location --retry 3 \
+      --max-time 300 --output "${tmp}" "${url}"; then
+    rm -f "${tmp}"
+    echo "lint: failed to download ${url}" >&2
+    return 1
+  fi
+  local got
+  got="$(sha256sum "${tmp}" | cut -d' ' -f1)"
+  if [[ "${got}" != "${want}" ]]; then
+    rm -f "${tmp}"
+    echo "lint: checksum mismatch for ${url}" >&2
+    echo "lint:   want ${want}" >&2
+    echo "lint:   got  ${got}" >&2
+    return 1
+  fi
+  mv "${tmp}" "${out}"
+}
+
+install_buildifier() {
+  local -r bin="${CACHE_DIR}/buildifier-${BUILDIFIER_VERSION}"
+  if [[ ! -x "${bin}" ]]; then
+    fetch "https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION}/buildifier-linux-${BUILDIFIER_ARCH}" \
+      "${BUILDIFIER_SHA256}" "${bin}"
+    chmod +x "${bin}"
+  fi
+  echo "${bin}"
+}
+
+install_codespell() {
+  local -r dir="${CACHE_DIR}/codespell-${CODESPELL_VERSION}"
+  if [[ ! -d "${dir}" ]]; then
+    local -r wheel="${CACHE_DIR}/codespell.whl"
+    fetch "${CODESPELL_URL}" "${CODESPELL_SHA256}" "${wheel}"
+    rm -rf "${dir}.tmp"
+    mkdir -p "${dir}.tmp"
+    unzip -q "${wheel}" -d "${dir}.tmp"
+    mv "${dir}.tmp" "${dir}"
+    rm -f "${wheel}"
+  fi
+  echo "${dir}"
+}
+
+install_cpplint() {
+  local -r dir="${CACHE_DIR}/cpplint-${CPPLINT_VERSION}"
+  if [[ ! -d "${dir}" ]]; then
+    local -r wheel="${CACHE_DIR}/cpplint.whl"
+    fetch "${CPPLINT_URL}" "${CPPLINT_SHA256}" "${wheel}"
+    rm -rf "${dir}.tmp"
+    mkdir -p "${dir}.tmp"
+    unzip -q "${wheel}" -d "${dir}.tmp"
+    mv "${dir}.tmp" "${dir}"
+    rm -f "${wheel}"
+  fi
+  echo "${dir}"
+}
+
+install_clang_format() {
+  local -r bin="${CACHE_DIR}/clang-format-${CLANG_FORMAT_VERSION}"
+  if [[ ! -x "${bin}" ]]; then
+    local -r wheel="${CACHE_DIR}/clang-format.whl"
+    local -r dir="${CACHE_DIR}/clang-format.d"
+    fetch "${CLANG_FORMAT_URL}" "${CLANG_FORMAT_SHA256}" "${wheel}"
+    rm -rf "${dir}"
+    mkdir -p "${dir}"
+    unzip -q "${wheel}" -d "${dir}"
+    mv "${dir}/clang_format/data/bin/clang-format" "${bin}"
+    chmod +x "${bin}"
+    rm -rf "${dir}" "${wheel}"
+  fi
+  echo "${bin}"
+}
+
+install_clang_tidy() {
+  local -r dir="${CACHE_DIR}/clang-tidy-${CLANG_TIDY_VERSION}"
+  local -r bin="${dir}/clang_tidy/data/bin/clang-tidy"
+  if [[ ! -x "${bin}" ]]; then
+    local -r wheel="${CACHE_DIR}/clang-tidy.whl"
+    fetch "${CLANG_TIDY_URL}" "${CLANG_TIDY_SHA256}" "${wheel}"
+    rm -rf "${dir}.tmp"
+    mkdir -p "${dir}.tmp"
+    unzip -q "${wheel}" -d "${dir}.tmp"
+    chmod +x "${dir}.tmp/clang_tidy/data/bin/clang-tidy"
+    rm -rf "${dir}"
+    mv "${dir}.tmp" "${dir}"
+    rm -f "${wheel}"
+  fi
+  echo "${bin}"
+}
+
+# Only tracked files, to skip bazel-* symlinks and other build output.
+go_files() { git ls-files -z -- '*.go' "$@"; }
+doc_files() { git ls-files -z -- '*.md' '*.html'; }
+cc_files() { git ls-files -z -- '*.c' '*.cc' '*.h'; }
+bazel_files() {
+  git ls-files -z -- 'BUILD' '*/BUILD' '*.bzl' 'WORKSPACE' 'MODULE.bazel'
+}
+
+declare -a FAILED=()
+declare -a PASSED=()
+
+# report <name> <status> records a check result for the final summary.
+report() {
+  if [[ "$2" -eq 0 ]]; then
+    PASSED+=("$1")
+  else
+    FAILED+=("$1")
+  fi
+}
+
+# Formatting-only mode does not add or remove imports: generated packages may
+# not exist until Bazel builds them.
+check_goimports() {
+  local -ra goimports=(
+    bazel run --run_in_cwd @org_golang_x_tools//cmd/goimports -- -format-only
+  )
+  # This golden output tests comment positions across merged import declarations.
+  # goimports would merge the declarations and move their comments.
+  local -r golden_outputs=':(exclude)tools/go_generics/tests/simple/output.go'
+  if [[ "${FIX}" -eq 1 ]]; then
+    go_files "${golden_outputs}" | xargs -0 "${goimports[@]}" -w -l
+    return
+  fi
+  local output
+  output="$(go_files "${golden_outputs}" | xargs -0 "${goimports[@]}" -d)"
+  if [[ -n "${output}" ]]; then
+    printf '%s\n' "${output}"
+    echo 'Run `make lint-fix` to reformat these files.' >&2
+    return 1
+  fi
+}
+
+# The style lives in //.clang-format; clang-format finds it by walking up
+# from each file, so no style is passed here.
+check_clang_format() {
+  # Without the config, clang-format silently falls back to LLVM style.
+  if [[ ! -f "${REPO_DIR}/.clang-format" ]]; then
+    echo "lint: .clang-format is missing from the repository root" >&2
+    return 1
+  fi
+  local clang_format
+  clang_format="$(install_clang_format)"
+  # clang-format is single-threaded and each file is independent.
+  local -r jobs="$(nproc 2>/dev/null || echo 1)"
+  if [[ "${FIX}" -eq 1 ]]; then
+    cc_files | xargs -0 -P "${jobs}" -n 32 "${clang_format}" -i
+    return 0
+  fi
+  # --dry-run reports one diagnostic per hunk; collapse it to a file list.
+  local warnings status=0
+  warnings="$(cc_files |
+    xargs -0 -P "${jobs}" -n 32 "${clang_format}" --dry-run -Werror 2>&1)" ||
+    status=$?
+  if [[ "${status}" -ne 0 ]]; then
+    printf '%s\n' "${warnings}" >&2
+    # -Werror reports these as "error:" rather than "warning:".
+    local file
+    while IFS= read -r file; do
+      [[ -f "${file}" ]] || continue
+      diff -u --label "${file}" --label "${file} (formatted)" \
+        "${file}" <("${clang_format}" "${file}") || true
+    done < <(printf '%s\n' "${warnings}" |
+      sed -n 's/^\(.*\):[0-9]\+:[0-9]\+: \(warning\|error\): .*/\1/p' | sort -u)
+    echo
+    echo "Run \`make lint-fix\` to reformat these files." >&2
+    return 1
+  fi
+}
+
+check_clang_tidy() {
+  if [[ ! -f "${REPO_DIR}/.clang-tidy" ]]; then
+    echo "lint: .clang-tidy is missing from the repository root" >&2
+    return 1
+  fi
+  local -r database="${REPO_DIR}/compile_commands.json"
+  if [[ ! -f "${database}" ]]; then
+    if ! command -v bazel > /dev/null 2>&1; then
+      echo "lint: ${database} is missing and bazel is not on PATH" >&2
+      echo "lint: run tools/gen_compile_commands.py to create it" >&2
+      return 1
+    fi
+    python3 "${REPO_DIR}/tools/gen_compile_commands.py" >&2
+  fi
+  local clang_tidy
+  clang_tidy="$(install_clang_tidy)"
+  python3 "${REPO_DIR}/tools/clang_tidy/clang_tidy.py" \
+    --clang-tidy="${clang_tidy}" \
+    --config-file="${REPO_DIR}/.clang-tidy" \
+    --database="${database}" \
+    --jobs="$(nproc 2> /dev/null || echo 1)"
+}
+
+# Native rule loads (native-sh-test, native-sh-binary, native-proto) are
+# excluded because rules_shell / proto_library.bzl loads are not used here.
+check_buildifier() {
+  local buildifier
+  buildifier="$(install_buildifier)"
+  local -r warnings="-duplicated-name,-list-append,-native-py,-native-sh-binary,-native-sh-library,-native-sh-test,-native-proto"
+  if [[ "${FIX}" -eq 1 ]]; then
+    bazel_files | xargs -0 "${buildifier}" --mode=fix --lint=fix --warnings="${warnings}"
+    return 0
+  fi
+  local output status=0
+  output="$(bazel_files | xargs -0 "${buildifier}" --mode=check --lint=warn --warnings="${warnings}" 2>&1)" || status=$?
+  if [[ -z "${output}" ]]; then
+    return "${status}"
+  fi
+  local unformatted
+  unformatted="$(printf '%s\n' "${output}" | sed -n 's/^\(.*\) # reformat$/\1/p')"
+  local lint_warnings
+  lint_warnings="$(printf '%s\n' "${output}" | grep -v ' # reformat$' || true)"
+  local rc="${status}"
+  if [[ -n "${unformatted}" ]]; then
+    local file
+    while IFS= read -r file; do
+      # -path lets buildifier infer the file type from stdin, so the diff
+      # matches what --mode=fix would write.
+      diff -u --label "${file}" --label "${file} (formatted)" \
+        "${file}" <("${buildifier}" -path="${file}" < "${file}") || true
+    done <<< "${unformatted}"
+    echo
+    echo "Run \`make lint-fix\` to reformat these files." >&2
+    rc=1
+  fi
+  if [[ -n "${lint_warnings}" ]]; then
+    echo "${lint_warnings}" >&2
+    rc=1
+  fi
+  return "${rc}"
+}
+
+check_actions() {
+  if ! command -v bazel > /dev/null 2>&1; then
+    echo "lint: bazel is not on PATH; the actions check runs //:github_actions_test" >&2
+    return 1
+  fi
+  bazel test --enable_runfiles --test_output=errors //:github_actions_test
+}
+
+check_spelling() {
+  local codespell_dir
+  codespell_dir="$(install_codespell)"
+  # Source is included, so identifiers codespell reads as prose (offsetP,
+  # FillIn, ...) need entries in tools/.codespellrc.
+  { doc_files && go_files && cc_files; } |
+    PYTHONPATH="${codespell_dir}" xargs -0 python3 -m codespell_lib \
+      --config "${REPO_DIR}/tools/.codespellrc"
+}
+
+check_cpplint() {
+  local cpplint_dir
+  cpplint_dir="$(install_cpplint)"
+  local -r jobs="$(nproc 2>/dev/null || echo 1)"
+  cc_files |
+    PYTHONPATH="${cpplint_dir}" xargs -0 -P "${jobs}" -n 32 python3 -W ignore::DeprecationWarning -m cpplint \
+      --quiet --filter=-,+build/include_order,+build/c++11
+}
+
+
+contains() {
+  local -r needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [[ "${item}" == "${needle}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_check() {
+  local -r name="$1" fn="$2" desc="$3"
+  echo "==> ${desc}" >&2
+  # A conditional call would disable errexit throughout the check. Capture an
+  # unconditional subshell instead, so one failed check does not stop the rest.
+  local status
+  set +e
+  (
+    set -eE
+    # Bash clears errexit in command substitutions; inherit this trap into them.
+    trap 'exit "$?"' ERR
+    "${fn}"
+  )
+  status=$?
+  set -e
+  report "${name}" "${status}"
+}
+
+main() {
+  mkdir -p "${CACHE_DIR}"
+
+  local -a args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --fix) FIX=1 ;;
+      *)     args+=("${arg}") ;;
+    esac
+  done
+
+  local -a checks=("${args[@]+"${args[@]}"}")
+  if [[ "${#checks[@]}" -eq 0 ]]; then
+    checks=("${ALL_CHECKS[@]}")
+  fi
+
+  local c
+  for c in "${checks[@]}"; do
+    if ! contains "${c}" "${KNOWN_CHECKS[@]}"; then
+      echo "lint: unknown check '${c}'" >&2
+      echo "lint: known checks: ${KNOWN_CHECKS[*]}" >&2
+      exit 1
+    fi
+  done
+
+  if [[ "${FIX}" -eq 1 ]]; then
+    local -a fixable=()
+    for c in "${checks[@]}"; do
+      if contains "${c}" "${FIXABLE_CHECKS[@]}"; then
+        fixable+=("${c}")
+      fi
+    done
+    checks=("${fixable[@]+"${fixable[@]}"}")
+    if [[ "${#checks[@]}" -eq 0 ]]; then
+      echo "lint: --fix applies only to ${FIXABLE_CHECKS[*]}" >&2
+      exit 1
+    fi
+  fi
+
+  local check
+  for check in "${checks[@]}"; do
+    case "${check}" in
+      goimports)    run_check goimports check_goimports "goimports" ;;
+      clang-format) run_check clang-format check_clang_format "clang-format" ;;
+      cpplint)      run_check cpplint check_cpplint "cpplint" ;;
+      clang-tidy)   run_check clang-tidy check_clang_tidy "clang-tidy" ;;
+      buildifier)   run_check buildifier check_buildifier "buildifier" ;;
+      actions)      run_check actions check_actions "actionlint" ;;
+      spelling)     run_check spelling check_spelling "codespell" ;;
+    esac
+  done
+
+  echo "==> Lint summary" >&2
+  local name
+  for name in "${PASSED[@]+"${PASSED[@]}"}"; do
+    echo "  PASS  ${name}" >&2
+  done
+  for name in "${FAILED[@]+"${FAILED[@]}"}"; do
+    echo "  FAIL  ${name}" >&2
+  done
+  if [[ "${#FAILED[@]}" -gt 0 ]]; then
+    echo >&2
+    echo "lint: ${#FAILED[@]} check(s) failed." >&2
+    exit 1
+  fi
+  echo >&2
+  echo "lint: all checks passed." >&2
+}
+
+main "$@"

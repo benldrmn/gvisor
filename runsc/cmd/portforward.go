@@ -31,7 +31,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/urpc"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -86,7 +86,7 @@ func (p *PortForward) SetFlags(f *flag.FlagSet) {
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (p *PortForward) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := p.loadContainer(conf, f, container.LoadOpts{})
+	c, err := p.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -104,7 +104,7 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 
 	portStr := f.Arg(1)
 
-	c, err := p.loadContainer(conf, f, container.LoadOpts{})
+	c, err := p.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
@@ -236,7 +236,7 @@ func (p *PortForward) doStream(ctx context.Context, port string, c *container.Co
 	}
 	defer f.Close()
 
-	if err := c.PortForward(&boot.PortForwardOpts{
+	if err := c.PortForward(&sentryapi.PortForwardOpts{
 		Port:        uint16(p.portNum),
 		ContainerID: c.ID,
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
@@ -273,7 +273,7 @@ func portCopy(ctx context.Context, c *container.Container, localConn net.Conn, p
 	// Request port forwarding from the sentry. This request will return
 	// immediately after port forwarding is started and connection state is
 	// handled via the UDS from then on.
-	if err := c.PortForward(&boot.PortForwardOpts{
+	if err := c.PortForward(&sentryapi.PortForwardOpts{
 		Port:        port,
 		FilePayload: urpc.FilePayload{Files: []*os.File{streamFile}},
 	}); err != nil {

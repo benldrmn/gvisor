@@ -183,11 +183,14 @@ go_test(
     name = "mm_test",
     size = "small",
     srcs = ["mm_test.go"],
-    library = ":mm",
+    embed = [":mm"],
     deps = [
         "//pkg/context",
+        "//pkg/errors",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
+        "//pkg/memutil",
+        "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/limits",
@@ -195,5 +198,6 @@ go_test(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

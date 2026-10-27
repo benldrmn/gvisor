@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
 )
@@ -112,18 +113,43 @@ func PrepareArgs(subCmdName string, fSet *flag.FlagSet, override map[string]stri
 	return args
 }
 
-// ExecProcUmounter executes a child process that umounts /proc when the
-// returned pipe is closed.
-func ExecProcUmounter() (*exec.Cmd, *os.File) {
+// SyncUsernsForRootless waits on usernsFD to be closed and then sets
+// UID/GID to uid/gid. Note that this function calls runtime.LockOSThread().
+//
+// Postcondition: All callers must re-exec themselves after this returns.
+func SyncUsernsForRootless(fd int, uid uint32, gid uint32) {
+	if err := WaitForFD(fd, "userns sync FD"); err != nil {
+		util.Fatalf("failed to sync on userns FD: %v", err)
+	}
+
+	// SETUID changes UID on the current system thread, so we have
+	// to re-execute current binary.
+	runtime.LockOSThread()
+	if _, _, errno := unix.RawSyscall(unix.SYS_SETUID, uintptr(uid), 0, 0); errno != 0 {
+		util.Fatalf("failed to set UID: %v", errno)
+	}
+	if _, _, errno := unix.RawSyscall(unix.SYS_SETGID, uintptr(gid), 0, 0); errno != 0 {
+		util.Fatalf("failed to set GID: %v", errno)
+	}
+}
+
+// ExecProcUmounter executes the gvisor-proc-umounter binary `umounter` as a
+// child process that umounts /proc when the returned pipe is written to.
+// `umounter` may be an O_PATH file, so that it can be executed after the host
+// filesystem is no longer reachable.
+func ExecProcUmounter(umounter *os.File) (*exec.Cmd, *os.File) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		util.Fatalf("error creating a pipe: %v", err)
 	}
 	defer r.Close()
 
-	cmd := exec.Command(specutils.ExePath)
-	cmd.Args = append(cmd.Args, "umount", "--sync-fd=3", "/proc")
-	cmd.ExtraFiles = append(cmd.ExtraFiles, r)
+	// The sync pipe gets FD 3 and `umounter` gets FD 4 in the child.
+	// LINT.IfChange
+	cmd := exec.Command("/proc/self/fd/4", "/proc")
+	cmd.ExtraFiles = []*os.File{r, umounter}
+	// LINT.ThenChange(../../procumounter/procumounter.c)
+	cmd.Args[0] = gvisorbinaries.ProcUmounter.Name
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -136,7 +162,13 @@ func ExecProcUmounter() (*exec.Cmd, *os.File) {
 // UmountProc writes to syncFD signalling the process started by
 // ExecProcUmounter() to umount /proc.
 func UmountProc(syncFD int) {
-	syncFile := os.NewFile(uintptr(syncFD), "procfs umount sync FD")
+	UmountProcFile(os.NewFile(uintptr(syncFD), "procfs umount sync FD"))
+}
+
+// UmountProcFile is like `UmountProc`, but takes the pipe's write end as an
+// `os.File`. This must be used when the caller already holds a `os.File`
+// (e.g. when the boot process continues without re-exec'ing).
+func UmountProcFile(syncFile *os.File) {
 	buf := make([]byte, 1)
 	if w, err := syncFile.Write(buf); err != nil || w != 1 {
 		util.Fatalf("unable to write into the proc umounter descriptor: %v", err)
@@ -149,6 +181,17 @@ func UmountProc(syncFD int) {
 	}
 	if !waitStatus.Exited() || waitStatus.ExitStatus() != 0 {
 		util.Fatalf("the proc umounter process failed: %v", waitStatus)
+	}
+	if err := unix.Access("/proc/self", unix.F_OK); err != unix.ENOENT {
+		util.Fatalf("/proc is still accessible")
+	}
+}
+
+// UmountProcInProcess umounts /proc directly from the calling process.
+// The caller must still hold CAP_SYS_ADMIN.
+func UmountProcInProcess() {
+	if err := unix.Unmount("/proc", unix.MNT_DETACH); err != nil {
+		util.Fatalf("error umounting /proc: %v", err)
 	}
 	if err := unix.Access("/proc/self", unix.F_OK); err != unix.ENOENT {
 		util.Fatalf("/proc is still accessible")

@@ -14,27 +14,39 @@ go_library(
         "metricserver_metrics.go",
         "metricserver_profile.go",
     ],
-    visibility = ["//runsc:__subpackages__"],
+    visibility = [
+        "//:__pkg__",
+        "//runsc:__subpackages__",
+    ],
     deps = [
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/log",
         "//pkg/prometheus",
-        "//pkg/sentry/control",
+        "//pkg/sentry/control/controlapi",
         "//pkg/state",
         "//pkg/sync",
         "//runsc/config",
         "//runsc/container",
         "//runsc/metricserver/containermetrics",
         "//runsc/sandbox",
+        "@com_google_cloud_go_compute_metadata//:go_default_library",
         "@org_golang_google_api//option:go_default_library",
         "@org_golang_google_grpc//:go_default_library",
+        "@org_golang_google_grpc//credentials/insecure:go_default_library",
     ],
 )
 
 go_test(
     name = "metricserver_test",
     srcs = ["metricserver_test.go"],
-    library = ":metricserver",
-    deps = ["@com_github_google_go_cmp//cmp:go_default_library"],
+    embed = [":metricserver"],
+    deps = [
+        "//pkg/metric:metric_go_proto",
+        "//runsc/container",
+        "//runsc/sandbox",
+        "//runsc/specutils",
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
 )

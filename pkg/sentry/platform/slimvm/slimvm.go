@@ -16,16 +16,15 @@
 package slimvm
 
 import (
-	"fmt"
 	"strconv"
 	"sync"
-	"syscall"
 
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
@@ -51,23 +50,11 @@ var (
 	slimvmFile *fd.FD
 )
 
-// OpenDevice opens the SlimVM device at /dev/slimvm and returns the File.
-func OpenDevice(devicePath string) (*fd.FD, error) {
-	if devicePath == "" {
-		devicePath = "/dev/slimvm"
-	}
-	f, err := fd.Open(devicePath, syscall.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("error opening %s: %v", devicePath, err)
-	}
-	return f, nil
-}
-
 // New returns a new SlimVM-based implementation of the platform interface.
-func New(deviceFile *fd.FD, sandboxID string, applicationCores int) (*SlimVM, error) {
-	slimvmFile = deviceFile
+func New(opts platform.Options) (*SlimVM, error) {
+	mbCh := hostmm.Probe(true)
+	slimvmFile = opts.DeviceFile
 	slimvmFD = uintptr(slimvmFile.FD())
-
 	// Ensure global initialization is done.
 	globalOnce.Do(func() {
 		updateGlobalOnce(int(slimvmFD))
@@ -75,19 +62,25 @@ func New(deviceFile *fd.FD, sandboxID string, applicationCores int) (*SlimVM, er
 	if globalErr != nil {
 		return nil, globalErr
 	}
+	opts.StartupTimer.Reached("slimvm global state initialized")
 
 	// Parse sandbox ID for the host kernel module.
-	sid, _ := strconv.ParseInt(sandboxID[:min(8, len(sandboxID))], 16, 64)
+	sid, _ := strconv.ParseInt(opts.SandboxID[:min(8, len(opts.SandboxID))], 16, 64)
 
 	// Create a VM context.
-	machine, err := newMachine(sid, applicationCores)
+	machine, err := newMachine(sid, opts.ApplicationCores, opts.StartupTimer)
 	if err != nil {
 		return nil, err
 	}
+	opts.StartupTimer.Reached("slimvm machine created")
 
-	// All set.
+	opts.StartupTimer.Reached("waiting for membarrier")
+	memBarrier := <-mbCh
+	opts.StartupTimer.Reached("host membarrier probed")
+
 	return &SlimVM{
-		machine: machine,
+		UseHostProcessMemoryBarrier: platform.UseHostProcessMemoryBarrier{MemBarrier: memBarrier},
+		machine:                     machine,
 	}, nil
 }
 
@@ -121,7 +114,7 @@ func (*SlimVM) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new pagetable root.
-func (k *SlimVM) NewAddressSpace() (platform.AddressSpace, error) {
+func (k *SlimVM) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	// Allocate page tables and install system mappings.
 	pageTables := pagetables.NewWithUpper(newAllocator(), k.machine.upperSharedPageTables, ring0.KernelStartAddress)
 
@@ -134,9 +127,11 @@ func (k *SlimVM) NewAddressSpace() (platform.AddressSpace, error) {
 
 // NewContext returns an interruptible context.
 func (k *SlimVM) NewContext(pkgcontext.Context) platform.Context {
-	return &context{
+	c := &context{
 		machine: k.machine,
 	}
+	c.interrupt.Dst = c
+	return c
 }
 
 // ConcurrencyCount implements platform.Platform.ConcurrencyCount.
@@ -155,15 +150,7 @@ func (k *SlimVM) HealthCheck() {
 type constructor struct{}
 
 func (*constructor) New(opts platform.Options) (platform.Platform, error) {
-	return New(opts.DeviceFile, opts.SandboxID, opts.ApplicationCores)
-}
-
-func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {
-	return OpenDevice(devicePath)
-}
-
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{}
+	return New(opts)
 }
 
 func init() {

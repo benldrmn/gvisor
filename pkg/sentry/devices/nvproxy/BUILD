@@ -61,6 +61,7 @@ go_library(
         "seccomp_filters.go",
         "uvm.go",
         "uvm_mmap.go",
+        "uvm_tools.go",
         "uvm_unsafe.go",
         "version.go",
     ],
@@ -103,7 +104,7 @@ go_library(
 go_test(
     name = "nvproxy_test",
     srcs = ["nvproxy_test.go"],
-    library = ":nvproxy",
+    embed = [":nvproxy"],
     deps = [
         "//pkg/abi/nvgpu",
         "//pkg/seccomp",

@@ -14,9 +14,19 @@
 
 #include "test/syscalls/linux/socket_ipv4_datagram_based_socket_unbound.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include <cerrno>
+
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/syscalls/linux/ip_socket_test_util.h"
 #include "test/util/capability_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/socket_util.h"
+#include "test/util/test_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -34,7 +44,7 @@ void IPv4DatagramBasedUnboundSocketTest::SetUp() {
     // privs. So we only run the test with gVisor and not hostinet, and even
     // then require CAP_NET_RAW.
     // See https://lwn.net/Articles/443051/
-    SKIP_IF(!IsRunningOnGvisor() || IsRunningWithHostinet() ||
+    SKIP_IF(GvisorPlatform() == Platform::kNative || IsRunningWithHostinet() ||
             ASSERT_NO_ERRNO_AND_VALUE(HaveRawIPSocketCapability(
                 GetParam().domain, GetParam().protocol)));
   }
@@ -267,7 +277,7 @@ TEST_P(IPv4DatagramBasedUnboundSocketTest, IpMulticastIfSetNic) {
 
 TEST_P(IPv4DatagramBasedUnboundSocketTest, TestJoinGroupNoIf) {
   // TODO(b/185517803): Fix for native test.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   auto socket1 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto socket2 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 

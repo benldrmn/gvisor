@@ -36,7 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/prometheus"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/runsc/config"
@@ -62,28 +62,36 @@ const (
 type servedSandbox struct {
 	rootContainerID container.FullID
 	server          *metricServer
-	extraLabels     map[string]string
 
-	// mu protects the fields below.
+	// extraLabels is initialized by load along with sandbox and is immutable
+	// thereafter. Metrics readers synchronize initialization by calling load.
+	// checklocks cannot express ownership that changes from mu during
+	// initialization to immutable access after a successful load.
+	extraLabels map[string]string
+
 	mu sync.Mutex
 
 	// sandbox is the sandbox being monitored.
-	// Once set, it is immutable.
+	// Once set, the pointer is not reassigned.
+	//
+	// +checklocks:mu
 	sandbox *sandbox.Sandbox
 
 	// createdAt stores the time the sandbox was created.
 	// It is loaded from the container state file.
-	// Once set, it is immutable.
+	// Like extraLabels, it is immutable after initialization by load.
 	createdAt time.Time
 
 	// capabilities is the union of the capability set of the containers within `sandbox`.
 	// It is used to export a per-sandbox metric representing which capabilities are in use.
 	// For monitoring purposes, a capability added in a container means it is considered
 	// added for the whole sandbox.
+	// Like extraLabels, it is immutable after initialization by load.
 	capabilities []linux.Capability
 
 	// specMetadataLabels is the set of label exported as part of the
 	// `spec_metadata` metric.
+	// Like extraLabels, it is immutable after initialization by load.
 	specMetadataLabels map[string]string
 
 	// verifier allows verifying the data integrity of the metrics we get from this sandbox.
@@ -91,13 +99,16 @@ type servedSandbox struct {
 	// access to the sandbox. Metric registration data is loaded from the root container's
 	// state file.
 	// The server needs to load this registration data before any data from this sandbox is
-	// served to HTTP clients. If there is no metric registration data within the Container
-	// data, then metrics were not requested for this sandbox, and this servedSandbox should
-	// be deleted from the server.
-	// Once set, it is immutable.
+	// served to HTTP clients. The sandbox has no metric registration data until it starts;
+	// until then, only metadata about the sandbox is served.
+	// Once set, the pointer is not reassigned.
+	//
+	// +checklocks:mu
 	verifier *prometheus.Verifier
 
 	// cleanupVerifier holds a reference to the cleanup function of the verifier.
+	//
+	// +checklocks:mu
 	cleanupVerifier func()
 
 	// extra contains additional per-sandbox data.
@@ -105,19 +116,19 @@ type servedSandbox struct {
 }
 
 // load loads the sandbox being monitored and initializes its metric verifier.
-// If it returns an error other than container.ErrStateFileLocked, the sandbox is either
-// non-existent, or has not requested instrumentation to be enabled, or does not have
-// valid metric registration data. In any of these cases, the sandbox should be removed
-// from this metrics server.
+// Errors mean the sandbox should be removed from this metrics server.
+//
+// +checklocksexclude:s.mu
 func (s *servedSandbox) load() (*sandbox.Sandbox, *prometheus.Verifier, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sandbox == nil {
+	justLoaded := s.sandbox == nil
+	if justLoaded {
 		allContainers, err := container.LoadSandbox(s.server.rootDir, s.rootContainerID.SandboxID, container.LoadOpts{
-			TryLock: container.TryAcquire,
+			ReadOnly: true,
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("cannot load sandbox %q: %v", s.rootContainerID.SandboxID, err)
+			return nil, nil, fmt.Errorf("cannot load sandbox %q: %w", s.rootContainerID.SandboxID, err)
 		}
 		var rootContainer *container.Container
 		for _, cont := range allContainers {
@@ -181,16 +192,27 @@ func (s *servedSandbox) load() (*sandbox.Sandbox, *prometheus.Verifier, error) {
 		s.createdAt = rootContainer.CreatedAt
 	}
 	if s.verifier == nil {
-		registeredMetrics, err := s.sandbox.GetRegisteredMetrics()
-		if err != nil {
-			return nil, nil, err
+		registeredMetrics := s.sandbox.RegisteredMetrics
+		if registeredMetrics == nil && !justLoaded {
+			// The sandbox may have started since it was loaded.
+			rootContainer, err := container.Load(s.server.rootDir, s.rootContainerID, container.LoadOpts{
+				Exact:     true,
+				SkipCheck: true,
+				ReadOnly:  true,
+			})
+			if err != nil {
+				return nil, nil, fmt.Errorf("cannot load root container of sandbox %q: %w", s.rootContainerID.SandboxID, err)
+			}
+			registeredMetrics = rootContainer.Sandbox.RegisteredMetrics
 		}
-		verifier, cleanup, err := prometheus.NewVerifier(registeredMetrics)
-		if err != nil {
-			return nil, nil, err
+		if registeredMetrics != nil {
+			verifier, cleanup, err := prometheus.NewVerifier(registeredMetrics)
+			if err != nil {
+				return nil, nil, err
+			}
+			s.verifier = verifier
+			s.cleanupVerifier = cleanup
 		}
-		s.verifier = verifier
-		s.cleanupVerifier = cleanup
 	}
 	if err := s.extra.load(s); err != nil {
 		return nil, nil, err
@@ -198,6 +220,7 @@ func (s *servedSandbox) load() (*sandbox.Sandbox, *prometheus.Verifier, error) {
 	return s.sandbox, s.verifier, nil
 }
 
+// +checklocksexclude:s.mu
 func (s *servedSandbox) cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -206,8 +229,12 @@ func (s *servedSandbox) cleanup() {
 	}
 }
 
-// querySandboxMetrics queries the sandbox for metrics data.
+// querySandboxMetrics queries the sandbox for metrics data. `verifier` is nil
+// if the sandbox has not started yet.
 func querySandboxMetrics(ctx context.Context, sand *sandbox.Sandbox, verifier *prometheus.Verifier, metricsFilter string) (*prometheus.Snapshot, error) {
+	if verifier == nil {
+		return prometheus.NewSnapshot(), nil
+	}
 	ch := make(chan struct {
 		snapshot *prometheus.Snapshot
 		err      error
@@ -215,7 +242,7 @@ func querySandboxMetrics(ctx context.Context, sand *sandbox.Sandbox, verifier *p
 	canceled := make(chan struct{}, 1)
 	defer close(canceled)
 	go func() {
-		snapshot, err := sand.ExportMetrics(control.MetricsExportOpts{
+		snapshot, err := sand.ExportMetrics(controlapi.MetricsExportOpts{
 			OnlyMetrics: metricsFilter,
 		})
 		res := struct {
@@ -247,7 +274,6 @@ func querySandboxMetrics(ctx context.Context, sand *sandbox.Sandbox, verifier *p
 type metricServer struct {
 	rootDir                string
 	pid                    int
-	pidFile                string
 	allowUnknownRoot       bool
 	exposeProfileEndpoints bool
 	address                string
@@ -257,28 +283,42 @@ type metricServer struct {
 
 	// Size of the map of written metrics during the last /metrics export. Initially zero.
 	// Used to efficiently reallocate a map of the right size during the next export.
+	//
+	// +checkatomic
 	lastMetricsWrittenSize atomicbitops.Uint32
 
 	// Pool of `prometheus.ReusableWriter`s. Used to avoid large buffer allocations for
 	// successive snapshots.
 	promWriterPool sync.Pool
 
-	// mu protects the fields below.
+	// mu protects mutable registry, request-filter, and shutdown state.
 	mu sync.Mutex
+
+	// pidFile is the path to the PID file to remove on shutdown. It is cleared
+	// after successful removal.
+	//
+	// +checklocks:mu
+	pidFile string
 
 	// udsPath is a path to a Unix Domain Socket file on which the server is bound and which it owns.
 	// This socket file will be deleted on server shutdown.
 	// This field is not set if binding to a network port, or when the UDS already existed prior to
 	// being bound by us (i.e. its ownership isn't ours), such that it isn't deleted in this case.
 	// The field is unset once the file is successfully removed.
+	//
+	// +checklocks:mu
 	udsPath string
 
 	// sandboxes is the list of sandboxes we serve metrics for.
+	//
+	// +checklocks:mu
 	sandboxes map[container.FullID]*servedSandbox
 
 	// lastStateFileStat maps container full IDs to the last observed stat() of their state file.
 	// This is used to monitor for sandboxes in the background. If a sandbox's state file matches this
 	// info, we can assume that the last background scan already looked at it.
+	//
+	// +checklocks:mu
 	lastStateFileStat map[container.FullID]os.FileInfo
 
 	// lastValidMetricFilter stores the last value of the "runsc-sandbox-metrics-filter" parameter for
@@ -286,6 +326,8 @@ type metricServer struct {
 	// It represents the last-known compilable regular expression that was passed to /metrics.
 	// It is used to avoid re-verifying this parameter in the common case where a single scraper
 	// is consistently passing in the same value for this parameter in each successive request.
+	//
+	// +checklocks:mu
 	lastValidMetricFilter string
 
 	// lastValidCapabilityFilterStr stores the last value of the "runsc-capability-filter" parameter
@@ -293,10 +335,14 @@ type metricServer struct {
 	// It represents the last-known compilable regular expression that was passed to /metrics.
 	// It is used to avoid re-verifying this parameter in the common case where a single scraper
 	// is consistently passing in the same value for this parameter in each successive request.
+	//
+	// +checklocks:mu
 	lastValidCapabilityFilterStr string
 
 	// lastValidCapabilityFilterReg is the compiled regular expression corresponding to
 	// lastValidCapabilityFilterStr.
+	//
+	// +checklocks:mu
 	lastValidCapabilityFilterReg *regexp.Regexp
 
 	// numSandboxes counts the number of sandboxes that have ever been registered on this server.
@@ -305,15 +351,24 @@ type metricServer struct {
 	// done a good job serving sandbox metrics and it's time for it to gracefully die as there are no
 	// more sandboxes to serve.
 	// Also exported as a metric of total number of sandboxes started.
+	//
+	// +checklocks:mu
 	numSandboxes int64
 
-	// shuttingDown is flipped to true when the server shutdown process has started.
-	// Used to deal with race conditions where a sandbox is trying to register after the server has
-	// already started to go to sleep.
+	// shuttingDown is set when shutdown starts. It prevents discovery from
+	// adding new sandboxes and lets handlers reject requests.
+	//
+	// +checklocks:mu
 	shuttingDown bool
 
 	// shutdownCh is written to when receiving the signal to shut down gracefully.
+	// It is initialized before startVerifyLoop and is never reassigned.
 	shutdownCh chan os.Signal
+
+	// shutdownDone is closed when the shutdown attempt returns, including on
+	// cancellation or error. It is initialized before startVerifyLoop and is
+	// never reassigned.
+	shutdownDone chan struct{}
 
 	// extraData contains additional server-wide data.
 	extra serverData
@@ -347,7 +402,8 @@ func sufficientlyEqualStats(s1, s2 os.FileInfo) bool {
 
 // refreshSandboxesLocked removes sandboxes that are no longer running from m.sandboxes, and
 // adds sandboxes found in the root directory that do request instrumentation.
-// Preconditions: m.mu is locked.
+//
+// +checklocks:m.mu
 func (m *metricServer) refreshSandboxesLocked() {
 	if m.shuttingDown {
 		// Do nothing to avoid log spam.
@@ -374,14 +430,17 @@ func (m *metricServer) refreshSandboxesLocked() {
 			delete(m.sandboxes, sandboxID)
 			continue
 		}
-		if _, _, err := sandbox.load(); err != nil && err != container.ErrStateFileLocked {
+		sand, _, err := sandbox.load()
+		if err != nil {
 			log.Warningf("Sandbox %s cannot be loaded, deleting it: %v", sandboxID, err)
 			sandbox.cleanup()
 			delete(m.sandboxes, sandboxID)
 			continue
 		}
-		if !sandbox.sandbox.IsRunning() {
-			log.Infof("Sandbox %s is no longer running, deleting it.", sandboxID)
+		if running, err := sand.IsRunning(); err != nil {
+			log.Infof("Failed to check if sandbox %s is running: %v", sandboxID, err)
+		} else if !running {
+			log.Infof("Sandbox %s is no longer running, deleting it: %v", sandboxID, err)
 			sandbox.cleanup()
 			delete(m.sandboxes, sandboxID)
 			continue
@@ -426,13 +485,12 @@ func (m *metricServer) refreshSandboxesLocked() {
 		cont, err := container.Load(m.rootDir, sid, container.LoadOpts{
 			Exact:         true,
 			SkipCheck:     true,
-			TryLock:       container.TryAcquire,
+			ReadOnly:      true,
 			RootContainer: true,
 		})
 		if err != nil {
-			if err == container.ErrStateFileLocked {
-				// This error is OK and shouldn't generate log spam. The sandbox is probably in the middle
-				// of being created.
+			if errors.Is(err, os.ErrNotExist) {
+				// The sandbox was deleted since it was listed.
 				continue
 			}
 			log.Warningf("Cannot load state file for sandbox %q: %v", sid, err)
@@ -448,12 +506,15 @@ func (m *metricServer) refreshSandboxesLocked() {
 		}
 
 		// This case can be hit when there is a leftover state file for a sandbox that was `kill -9`'d
-		// without an opportunity for it to clean up its state file. This results in a valid state file
-		// but the sandbox PID is gone. We don't want to continuously load this sandbox's state file.
-		if cont.Status == container.Running && !cont.Sandbox.IsRunning() {
-			log.Warningf("Sandbox %q has state file in state Running, yet it isn't actually running. Ignoring it.", sid)
-			m.lastStateFileStat[sid] = stat
-			continue
+		// without an opportunity for it to clean up its state file, or that failed to boot. This
+		// results in a valid state file but the sandbox PID is gone. We don't want to continuously
+		// load this sandbox's state file.
+		if cont.Status == container.Created || cont.Status == container.Running {
+			if running, err := cont.Sandbox.IsRunning(); err != nil || !running {
+				log.Warningf("Sandbox %q has state file in state %v, yet it isn't actually running (%v). Ignoring it.", sid, cont.Status, err)
+				m.lastStateFileStat[sid] = stat
+				continue
+			}
 		}
 
 		m.numSandboxes++
@@ -464,11 +525,8 @@ func (m *metricServer) refreshSandboxesLocked() {
 				prometheus.SandboxIDLabel: sid.SandboxID,
 			},
 		}
-		// Best-effort attempt to load the state file instantly.
-		// This may legitimately fail if it is locked, e.g. during sandbox startup.
-		// If it fails for any other reason, then the sandbox went away between the time we listed the
-		// sandboxes and now, so just delete it.
-		if _, _, err := served.load(); err != nil && err != container.ErrStateFileLocked {
+		// Try to load all containers now.
+		if _, _, err := served.load(); err != nil {
 			log.Warningf("Sandbox %q cannot be loaded, ignoring it: %v", sid, err)
 			m.lastStateFileStat[sid] = stat
 			served.cleanup()
@@ -493,6 +551,8 @@ type sandboxLoadResult struct {
 // loadSandboxesLocked loads the state file data from all known sandboxes.
 // It does so in parallel, and avoids reloading sandboxes for which we have
 // already loaded data.
+//
+// +checklocks:m.mu
 func (m *metricServer) loadSandboxesLocked(ctx context.Context) []sandboxLoadResult {
 	m.refreshSandboxesLocked()
 
@@ -531,6 +591,7 @@ func (m *metricServer) loadSandboxesLocked(ctx context.Context) []sandboxLoadRes
 type sandboxMetricsResult struct {
 	sandboxLoadResult
 	isRunning       bool
+	isRunningErr    error
 	isCheckpointed  bool
 	isRestored      bool
 	cpuTimeSavedMS  int64
@@ -573,6 +634,7 @@ func queryMultiSandboxMetrics(ctx context.Context, loadedSandboxes []sandboxLoad
 			defer wg.Done()
 			for s := range loadedSandboxCh {
 				isRunning := false
+				var isRunningErr error
 				isCheckpointed := false
 				isRestored := false
 				cpuTimeSavedMS := int64(0)
@@ -583,15 +645,20 @@ func queryMultiSandboxMetrics(ctx context.Context, loadedSandboxes []sandboxLoad
 					queryCtx, queryCtxCancel := context.WithTimeout(ctx, perSandboxTime)
 					snapshot, err = querySandboxMetrics(queryCtx, s.sandbox, s.verifier, metricsFilter)
 					queryCtxCancel()
-					isRunning = s.sandbox.IsRunning()
+					isRunning, isRunningErr = s.sandbox.IsRunning()
+					if isRunningErr != nil && err == nil {
+						err = fmt.Errorf("checking if sandbox is running: %w", isRunningErr)
+					}
 					isCheckpointed = s.sandbox.Checkpointed
 					isRestored = s.sandbox.Restored
-					cpuTimeSavedMS = s.sandbox.CPUTimeSaved.Milliseconds()
-					wallTimeSavedMS = s.sandbox.WallTimeSaved.Milliseconds()
+					cpuTimeSaved, wallTimeSaved := s.sandbox.TimeSaved()
+					cpuTimeSavedMS = cpuTimeSaved.Milliseconds()
+					wallTimeSavedMS = wallTimeSaved.Milliseconds()
 				}
 				processSandbox(sandboxMetricsResult{
 					sandboxLoadResult: s,
 					isRunning:         isRunning,
+					isRunningErr:      isRunningErr,
 					isCheckpointed:    isCheckpointed,
 					isRestored:        isRestored,
 					cpuTimeSavedMS:    cpuTimeSavedMS,
@@ -630,6 +697,8 @@ func queryMultiSandboxMetrics(ctx context.Context, loadedSandboxes []sandboxLoad
 }
 
 // serveMetrics serves metrics requests.
+//
+// +checklocksexclude:m.mu
 func (m *metricServer) serveMetrics(w *httpResponseWriter, req *http.Request) httpResult {
 	ctx, ctxCancel := context.WithTimeout(req.Context(), metricsExportTimeout)
 	defer ctxCancel()
@@ -678,8 +747,11 @@ func (m *metricServer) serveMetrics(w *httpResponseWriter, req *http.Request) ht
 		numCheckpointedSandboxes int64
 		numRestoredSandboxes     int64
 	}
-	meta := metaMetrics{}                   // Protected by metricsMu.
-	selfMetrics := prometheus.NewSnapshot() // Protected by metricsMu.
+	// queryMultiSandboxMetrics callbacks update these under metricsMu, then
+	// join before the final aggregation below. checklocks cannot associate
+	// local variables with a separate mutex captured by a callback.
+	meta := metaMetrics{}
+	selfMetrics := prometheus.NewSnapshot()
 
 	type snapshotAndOptions struct {
 		snapshot *prometheus.Snapshot
@@ -731,7 +803,7 @@ func (m *metricServer) serveMetrics(w *httpResponseWriter, req *http.Request) ht
 		} else {
 			// If the sandbox isn't running, it is normal that metrics are not exported for it, so
 			// do not report this case as an error.
-			if r.isRunning {
+			if r.isRunning || r.isRunningErr != nil {
 				meta.numCannotExportSandboxes++
 				log.Warningf("Could not export metrics from sandbox %s: %v", r.served.rootContainerID.SandboxID, r.err)
 			}
@@ -803,6 +875,8 @@ func (m *metricServer) serveMetrics(w *httpResponseWriter, req *http.Request) ht
 // Returns a response prefixed by "runsc-metrics:OK" on success.
 // Clients can use this to assert that they are talking to the metrics server, as opposed to some
 // other random HTTP server.
+//
+// +checklocksexclude:m.mu
 func (m *metricServer) serveHealthCheck(w *httpResponseWriter, req *http.Request) httpResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -822,6 +896,8 @@ func (m *metricServer) serveHealthCheck(w *httpResponseWriter, req *http.Request
 }
 
 // servePID serves the PID of the metric server process.
+//
+// +checklocksexclude:m.mu
 func (m *metricServer) servePID(w *httpResponseWriter, req *http.Request) httpResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -865,6 +941,7 @@ func (s *Server) Run(ctx context.Context) error {
 		pidFile:                s.PIDFile,
 		exposeProfileEndpoints: s.ExposeProfileEndpoints,
 		allowUnknownRoot:       s.AllowUnknownRoot,
+		shutdownDone:           make(chan struct{}),
 		promWriterPool: sync.Pool{
 			New: func() any {
 				return &prometheus.ReusableWriter[*httpResponseWriter]{}
@@ -960,15 +1037,17 @@ func (s *Server) Run(ctx context.Context) error {
 	m.srv.Handler = mux
 	m.srv.ReadTimeout = httpTimeout
 	m.srv.WriteTimeout = httpTimeout
-	if err := m.startVerifyLoop(ctx); err != nil {
-		return fmt.Errorf("cannot start background loop: %w", err)
-	}
 	if m.pidFile != "" {
 		if err := os.WriteFile(m.pidFile, []byte(fmt.Sprintf("%d", m.pid)), 0644); err != nil {
 			return fmt.Errorf("cannot write PID to file %q: %w", m.pidFile, err)
 		}
 		defer os.Remove(m.pidFile)
 		log.Infof("Wrote PID %d to file %v.", m.pid, m.pidFile)
+	}
+	// Finish setting up the PID file before shutdown can remove it and clear
+	// m.pidFile in the background.
+	if err := m.startVerifyLoop(ctx); err != nil {
+		return fmt.Errorf("cannot start background loop: %w", err)
 	}
 
 	// If not modified by the user from the environment, set the Go GC percentage lower than default.
@@ -985,10 +1064,10 @@ func (s *Server) Run(ctx context.Context) error {
 	log.Infof("Server serving on %s for root directory %s.", conf.MetricServer, conf.RootDir)
 	serveErr := m.srv.Serve(listener)
 	log.Infof("Server has stopped accepting requests.")
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if serveErr != nil {
 		if serveErr == http.ErrServerClosed {
+			// Serve returns before Shutdown finishes waiting for active handlers.
+			<-m.shutdownDone
 			return nil
 		}
 		return fmt.Errorf("cannot serve on address %s: %w", conf.MetricServer, serveErr)

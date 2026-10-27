@@ -1,6 +1,6 @@
 """Macro for precompiling seccomp-bpf programs."""
 
-load("//tools:defs.bzl", "go_binary")
+load("//tools:defs.bzl", "go_binary", "select_arch", "target_emulator")
 
 def precompiled_seccomp_rules(
         name,
@@ -8,7 +8,8 @@ def precompiled_seccomp_rules(
         programs_to_compile_go_import,
         out,
         out_package_name,
-        exclude_in_fastbuild = False):
+        exclude_in_fastbuild = False,
+        tags = []):
     """Generates a Go source file containing precompiled seccomp-bpf programs.
 
     Args:
@@ -27,6 +28,7 @@ def precompiled_seccomp_rules(
         out_package_name: Go package name that `out` belongs to.
         exclude_in_fastbuild: Whether to skip precompilation in fastbuild mode.
             The auto-generated `GetPrecompiled` function will fail all lookups.
+        tags: List of tags to pass to the generated genrule.
     """
     if exclude_in_fastbuild:
         native.config_setting(
@@ -106,12 +108,40 @@ def precompiled_seccomp_rules(
     ]
     gen_bin_deps = [programs_to_compile_go_library] + base_gen_bin_deps
     go_binary(
-        name = name + "_gen_bin",
+        name = name + "_gen_dynamic_bin",
         srcs = [out + ".gen.go"],
         deps = gen_bin_deps,
         embedsrcs = [
             ":" + out + ".gen.lib.tmpl.go",
         ],
+        pure = True,
+        noasan = True,
+        race = "off",
+    )
+
+    # gotsan forces the generator to be dynamically linked.
+    # QEMU cannot load the dynamic loader of the generator,
+    # so it must be static in this configuration.
+    go_binary(
+        name = name + "_gen_static_bin",
+        srcs = [out + ".gen.go"],
+        deps = gen_bin_deps,
+        embedsrcs = [
+            ":" + out + ".gen.lib.tmpl.go",
+        ],
+        pure = True,
+        static = True,
+        noasan = True,
+        race = "off",
+        nogo = False,
+        tags = ["manual"],
+    )
+    native.alias(
+        name = name + "_gen_bin",
+        actual = select({
+            "//tools:gotsan": ":" + name + "_gen_static_bin",
+            "//conditions:default": ":" + name + "_gen_dynamic_bin",
+        }),
     )
     if exclude_in_fastbuild:
         go_binary(
@@ -125,28 +155,67 @@ def precompiled_seccomp_rules(
 
     # This genrule actually runs the go_binary we just declared, and writes
     # its output (containing the precompiled rules) to the desired `out` file.
-    out_cmd = "$(location :" + name + "_gen_bin) --package='" + out_package_name + "' --out=$@"
+    #
+    # The generator is a source (rather than a tool) of this genrule, so that
+    # it is built for the target platform rather than for the execution
+    # platform. If the execution platform's architecture differs from the
+    # target's (i.e. when cross-compiling), it is run under a user-mode
+    # emulator. If no emulator is configured for the target architecture, it
+    # is run directly, which works if the kernel is configured to run foreign
+    # binaries (binfmt_misc) and fails otherwise.
+    #
+    # Execution platform constraints are deliberately not used here: they would
+    # make cross-architecture configurations fail analysis wherever no
+    # execution platform for the target architecture is available.
+    emulator = target_emulator()
+    out_args = " --package='" + out_package_name + "' --out=$@"
+    run_gen_cmd = (
+        "GEN=$(location :" + name + "_gen_bin); " +
+        "RUN=; " +
+        "if [ -n \"$$TARGET_ARCH\" ] && [ \"$$(uname -m)\" != \"$$TARGET_ARCH\" ]; then " +
+        "  RUN=\"$$EMULATOR\"; " +
+        "fi; " +
+        "$$RUN \"$$GEN\"" + out_args + " || { " +
+        "  echo \"Failed to run $$GEN (built for $$TARGET_ARCH) on $$(uname -m)" +
+        " (emulator: $${RUN:-none}).\" >&2; " +
+        "  exit 1; " +
+        "}"
+    )
+    run_gen_env = (
+        "TARGET_ARCH=" + select_arch(
+            amd64 = "x86_64",
+            arm64 = "aarch64",
+            riscv64 = "riscv64",
+            default = "",
+        ) + "; " +
+        "EMULATOR='" + emulator.cmd + "'; "
+    )
     if exclude_in_fastbuild:
         native.genrule(
             name = name,
             outs = [out],
-            cmd = select({
-                ":" + name + "_fastbuild_cond": (
-                    "$(location :" + name + "_gen_stubbed_bin) --package='" + out_package_name + "' --out=$@"
-                ),
-                "//conditions:default": out_cmd,
+            srcs = select({
+                ":" + name + "_fastbuild_cond": [],
+                "//conditions:default": [":" + name + "_gen_bin"],
+            }),
+            # The stubbed generator's output does not depend on the
+            # architecture, so it is built for the execution platform.
+            cmd = run_gen_env + select({
+                ":" + name + "_fastbuild_cond": "$(location :" + name + "_gen_stubbed_bin)" + out_args,
+                "//conditions:default": run_gen_cmd,
             }),
             tools = select({
                 ":" + name + "_fastbuild_cond": [":" + name + "_gen_stubbed_bin"],
-                "//conditions:default": [":" + name + "_gen_bin"],
-            }),
+                "//conditions:default": [],
+            }) + emulator.tools,
+            tags = tags + ["requires-mem:16g"],
         )
     else:
         native.genrule(
             name = name,
             outs = [out],
-            cmd = (
-                "$(location :" + name + "_gen_bin) --package='" + out_package_name + "' --out=$@"
-            ),
-            tools = [":" + name + "_gen_bin"],
+            srcs = [":" + name + "_gen_bin"],
+            cmd = run_gen_env + run_gen_cmd,
+            tools = emulator.tools,
+            tags = tags + ["requires-mem:16g"],
         )

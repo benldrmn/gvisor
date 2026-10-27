@@ -13,24 +13,40 @@
 // limitations under the License.
 
 #include <arpa/inet.h>
+#ifdef __linux__
+#include <linux/capability.h>
+#include <sys/syscall.h>
+#endif  // __linux__
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <tuple>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/base/attributes.h"
 #include "test/syscalls/linux/ip_socket_test_util.h"
 #include "test/syscalls/linux/unix_domain_socket_test_util.h"
 #include "test/util/capability_util.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
@@ -667,8 +683,16 @@ void randomizePacket(char* buf, size_t len, int proto) {
   RandomizeBuffer(buf, len);
   // When testing with TCP sockets, ensure the RST flag is set. This is to
   // prevent the TCP stack from generating RSTs packets for unknown endpoints.
-  if (proto == IPPROTO_TCP && len > TCPHDR_FLAGS_OFF)
+  if (proto == IPPROTO_TCP && len > TCPHDR_FLAGS_OFF) {
     buf[TCPHDR_FLAGS_OFF] |= TCPHDR_RST;
+  }
+  // For UDP packets, ensure the length field in the UDP header
+  // is set to the total length of the UDP packet as the network stack
+  // may trim the packet to the header length.
+  if (proto == IPPROTO_UDP && len >= sizeof(udphdr)) {
+    udphdr* udp = reinterpret_cast<udphdr*>(buf);
+    udp->len = htons(len);
+  }
 }
 
 // Test that receive buffer limits are not enforced when the recv buffer is
@@ -754,8 +778,9 @@ TEST_P(RawSocketTest, RecvBufLimits) {
 
   // Set a receive timeout so that we don't block forever on reads if the test
   // fails.
-  struct timeval tv {
-    .tv_sec = 1, .tv_usec = 0,
+  struct timeval tv{
+      .tv_sec = 1,
+      .tv_usec = 0,
   };
   ASSERT_THAT(setsockopt(s_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)),
               SyscallSucceeds());
@@ -1428,58 +1453,21 @@ TEST(RawSocketTest, SetIPv6ChecksumError_ReadShort) {
       ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET6, SOCK_RAW, IPPROTO_UDP));
 
   int intV = 2;
-  if (IsRunningOnGvisor()) {
-    // TODO(https://gvisor.dev/issue/6982): This is a deviation from Linux. We
-    // should determine if we want to match the behaviour or handle the error
-    // more gracefully.
-    ASSERT_THAT(
-        setsockopt(fd.get(), SOL_IPV6, IPV6_CHECKSUM, &intV, sizeof(intV) - 1),
-        SyscallFailsWithErrno(EINVAL));
-    return;
-  }
-
-  intV = std::numeric_limits<int>::max();
-  if (intV % 2) {
-    intV--;
-  }
-
-  if (const char* val = getenv("IPV6_CHECKSUM_SETSOCKOPT_SHORT_EXCEPTION");
-      val != nullptr && strcmp(val, "1") == 0) {
-    // TODO(https://issuetracker.google.com/issues/212585236): As of writing, it
-    // seems like at least one Linux environment considers optlen unlike a local
-    // Linux environment. In this case we call setsockopt with the full int so
-    // that the rest of the test passes. Once the root cause for this difference
-    // is found, we can update this check.
-    ASSERT_THAT(
-        setsockopt(fd.get(), SOL_IPV6, IPV6_CHECKSUM, &intV, sizeof(intV)),
-        SyscallSucceeds());
-  } else {
-    ASSERT_THAT(
-        setsockopt(fd.get(), SOL_IPV6, IPV6_CHECKSUM, &intV, sizeof(intV) - 1),
-        SyscallSucceeds());
-  }
-
-  {
-    int got;
-    socklen_t got_len = sizeof(got);
-    ASSERT_THAT(getsockopt(fd.get(), SOL_IPV6, IPV6_CHECKSUM, &got, &got_len),
-                SyscallSucceeds());
-    ASSERT_EQ(got_len, sizeof(got));
-    // Even though we called setsockopt with a length smaller than an int, Linux
-    // seems to read the full int.
-    EXPECT_EQ(got, intV);
-  }
-
-  // If we have pass a pointer that points to memory less than the size of an
-  // int, we get a bad address error.
-  std::unique_ptr<uint8_t> u8V;
-  // Linux seems to assume a full int but doesn't check the passed length.
-  //
-  // https://github.com/torvalds/linux/blob/a52a8e9eaf4a12dd58953fc622bb2bc08fd1d32c/net/ipv6/raw.c#L1023
-  // shows that Linux copies optVal to an int without first checking optLen.
+  // Use a valid length to reach the bad-pointer check.
   ASSERT_THAT(
-      setsockopt(fd.get(), SOL_IPV6, IPV6_CHECKSUM, u8V.get(), sizeof(*u8V)),
+      setsockopt(fd.get(), SOL_IPV6, IPV6_CHECKSUM, nullptr, sizeof(intV)),
       SyscallFailsWithErrno(EFAULT));
+
+  // Linux 5.16 added the length check. Conservatively skip older native
+  // kernels, which may or may not have the fix backported. gVisor checks the
+  // length. https://github.com/torvalds/linux/commit/fb7bc9204
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 16));
+  }
+  ASSERT_THAT(
+      setsockopt(fd.get(), SOL_IPV6, IPV6_CHECKSUM, &intV, sizeof(intV) - 1),
+      SyscallFailsWithErrno(EINVAL));
 }
 
 TEST(RawSocketTest, IPv6Checksum_ValidateAndCalculate) {

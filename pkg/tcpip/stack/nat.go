@@ -266,6 +266,8 @@ func IPTHandlePacket(pkt *PacketBuffer, hook Hook, r *Route) bool {
 
 // PortOrIdentRange represents a range of ports or idents
 // range to use for NAT.
+//
+// +stateify savable
 type PortOrIdentRange struct {
 	Start uint16
 	Size  uint32
@@ -309,12 +311,23 @@ func (cn *conn) ConfigureNAT(portsOrIdents PortOrIdentRange, natAddress tcpip.Ad
 	if *manip != manipNotPerformed {
 		return true
 	}
+	// Like nf_nat_setup_info, only count the NAT as performed if it changed
+	// the tuple.
+	origAddress, origPortOrIdent := *address, *portOrIdent
 	*manip = manipPerformed
+	defer func() {
+		if *address == origAddress && *portOrIdent == origPortOrIdent {
+			*manip = manipPerformedNoop
+		}
+	}()
 	if changeAddress {
 		*address = natAddress
 	}
 
 	// Everything below here is port-fiddling.
+	// TODO: b/486197011 - Handle reply tuple collisions when changePort
+	// is false. Check for tuple uniqueness or find a unique tuple.
+	// Ref: net/netfilter/nf_nat_core.c:nf_nat_l4proto_unique_tuple.
 	if !changePort {
 		return true
 	}
@@ -490,6 +503,22 @@ func (cn *conn) IsNATConfigured(natType NATType) bool {
 	return false
 }
 
+// IsNATApplied returns whether NAT of the given type changed the connection's
+// addresses or ports. A no-op NAT does not count. This matches Linux, where
+// nf_nat_setup_info sets IPS_SRC_NAT or IPS_DST_NAT only when the NAT changes
+// the tuple.
+func (cn *conn) IsNATApplied(natType NATType) bool {
+	cn.mu.RLock()
+	defer cn.mu.RUnlock()
+	switch natType {
+	case SNAT:
+		return cn.sourceManip == manipPerformed
+	case DNAT:
+		return cn.destinationManip == manipPerformed
+	}
+	return false
+}
+
 // ConfigureNoopNAT configures the connection for no-op NAT.
 // Similar to the func `IPTMaybePerformNoopNAT` except that this one only configures NO-OP NAT and is independent of IPTables.
 func (cn *conn) ConfigureNoopNAT(pkt *PacketBuffer, natType NATType) bool {
@@ -535,4 +564,47 @@ func (cn *conn) ConfigureNoopNAT(pkt *PacketBuffer, natType NATType) bool {
 	}
 
 	return cn.ConfigureNAT(portsOrIdents, tcpip.Address{}, natType, true /* changePort */, false /* changeAddress */)
+}
+
+// ConfigureMasquerade configures the connection for masquerade.
+func (cn *conn) configureMasquerade(pkt *PacketBuffer, route *Route, stk *Stack, ports PortOrIdentRange, changePort bool) bool {
+	srcAddr := pkt.Network().SourceAddress()
+	if srcAddr == header.IPv4Any || srcAddr == header.IPv6Any {
+		return false
+	}
+	// Masquerade is only supported for postrouting.
+	if route == nil {
+		return false
+	}
+
+	// Get the network endpoint for the outgoing interface to find its primary address.
+	netEP, err := stk.GetNetworkEndpoint(route.NICID(), route.NetProto())
+	if err != nil {
+		return false
+	}
+
+	addressEP, ok := netEP.(AddressableEndpoint)
+	if !ok {
+		return false
+	}
+
+	// Ref: net/netfilter/nf_nat_masquerade.c:nf_nat_masquerade_ipv[4|6]()
+	// Use the next hop address as the destination address if it is set.
+	nh := route.NextHop()
+	if nh.Len() == 0 {
+		nh = pkt.Network().DestinationAddress()
+	}
+
+	// addressEP is expected to be set for the postrouting hook.
+	// Find the outgoing primary address for the destination address.
+	ep := addressEP.AcquireOutgoingPrimaryAddress(nh, tcpip.Address{} /* srcHint */, false /* allowExpired */)
+	if ep == nil {
+		// No address exists that we can use as a source address.
+		return false
+	}
+	address := ep.AddressWithPrefix().Address
+	ep.DecRef()
+
+	// Configure NAT for the packet to change the source address.
+	return cn.ConfigureNAT(ports, address, SNAT, changePort, true /* changeAddress */)
 }

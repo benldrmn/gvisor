@@ -2895,7 +2895,7 @@ func TestReceiveFragments(t *testing.T) {
 	ipv4Payload3Addr1ToAddr2 := udpGen(127, 3, addr1, addr2)
 	udpPayload3Addr1ToAddr2 := ipv4Payload3Addr1ToAddr2[header.UDPMinimumSize:]
 	// Used to test the max reassembled IPv4 payload length.
-	ipv4Payload4Addr1ToAddr2 := udpGen(header.UDPMaximumSize-header.UDPMinimumSize, 4, addr1, addr2)
+	ipv4Payload4Addr1ToAddr2 := udpGen(header.UDPMaximumSize-header.IPv4MinimumSize-header.UDPMinimumSize, 4, addr1, addr2)
 	udpPayload4Addr1ToAddr2 := ipv4Payload4Addr1ToAddr2[header.UDPMinimumSize:]
 
 	type fragmentData struct {
@@ -4450,5 +4450,199 @@ func TestForwardingTCPChecksum(t *testing.T) {
 	payloadCsum := checksum.Checksum(tcpHeader.Payload(), 0)
 	if !tcpHeader.IsChecksumValid(src, dst, payloadCsum, payloadLength) {
 		t.Errorf("expected valid TCP checksum, but got invalid")
+	}
+}
+
+func TestForwardedICMPInnerIPv4OptionsPanics(t *testing.T) {
+	ctx := newTestContext()
+	defer ctx.cleanup()
+	s := ctx.s
+
+	endpoints := make(map[tcpip.NICID]*channel.Endpoint)
+	for nicID, addr := range defaultEndpointConfigs {
+		ep := channel.New(1, ipv4.MaxTotalSize, "")
+		defer ep.Close()
+		if err := s.CreateNIC(nicID, ep); err != nil {
+			t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+		}
+		protoAddr := tcpip.ProtocolAddress{Protocol: header.IPv4ProtocolNumber, AddressWithPrefix: addr}
+		if err := s.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); err != nil {
+			t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, protoAddr, err)
+		}
+		endpoints[nicID] = ep
+	}
+
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: incomingIPv4Addr.Subnet(), NIC: incomingNICID},
+		{Destination: outgoingIPv4Addr.Subnet(), NIC: outgoingNICID},
+	})
+
+	if err := s.SetForwardingDefaultAndAllNICs(header.IPv4ProtocolNumber, true); err != nil {
+		t.Fatalf("s.SetForwardingDefaultAndAllNICs(%d, true): %s", header.IPv4ProtocolNumber, err)
+	}
+
+	// Inner IPv4 header with IHL=6 (24 bytes -> has options).
+	inner := header.IPv4(make([]byte, 24))
+	inner.Encode(&header.IPv4Fields{
+		TotalLength: 24,
+		TTL:         64,
+		Protocol:    uint8(header.UDPProtocolNumber),
+		SrcAddr:     remoteIPv4Addr1,
+		DstAddr:     remoteIPv4Addr2,
+	})
+	inner.SetHeaderLength(24)
+
+	icmp := header.ICMPv4(make([]byte, header.ICMPv4MinimumSize+len(inner)))
+	icmp.SetType(header.ICMPv4DstUnreachable)
+	icmp.SetCode(header.ICMPv4PortUnreachable)
+	copy(icmp.Payload(), inner)
+
+	// Outer: remote-to-remote (10.0.0.2 -> 11.0.0.2) so the packet is forwarded.
+	outer := header.IPv4(make([]byte, header.IPv4MinimumSize+len(icmp)))
+	outer.Encode(&header.IPv4Fields{
+		TotalLength: uint16(len(outer)),
+		TTL:         64,
+		Protocol:    uint8(header.ICMPv4ProtocolNumber),
+		SrcAddr:     remoteIPv4Addr1,
+		DstAddr:     remoteIPv4Addr2,
+	})
+	copy(outer[header.IPv4MinimumSize:], icmp)
+	outer.SetChecksum(0)
+	outer.SetChecksum(^outer.CalculateChecksum())
+
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(outer),
+	})
+	defer pkt.DecRef()
+
+	endpoints[incomingNICID].InjectInbound(header.IPv4ProtocolNumber, pkt)
+}
+
+func TestOversizedFragmentedICMPEchoRequestDoesNotPanic(t *testing.T) {
+	const (
+		nicID = 1
+		ident = 42
+	)
+	var (
+		srcAddr = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x01"))
+		dstAddr = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x02"))
+	)
+
+	tests := []struct {
+		name         string
+		firstFragOpt header.IPv4OptionsSerializer
+		totalPayload int
+	}{
+		{
+			name:         "reassembled total length exceeds MaxUint16",
+			totalPayload: 65516,
+		},
+		{
+			name: "reassembled total length with IPv4 options exceeds MaxUint16",
+			firstFragOpt: header.IPv4OptionsSerializer{
+				&header.IPv4SerializableListEndOption{},
+			},
+			// With 4 bytes of options (IHL=24), 24 + 65512 = 65536 > ipv4.MaxTotalSize (65535).
+			totalPayload: 65512,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := newTestContext()
+			defer ctx.cleanup()
+			s := ctx.s
+
+			ep := channel.New(1, ipv4.MaxTotalSize, "")
+			defer ep.Close()
+			if err := s.CreateNIC(nicID, ep); err != nil {
+				t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+			}
+			protoAddr := tcpip.ProtocolAddress{
+				Protocol:          header.IPv4ProtocolNumber,
+				AddressWithPrefix: dstAddr.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, protoAddr, err)
+			}
+			s.SetRouteTable([]tcpip.Route{
+				{Destination: header.IPv4EmptySubnet, NIC: nicID},
+			})
+
+			// Build full ICMPv4 Echo Request payload with valid checksum.
+			icmpBuf := make([]byte, tc.totalPayload)
+			icmpHdr := header.ICMPv4(icmpBuf)
+			icmpHdr.SetType(header.ICMPv4Echo)
+			icmpHdr.SetCode(header.ICMPv4UnusedCode)
+			icmpHdr.SetChecksum(0)
+			icmpHdr.SetChecksum(^checksum.Checksum(icmpBuf, 0))
+
+			const firstFragPayloadLen = 8
+			fragments := []struct {
+				offset  uint16
+				more    bool
+				options header.IPv4OptionsSerializer
+				payload []byte
+			}{
+				{
+					offset:  0,
+					more:    true,
+					options: tc.firstFragOpt,
+					payload: icmpBuf[:firstFragPayloadLen],
+				},
+				{
+					offset:  firstFragPayloadLen,
+					more:    false,
+					payload: icmpBuf[firstFragPayloadLen:],
+				},
+			}
+
+			for _, frag := range fragments {
+				optLen := 0
+				if frag.options != nil {
+					optLen = int(frag.options.Length())
+				}
+				hdrLen := header.IPv4MinimumSize + optLen
+				pktLen := hdrLen + len(frag.payload)
+				raw := make([]byte, pktLen)
+				ip := header.IPv4(raw)
+				ip.Encode(&header.IPv4Fields{
+					TotalLength: uint16(pktLen),
+					ID:          ident,
+					Flags: func() uint8 {
+						if frag.more {
+							return header.IPv4FlagMoreFragments
+						}
+						return 0
+					}(),
+					FragmentOffset: frag.offset,
+					TTL:            64,
+					Protocol:       uint8(header.ICMPv4ProtocolNumber),
+					SrcAddr:        srcAddr,
+					DstAddr:        dstAddr,
+					Options:        frag.options,
+				})
+				copy(raw[hdrLen:], frag.payload)
+				ip.SetChecksum(0)
+				ip.SetChecksum(^ip.CalculateChecksum())
+
+				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Payload: buffer.MakeWithData(raw),
+				})
+				ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
+				pkt.DecRef()
+			}
+
+			if got := s.Stats().IP.MalformedPacketsReceived.Value(); got != 1 {
+				t.Errorf("got MalformedPacketsReceived = %d, want = 1", got)
+			}
+			if got := s.Stats().IP.MalformedFragmentsReceived.Value(); got != 1 {
+				t.Errorf("got MalformedFragmentsReceived = %d, want = 1", got)
+			}
+			if reply := ep.Read(); reply != nil {
+				defer reply.DecRef()
+				t.Errorf("expected no ICMP Echo Reply, got %#v", reply)
+			}
+		})
 	}
 }

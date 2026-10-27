@@ -120,7 +120,7 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 	// and its inode together in the heap. This will help reduce allocations and memory
 	// fragmentation. This is more cache friendly too.
 	// Obviously in case of hard link and if the inode already exists,
-	// we just re-use the inode and heap allocate just the dentry struct.
+	// we just reuse the inode and heap allocate just the dentry struct.
 	temp := struct {
 		d dentry
 		i lisafsInode
@@ -129,18 +129,24 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 	// This also avoids a correctness issue when a directory is bind-mounted on the host:
 	// different paths (e.g., /mnt/ and /mnt/a/b/c if /mnt/a/b/c is a bind mount of /mnt/)
 	// can return the same device ID and inode number from a stat call.
+	var cacheHit bool
 	temp.d.inode = fs.getOrCreateInode(inoKey /* dontCache = */, isDir,
-		func() { fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */) },
+		func() {
+			cacheHit = true
+			fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
+		},
 		func() *inode {
 			temp.i = lisafsInode{
 				inode: inode{
 					fs:        fs,
 					inoKey:    inoKey,
 					ino:       fs.inoFromKey(inoKey),
+					rdevMajor: ino.Stat.RdevMajor,
+					rdevMinor: ino.Stat.RdevMinor,
 					mode:      atomicbitops.FromUint32(uint32(ino.Stat.Mode)),
 					uid:       atomicbitops.FromUint32(uint32(fs.opts.dfltuid)),
 					gid:       atomicbitops.FromUint32(uint32(fs.opts.dfltgid)),
-					blockSize: atomicbitops.FromUint32(hostarch.PageSize),
+					blockSize: atomicbitops.FromUint32(uint32(hostarch.PageSize)),
 					readFD:    atomicbitops.FromInt32(-1),
 					writeFD:   atomicbitops.FromInt32(-1),
 					mmapFD:    atomicbitops.FromInt32(-1),
@@ -192,8 +198,21 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 			}
 			return inode
 		})
+	if cacheHit && !temp.d.inode.cachedMetadataAuthoritative() {
+		i := temp.d.inode.impl.(*lisafsInode)
+		i.metadataMu.Lock()
+		i.updateMetadataFromStatxLocked(&ino.Stat)
+		i.metadataMu.Unlock()
+	}
 
 	temp.d.init()
+	// If this dentry adopted a cached inode that already carries a bound-socket
+	// endpoint (a hard link to, or re-walk of, an existing bound socket), hold
+	// the extra reference that dentry.refs keeps for endpoint-bearing dentries.
+	// The bind path takes this reference itself, over a fresh inode.
+	if temp.d.inode.endpoint != nil {
+		temp.d.IncRef()
+	}
 	fs.syncMu.Lock()
 	fs.syncableDentries.PushBack(&temp.d.syncableListEntry)
 	fs.syncMu.Unlock()
@@ -464,7 +483,7 @@ func (i *lisafsInode) newChildDentry(ctx context.Context, childIno *lisafs.Inode
 
 func (i *lisafsInode) mknod(ctx context.Context, name string, creds *auth.Credentials, opts *vfs.MknodOptions) (*dentry, error) {
 	if _, ok := opts.Endpoint.(transport.HostBoundEndpoint); !ok {
-		childInode, err := i.controlFD.MknodAt(ctx, name, opts.Mode, lisafs.UID(creds.EffectiveKUID), lisafs.GID(creds.EffectiveKGID), opts.DevMinor, opts.DevMajor)
+		childInode, err := i.controlFD.MknodAt(ctx, name, opts.Mode, lisafs.UID(creds.FilesystemKUID), lisafs.GID(creds.FilesystemKGID), opts.DevMinor, opts.DevMajor)
 		if err != nil {
 			return nil, err
 		}
@@ -473,7 +492,7 @@ func (i *lisafsInode) mknod(ctx context.Context, name string, creds *auth.Creden
 
 	// This mknod(2) is coming from unix bind(2), as opts.Endpoint is set.
 	sockType := opts.Endpoint.(transport.Endpoint).Type()
-	childInode, boundSocketFD, err := i.controlFD.BindAt(ctx, sockType, name, opts.Mode, lisafs.UID(creds.EffectiveKUID), lisafs.GID(creds.EffectiveKGID))
+	childInode, boundSocketFD, err := i.controlFD.BindAt(ctx, sockType, name, opts.Mode, lisafs.UID(creds.FilesystemKUID), lisafs.GID(creds.FilesystemKGID))
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +536,7 @@ func (i *lisafsInode) mkdir(ctx context.Context, name string, mode linux.FileMod
 }
 
 func (i *lisafsInode) symlink(ctx context.Context, name, target string, creds *auth.Credentials) (*dentry, error) {
-	symlinkInode, err := i.controlFD.SymlinkAt(ctx, name, target, lisafs.UID(creds.EffectiveKUID), lisafs.GID(creds.EffectiveKGID))
+	symlinkInode, err := i.controlFD.SymlinkAt(ctx, name, target, lisafs.UID(creds.FilesystemKUID), lisafs.GID(creds.FilesystemKGID))
 	if err != nil {
 		return nil, err
 	}

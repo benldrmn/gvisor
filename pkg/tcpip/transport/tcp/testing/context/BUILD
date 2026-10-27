@@ -9,11 +9,13 @@ go_library(
     name = "context",
     testonly = 1,
     srcs = ["context.go"],
+    importpath = "gvisor.dev/gvisor/pkg/tcpip/transport/tcp/testing/context",
     visibility = [
         "//visibility:public",
     ],
     deps = [
         "//pkg/buffer",
+        "//pkg/cleanup",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/checksum",

@@ -25,21 +25,26 @@
 #include <sys/poll.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
 #include <csignal>
+#include <cstdint>
 #include <ctime>
-#include <iostream>
+#include <functional>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/base/macros.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -52,6 +57,7 @@
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/pty_util.h"
+#include "test/util/save_util.h"
 #include "test/util/signal_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -137,7 +143,7 @@ struct kernel_termios DefaultTermios() {
 // Returns a partial read if some bytes were read.
 //
 // fd must be non-blocking.
-PosixErrorOr<size_t> PollAndReadFd(int fd, void *buf, size_t count,
+PosixErrorOr<size_t> PollAndReadFd(int fd, void* buf, size_t count,
                                    absl::Duration timeout) {
   absl::Time end = absl::Now() + timeout;
 
@@ -156,7 +162,7 @@ PosixErrorOr<size_t> PollAndReadFd(int fd, void *buf, size_t count,
     }
 
     ssize_t n =
-        ReadFd(fd, static_cast<char *>(buf) + completed, count - completed);
+        ReadFd(fd, static_cast<char*>(buf) + completed, count - completed);
     if (n < 0) {
       if (errno == EAGAIN) {
         // Linux sometimes returns EAGAIN from this read, despite the fact that
@@ -251,14 +257,14 @@ PosixErrorOr<int> WaitUntilReceived(int fd, int count) {
 }
 
 // Verifies that there is nothing left to read from fd.
-void ExpectFinished(const FileDescriptor &fd) {
+void ExpectFinished(const FileDescriptor& fd) {
   // Nothing more to read.
   char c;
   EXPECT_THAT(ReadFd(fd.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
 }
 
 // Verifies that we can read expected bytes from fd into buf.
-void ExpectReadable(const FileDescriptor &fd, int expected, char *buf) {
+void ExpectReadable(const FileDescriptor& fd, int expected, char* buf) {
   size_t n = ASSERT_NO_ERRNO_AND_VALUE(
       PollAndReadFd(fd.get(), buf, expected, kTimeout));
   EXPECT_EQ(expected, n);
@@ -283,7 +289,7 @@ TEST(BasicPtyTest, OpenSetsControllingTTY) {
   struct sigaction old_sa;
   ASSERT_THAT(sigaction(SIGHUP, &sa, &old_sa), SyscallSucceeds());
   auto cleanup = Cleanup([old_sa] {
-    EXPECT_THAT(sigaction(SIGHUP, &old_sa, NULL), SyscallSucceeds());
+    EXPECT_THAT(sigaction(SIGHUP, &old_sa, nullptr), SyscallSucceeds());
   });
 
   FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
@@ -359,7 +365,7 @@ TEST(BasicPtyTest, TIOCGPTPEERSetsControllingTTY) {
   struct sigaction old_sa;
   ASSERT_THAT(sigaction(SIGHUP, &sa, &old_sa), SyscallSucceeds());
   auto cleanup = Cleanup([old_sa] {
-    EXPECT_THAT(sigaction(SIGHUP, &old_sa, NULL), SyscallSucceeds());
+    EXPECT_THAT(sigaction(SIGHUP, &old_sa, nullptr), SyscallSucceeds());
   });
 
   FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
@@ -455,12 +461,15 @@ TEST(BasicPtyTest, Getdents) {
 TEST(BasicPtyTest, NewInstance) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
+  // On Linux, the ptmx device of a new devpts instance has mode 0000 by
+  // default, so opening it would require CAP_DAC_OVERRIDE.
   auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  auto const mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("devpts_test", dir.path(), "devpts", 0, "newinstance", 0));
+  auto const mount = ASSERT_NO_ERRNO_AND_VALUE(Mount(
+      "devpts_test", dir.path(), "devpts", 0, "newinstance,ptmxmode=0666", 0));
   auto const dir2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  auto const mount2 = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("devpts_test2", dir.path(), "devpts", 0, "newinstance", 0));
+  auto const mount2 =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("devpts_test2", dir2.path(), "devpts", 0,
+                                      "newinstance,ptmxmode=0666", 0));
 
   // Opening PTYs with O_TRUNC shouldn't cause an error, but calls to
   // (f)truncate should.
@@ -471,25 +480,103 @@ TEST(BasicPtyTest, NewInstance) {
   ASSERT_THAT(open(spath2.c_str(), O_RDWR), SyscallFailsWithErrno(ENOENT));
   std::string spath = absl::StrCat(dir.path(), "/", n);
   FileDescriptor replica =
-      ASSERT_NO_ERRNO_AND_VALUE(Open(spath.c_str(), O_RDWR | O_NOCTTY));
+      ASSERT_NO_ERRNO_AND_VALUE(Open(spath, O_RDWR | O_NOCTTY));
 }
 
-TEST(BasicPtyTest, SetMode) {
+struct SetModeTestCase {
+  const char* name;
+  // Appended to the devpts mount options.
+  const char* options;
+  // The expected mode and owner of a new replica. std::nullopt means the
+  // caller's effective uid or gid.
+  mode_t mode;
+  std::optional<uid_t> uid;
+  std::optional<gid_t> gid;
+};
+
+class SetModeTest : public ::testing::TestWithParam<SetModeTestCase> {};
+
+TEST_P(SetModeTest, SetMode) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
+  const SetModeTestCase& test = GetParam();
+  const uid_t uid = test.uid.value_or(geteuid());
+  const gid_t gid = test.gid.value_or(getegid());
+  // The uid and gid options fail with EINVAL if the ID isn't mapped in the
+  // caller's user namespace.
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(IsIDMapped("/proc/self/uid_map", uid)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(IsIDMapped("/proc/self/gid_map", gid)));
+
+  // The root directory is owned by root in the caller's user namespace. See
+  // fs/devpts/inode.c:devpts_fill_super() and fs/inode.c:inode_init_always().
+  const uid_t root_uid = ASSERT_NO_ERRNO_AND_VALUE(
+      RootIDOrOverflow("/proc/self/uid_map", "/proc/sys/kernel/overflowuid"));
+  const gid_t root_gid = ASSERT_NO_ERRNO_AND_VALUE(
+      RootIDOrOverflow("/proc/self/gid_map", "/proc/sys/kernel/overflowgid"));
+
   auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  auto mount = ASSERT_NO_ERRNO_AND_VALUE(
+  auto const mount = ASSERT_NO_ERRNO_AND_VALUE(
       Mount("devpts_test", dir.path(), "devpts", 0,
-            "newinstance,mode=0600,ptmxmode=0620", 0));
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
-      Open(JoinPath(dir.path()), O_RDONLY | O_DIRECTORY));
-  mount.Release();
+            absl::StrCat("newinstance,ptmxmode=0620", test.options), 0));
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(dir.path(), O_RDONLY | O_DIRECTORY));
 
   struct stat st;
   ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_mode, 0600 | S_IFDIR);
+  EXPECT_EQ(st.st_mode, 0755 | S_IFDIR);
+  EXPECT_EQ(st.st_uid, root_uid);
+  EXPECT_EQ(st.st_gid, root_gid);
   ASSERT_THAT(fstatat(fd.get(), "ptmx", &st, 0), SyscallSucceeds());
   EXPECT_EQ(st.st_mode, 0620 | S_IFCHR);
+  EXPECT_EQ(st.st_uid, geteuid());
+  EXPECT_EQ(st.st_gid, getegid());
+
+  FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(JoinPath(dir.path(), "ptmx"), O_RDWR | O_NOCTTY));
+  int index = -1;
+  ASSERT_THAT(ioctl(master.get(), TIOCGPTN, &index), SyscallSucceeds());
+  ASSERT_THAT(fstatat(fd.get(), std::to_string(index).c_str(), &st, 0),
+              SyscallSucceeds());
+  EXPECT_EQ(st.st_mode, test.mode | S_IFCHR);
+  EXPECT_EQ(st.st_uid, uid);
+  EXPECT_EQ(st.st_gid, gid);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    , SetModeTest,
+    ::testing::Values(
+        SetModeTestCase{"Default", "", 0600, std::nullopt, std::nullopt},
+        SetModeTestCase{"Mode", ",mode=0622", 0622, std::nullopt, std::nullopt},
+        SetModeTestCase{"Uid", ",uid=123", 0600, 123, std::nullopt},
+        SetModeTestCase{"Gid", ",mode=0620,gid=5", 0620, std::nullopt, 5}),
+    [](const ::testing::TestParamInfo<SetModeTestCase>& info) {
+      return info.param.name;
+    });
+
+// Without the ptmxmode option, ptmx has mode 0000. See
+// fs/devpts/inode.c:DEVPTS_DEFAULT_PTMX_MODE.
+TEST(BasicPtyTest, DefaultPtmxMode) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("devpts_test", dir.path(), "devpts", 0, "newinstance", 0));
+
+  struct stat st;
+  ASSERT_THAT(stat(JoinPath(dir.path(), "ptmx").c_str(), &st),
+              SyscallSucceeds());
+  EXPECT_EQ(st.st_mode, 0000 | S_IFCHR);
+}
+
+// In the sandbox, /dev/ptmx is a symlink to pts/ptmx, so /dev/pts must be
+// mounted with ptmxmode=0666 for unprivileged users to allocate ptys.
+TEST(BasicPtyTest, DevPtmxMode) {
+  // On Linux, /dev/ptmx is set up by the host or the container runtime.
+  SKIP_IF(!IsRunningOnGvisor());
+
+  struct stat st;
+  ASSERT_THAT(stat("/dev/ptmx", &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_mode, 0666 | S_IFCHR);
 }
 
 TEST(BasicPtyTest, OpenDevTTY) {
@@ -631,9 +718,9 @@ class PtyTest : public ::testing::Test {
 
   // Writes master_input to the master file descriptor and verifies that
   // the replica and the echo output match what is expected.
-  void TestCanonicalIO(const char *master_input,
-                       const char *expected_replica_output,
-                       const char *expected_echo_output) {
+  void TestCanonicalIO(const char* master_input,
+                       const char* expected_replica_output,
+                       const char* expected_echo_output) {
     ASSERT_THAT(WriteFd(master_.get(), master_input, strlen(master_input)),
                 SyscallSucceedsWithValue(strlen(master_input)));
 
@@ -673,21 +760,21 @@ TEST_F(PtyTest, ReplicaCloseNotify) {
   // Ensure that there are no readable events.
   FD_ZERO(&read_set);
   FD_SET(master_.get(), &read_set);
-  EXPECT_THAT(select(max_fd, &read_set, NULL, NULL, &tv),
+  EXPECT_THAT(select(max_fd, &read_set, nullptr, nullptr, &tv),
               SyscallSucceedsWithValue(0));
 
   // Close the second replica and no readable event should occur.
   replica2_.reset();
   FD_ZERO(&read_set);
   FD_SET(master_.get(), &read_set);
-  EXPECT_THAT(select(max_fd, &read_set, NULL, NULL, &tv),
+  EXPECT_THAT(select(max_fd, &read_set, nullptr, nullptr, &tv),
               SyscallSucceedsWithValue(0));
 
   // Close the last remaining replica and a readable event should occur.
   replica_.reset();
   FD_ZERO(&read_set);
   FD_SET(master_.get(), &read_set);
-  EXPECT_THAT(select(max_fd, &read_set, NULL, NULL, &tv),
+  EXPECT_THAT(select(max_fd, &read_set, nullptr, nullptr, &tv),
               SyscallSucceedsWithValue(1));
   EXPECT_TRUE(FD_ISSET(master_.get(), &read_set));
 
@@ -823,7 +910,7 @@ TEST_F(PtyTest, PacketModeFailsOnReplica) {
 
 TEST_F(PtyTest, WriteInvalidUTF8) {
   char c = 0xff;
-  ASSERT_THAT(syscall(__NR_write, master_.get(), &c, sizeof(c)),
+  ASSERT_THAT(syscall(SYS_write, master_.get(), &c, sizeof(c)),
               SyscallSucceedsWithValue(sizeof(c)));
 }
 
@@ -1025,6 +1112,60 @@ TEST_F(PtyTest, TCSETSFTermiosONLCR) {
   char buf[3] = {};
   ExpectReadable(master_, 2, buf);
   EXPECT_STREQ(buf, "\r\n");
+
+  ExpectFinished(replica_);
+}
+
+TEST_F(PtyTest, TCSETSFFlushesOnlyReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "input";
+  constexpr char kOutput[] = "output";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_THAT(WriteFd(replica_.get(), kOutput, sizeof(kOutput) - 1),
+              SyscallSucceedsWithValue(sizeof(kOutput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(master_.get(), sizeof(kOutput) - 1));
+
+  struct kernel_termios t = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETS, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(replica_.get(), TCSETSF, &t), SyscallSucceeds());
+
+  char buf[sizeof(kOutput)] = {};
+  ExpectFinished(replica_);
+  EXPECT_THAT(ReadFd(master_.get(), buf, sizeof(kOutput) - 1),
+              SyscallSucceedsWithValue(sizeof(kOutput) - 1));
+  EXPECT_EQ(memcmp(buf, kOutput, sizeof(kOutput) - 1), 0);
+  ExpectFinished(master_);
+}
+
+TEST_F(PtyTest, TCSETSFOnMasterFlushesReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "pending";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+
+  struct kernel_termios t = {};
+  ASSERT_THAT(ioctl(master_.get(), TCGETS, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(master_.get(), TCSETSF, &t), SyscallSucceeds());
+
+  ExpectFinished(replica_);
+}
+
+TEST_F(PtyTest, TCSETSF2FlushesReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "pending";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+
+  struct kernel_termios2 t = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETS2, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(replica_.get(), TCSETSF2, &t), SyscallSucceeds());
 
   ExpectFinished(replica_);
 }
@@ -1568,7 +1709,7 @@ TEST_F(PtyTest, SwitchTwiceMultiline) {
   std::string kExpected = "GO\nBLUE\n!";
 
   // Write each line.
-  for (const std::string &input : kInputs) {
+  for (const std::string& input : kInputs) {
     ASSERT_THAT(WriteFd(master_.get(), input.c_str(), input.size()),
                 SyscallSucceedsWithValue(input.size()));
   }
@@ -1608,18 +1749,18 @@ TEST_F(PtyTest, QueueSize) {
 
 TEST_F(PtyTest, PartialBadBuffer) {
   // Allocate 2 pages.
-  void *addr = mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE,
+  void* addr = mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   ASSERT_NE(addr, MAP_FAILED);
-  char *buf = reinterpret_cast<char *>(addr);
+  char* buf = reinterpret_cast<char*>(addr);
 
   // Guard the 2nd page for our read to run into.
   ASSERT_THAT(
-      mprotect(reinterpret_cast<void *>(buf + kPageSize), kPageSize, PROT_NONE),
+      mprotect(reinterpret_cast<void*>(buf + kPageSize), kPageSize, PROT_NONE),
       SyscallSucceeds());
 
   // Leave only one free byte in the buffer.
-  char *bad_buffer = buf + kPageSize - 1;
+  char* bad_buffer = buf + kPageSize - 1;
 
   // Write to the master.
   constexpr char kBuf[] = "hello\n";
@@ -1635,7 +1776,10 @@ TEST_F(PtyTest, PartialBadBuffer) {
       ReadFd(replica_.get(), bad_buffer, size),
       AnyOf(SyscallFailsWithErrno(EFAULT), SyscallFailsWithErrno(EAGAIN)));
 
-  EXPECT_THAT(munmap(addr, 2 * kPageSize), SyscallSucceeds()) << addr;
+  // Format addr as a string before calling munmap so it can be safely streamed
+  // in diagnostic output on failure without triggering static analysis warnings
+  std::string const addr_str = absl::StrFormat("%p", addr);
+  EXPECT_THAT(munmap(addr, 2 * kPageSize), SyscallSucceeds()) << addr_str;
 }
 
 // Test that writing nothing to the PTY replica's output queue does not return
@@ -1656,6 +1800,26 @@ TEST_F(PtyTest, ReplicaWriteNothingNonCanonical) {
               SyscallSucceedsWithValue(strlen(kInput)));
 
   ExpectFinished(master_);
+}
+
+// Test that writing nothing to the PTY master's input queue does not block or
+// return an error.
+TEST_F(PtyTest, MasterWriteNothingCanonical) {
+  constexpr char kInput[] = "";
+  EXPECT_THAT(WriteFd(master_.get(), kInput, strlen(kInput)),
+              SyscallSucceedsWithValue(strlen(kInput)));
+
+  ExpectFinished(replica_);
+}
+
+TEST_F(PtyTest, MasterWriteNothingNonCanonical) {
+  DisableCanonical();
+
+  constexpr char kInput[] = "";
+  EXPECT_THAT(WriteFd(master_.get(), kInput, strlen(kInput)),
+              SyscallSucceedsWithValue(strlen(kInput)));
+
+  ExpectFinished(replica_);
 }
 
 TEST_F(PtyTest, SimpleEcho) {
@@ -1809,7 +1973,7 @@ TEST_F(JobControlTest, ReleaseTTY) {
   struct sigaction old_sa;
   EXPECT_THAT(sigaction(SIGHUP, &sa, &old_sa), SyscallSucceeds());
   EXPECT_THAT(ioctl(replica_.get(), TIOCNOTTY), SyscallSucceeds());
-  EXPECT_THAT(sigaction(SIGHUP, &old_sa, NULL), SyscallSucceeds());
+  EXPECT_THAT(sigaction(SIGHUP, &old_sa, nullptr), SyscallSucceeds());
 }
 
 TEST_F(JobControlTest, ReleaseUnsetTTY) {
@@ -1889,15 +2053,15 @@ TEST_F(JobControlTest, ReleaseTTYSignals) {
   sigemptyset(&sa.sa_mask);
   sigaddset(&sa.sa_mask, SIGHUP);
   sigaddset(&sa.sa_mask, SIGCONT);
-  sigprocmask(SIG_BLOCK, &sa.sa_mask, NULL);
+  sigprocmask(SIG_BLOCK, &sa.sa_mask, nullptr);
 
   pid_t same_pgrp_child = fork();
   if (!same_pgrp_child) {
     // The child will wait for SIGHUP and SIGCONT, then return 0. It begins with
     // SIGHUP and SIGCONT blocked. We install signal handlers for those signals,
     // then use sigsuspend to wait for those specific signals.
-    TEST_PCHECK(!sigaction(SIGHUP, &sa, NULL));
-    TEST_PCHECK(!sigaction(SIGCONT, &sa, NULL));
+    TEST_PCHECK(!sigaction(SIGHUP, &sa, nullptr));
+    TEST_PCHECK(!sigaction(SIGCONT, &sa, nullptr));
     sigset_t mask;
     sigfillset(&mask);
     sigdelset(&mask, SIGHUP);
@@ -1909,7 +2073,7 @@ TEST_F(JobControlTest, ReleaseTTYSignals) {
   }
 
   // We don't want to block these anymore.
-  sigprocmask(SIG_UNBLOCK, &sa.sa_mask, NULL);
+  sigprocmask(SIG_UNBLOCK, &sa.sa_mask, nullptr);
 
   // This child will return non-zero if either SIGHUP or SIGCONT are received.
   pid_t diff_pgrp_child = fork();
@@ -1934,7 +2098,7 @@ TEST_F(JobControlTest, ReleaseTTYSignals) {
   // processes in this process group.
   EXPECT_THAT(ioctl(replica_.get(), TIOCNOTTY), SyscallSucceeds());
 
-  EXPECT_THAT(sigaction(SIGHUP, &old_sa, NULL), SyscallSucceeds());
+  EXPECT_THAT(sigaction(SIGHUP, &old_sa, nullptr), SyscallSucceeds());
 
   // The child in the same process group will get signaled.
   int wstatus;
@@ -1971,7 +2135,7 @@ TEST_F(JobControlTest, ControllingProcessPersistsAfterChildExists) {
   sa.sa_flags = 0;
   sigemptyset(&sa.sa_mask);
   sigaddset(&sa.sa_mask, SIGINT);
-  ASSERT_THAT(sigaction(SIGINT, &sa, NULL), SyscallSucceeds());
+  ASSERT_THAT(sigaction(SIGINT, &sa, nullptr), SyscallSucceeds());
 
   // Send ^C.
   constexpr char kInput = ControlCharacter('C');
@@ -1998,7 +2162,7 @@ TEST_F(JobControlTest, ControllingProcessPersistsAfterChildExists) {
 
   // Release the controlling terminal and restore the old SIGHUP handler.
   EXPECT_THAT(ioctl(replica_.get(), TIOCNOTTY), SyscallSucceeds());
-  EXPECT_THAT(sigaction(SIGHUP, &old_sa, NULL), SyscallSucceeds());
+  EXPECT_THAT(sigaction(SIGHUP, &old_sa, nullptr), SyscallSucceeds());
 }
 
 TEST_F(JobControlTest, GetForegroundProcessGroup) {
@@ -2020,6 +2184,135 @@ TEST_F(JobControlTest, GetForegroundProcessGroupNonControlling) {
               SyscallFailsWithErrno(ENOTTY));
 }
 
+TEST_F(JobControlTest, GetSessionId) {
+  auto res = RunInChild([=]() {
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(!ioctl(replica_.get(), TIOCSCTTY, 0));
+
+    pid_t sid;
+    TEST_PCHECK(!ioctl(replica_.get(), TIOCGSID, &sid));
+    TEST_PCHECK(sid == getsid(0));
+
+    // TIOCGSID on the master end reports the session of the replica end.
+    pid_t master_sid;
+    TEST_PCHECK(!ioctl(master_.get(), TIOCGSID, &master_sid));
+    TEST_PCHECK(master_sid == sid);
+  });
+  ASSERT_NO_ERRNO(res);
+}
+
+TEST_F(JobControlTest, GetSessionIdNonControlling) {
+  // At this point there's no controlling terminal, so TIOCGSID should fail on
+  // both ends of the PTY.
+  pid_t sid;
+  ASSERT_THAT(ioctl(replica_.get(), TIOCGSID, &sid),
+              SyscallFailsWithErrno(ENOTTY));
+  ASSERT_THAT(ioctl(master_.get(), TIOCGSID, &sid),
+              SyscallFailsWithErrno(ENOTTY));
+}
+
+// Unlike the replica end, TIOCGSID on the master end does not require the PTY
+// to be the caller's controlling terminal.
+TEST_F(JobControlTest, GetSessionIdMasterOutsideSession) {
+  // child_ready tells us that the child has taken the replica as its
+  // controlling terminal; parent_done tells the child that it may exit.
+  int child_ready[2], parent_done[2];
+  ASSERT_THAT(pipe(child_ready), SyscallSucceeds());
+  ASSERT_THAT(pipe(parent_done), SyscallSucceeds());
+
+  pid_t child = fork();
+  if (!child) {
+    TEST_PCHECK(!close(child_ready[0]));
+    TEST_PCHECK(!close(parent_done[1]));
+
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(!ioctl(replica_.get(), TIOCSCTTY, 0));
+
+    pid_t sid = getsid(0);
+    TEST_PCHECK(write(child_ready[1], &sid, sizeof(sid)) == sizeof(sid));
+
+    // Block until the parent is done querying the master end.
+    char c;
+    TEST_PCHECK(read(parent_done[0], &c, 1) == 0);
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  ASSERT_THAT(close(child_ready[1]), SyscallSucceeds());
+  ASSERT_THAT(close(parent_done[0]), SyscallSucceeds());
+
+  pid_t child_sid;
+  ASSERT_THAT(read(child_ready[0], &child_sid, sizeof(child_sid)),
+              SyscallSucceedsWithValue(sizeof(child_sid)));
+  ASSERT_EQ(child_sid, child);
+  // We are not part of the child's session, so the replica end must not tell
+  // us anything...
+  pid_t sid;
+  EXPECT_THAT(ioctl(replica_.get(), TIOCGSID, &sid),
+              SyscallFailsWithErrno(ENOTTY));
+  // ...but the master end must.
+  EXPECT_THAT(ioctl(master_.get(), TIOCGSID, &sid), SyscallSucceeds());
+  EXPECT_EQ(sid, child_sid);
+
+  ASSERT_THAT(close(parent_done[1]), SyscallSucceeds());
+  int wstatus;
+  ASSERT_THAT(waitpid(child, &wstatus, 0), SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0);
+  ASSERT_THAT(close(child_ready[0]), SyscallSucceeds());
+}
+
+// TIOCGSID requires the PTY to be the caller's controlling terminal, not that
+// the caller lead the session, so a non-leader member of the session can read
+// the session ID too.
+TEST_F(JobControlTest, GetSessionIdNonLeader) {
+  auto res = RunInChild([=]() {
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(!ioctl(replica_.get(), TIOCSCTTY, 0));
+    pid_t sid = getsid(0);
+
+    // Fork a child that inherits the controlling terminal but doesn't lead
+    // the session.
+    pid_t grandchild = fork();
+    if (!grandchild) {
+      TEST_PCHECK(getpid() != sid);
+      TEST_PCHECK(getsid(0) == sid);
+
+      pid_t got;
+      TEST_PCHECK(!ioctl(replica_.get(), TIOCGSID, &got));
+      TEST_PCHECK(got == sid);
+      TEST_PCHECK(!ioctl(master_.get(), TIOCGSID, &got));
+      TEST_PCHECK(got == sid);
+      _exit(0);
+    }
+
+    int gcwstatus;
+    TEST_PCHECK(waitpid(grandchild, &gcwstatus, 0) == grandchild);
+    TEST_PCHECK(gcwstatus == 0);
+  });
+  ASSERT_NO_ERRNO(res);
+}
+
+// Giving up the controlling terminal clears the terminal's session, so
+// TIOCGSID fails on both ends afterwards.
+TEST_F(JobControlTest, GetSessionIdAfterRelease) {
+  auto res = RunInChild([=]() {
+    // TIOCNOTTY sends SIGHUP to the foreground process group, which is ours.
+    struct sigaction sa = {};
+    sa.sa_handler = SIG_IGN;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    TEST_PCHECK(!sigaction(SIGHUP, &sa, nullptr));
+
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(!ioctl(replica_.get(), TIOCSCTTY, 0));
+    TEST_PCHECK(!ioctl(replica_.get(), TIOCNOTTY));
+
+    pid_t sid;
+    TEST_PCHECK(ioctl(replica_.get(), TIOCGSID, &sid) < 0 && errno == ENOTTY);
+    TEST_PCHECK(ioctl(master_.get(), TIOCGSID, &sid) < 0 && errno == ENOTTY);
+  });
+  ASSERT_NO_ERRNO(res);
+}
+
 // This test:
 // - sets itself as the foreground process group
 // - creates a child process in a new process group
@@ -2035,7 +2328,7 @@ TEST_F(JobControlTest, SetForegroundProcessGroup) {
     sa.sa_handler = SIG_IGN;
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGTTOU, &sa, NULL);
+    sigaction(SIGTTOU, &sa, nullptr);
 
     // Set ourself as the foreground process group.
     TEST_PCHECK(!tcsetpgrp(replica_.get(), getpgid(0)));
@@ -2112,7 +2405,7 @@ TEST_F(JobControlTest, SetForegroundProcessGroupSIGTTOUIgnored) {
       sa.sa_handler = SIG_IGN;
       sa.sa_flags = 0;
       sigemptyset(&sa.sa_mask);
-      sigaction(SIGTTOU, &sa, NULL);
+      sigaction(SIGTTOU, &sa, nullptr);
       // Assign a different pgid to the child so it will result as
       // a background process.
       TEST_PCHECK(!setpgid(grandchild, getpid()));
@@ -2144,7 +2437,7 @@ TEST_F(JobControlTest, SetForegroundProcessGroupSIGTTOUBlocked) {
       // checking for "blocked == [SIGTTOU]" (see issue 7941 for
       // context).
       sigaddset(&signal_set, SIGTTIN);
-      sigprocmask(SIG_BLOCK, &signal_set, NULL);
+      sigprocmask(SIG_BLOCK, &signal_set, nullptr);
       // Assign a different pgid to the child so it will result as
       // a background process.
       TEST_PCHECK(!setpgid(grandchild, getpid()));
@@ -2153,7 +2446,7 @@ TEST_F(JobControlTest, SetForegroundProcessGroupSIGTTOUBlocked) {
       // signaled. That would happen if `tcsetpgrp` enqueued the
       // signal through the mask -- we would not yet have received it,
       // because of the mask.
-      sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
+      sigprocmask(SIG_UNBLOCK, &signal_set, nullptr);
       _exit(0);
     }
     int wstatus;
@@ -2713,6 +3006,33 @@ TEST_F(JobControlTest, SigwinchOnWindowSizeChange) {
   ASSERT_THAT(waitpid(child, &wstatus, 0), SyscallSucceedsWithValue(child));
   ASSERT_TRUE(WIFEXITED(wstatus));
   EXPECT_EQ(WEXITSTATUS(wstatus), 42);
+}
+
+TEST_F(PtyTest, PositionalIO) {
+  char buf[32] = {};
+  struct iovec iov = {
+      .iov_base = buf,
+      .iov_len = sizeof(buf),
+  };
+
+  // Positional I/O on master should return ESPIPE.
+  EXPECT_THAT(pread(master_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwrite(master_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(preadv(master_.get(), &iov, 1, 0), SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwritev(master_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
+
+  // Positional I/O on replica should return ESPIPE.
+  EXPECT_THAT(pread(replica_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwrite(replica_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(preadv(replica_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwritev(replica_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
 }
 
 }  // namespace

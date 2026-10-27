@@ -17,9 +17,13 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/sys/unix"
 )
 
 type runtimeDef struct {
@@ -206,6 +210,40 @@ func TestInstall(t *testing.T) {
 	}
 }
 
+func TestWriteFileWithExplicitMode(t *testing.T) {
+	oldMask := unix.Umask(0077)
+	t.Cleanup(func() { unix.Umask(oldMask) })
+	filename := filepath.Join(t.TempDir(), "config")
+	const old = "old"
+	if err := os.WriteFile(filename, []byte(old), 0600); err != nil {
+		t.Fatalf("os.WriteFile(%q, %q, 0600) = %v, want nil", filename, old, err)
+	}
+	stale, err := os.Open(filename)
+	if err != nil {
+		t.Fatalf("os.Open(%q) = %v, want nil", filename, err)
+	}
+	t.Cleanup(func() { stale.Close() })
+
+	const want = "new"
+	if err := writeFileWithExplicitMode(filename, []byte(want), 0644); err != nil {
+		t.Fatalf("writeFileWithExplicitMode(%q, %q, 0644) = %v, want nil", filename, want, err)
+	}
+
+	info, err := os.Stat(filename)
+	if err != nil {
+		t.Fatalf("os.Stat(%q) = %v, want nil", filename, err)
+	}
+	if got := info.Mode().Perm(); got != 0644 {
+		t.Errorf("os.Stat(%q).Mode().Perm() = %#o, want %#o", filename, got, 0644)
+	}
+	if got, err := os.ReadFile(filename); err != nil || string(got) != want {
+		t.Errorf("os.ReadFile(%q) = %q, %v, want %q, nil", filename, got, err, want)
+	}
+	if got, err := io.ReadAll(stale); err != nil || string(got) != old {
+		t.Errorf("io.ReadAll(%q) = %q, %v, want %q, nil", stale.Name(), got, err, old)
+	}
+}
+
 func TestUninstall(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -282,5 +320,38 @@ func TestUninstall(t *testing.T) {
 				t.Fatalf("Mismatch output (-want +got-): %s", res)
 			}
 		})
+	}
+}
+
+func TestReleaseTarballURL(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		goarch  string
+		want    string // Empty means an error is expected.
+	}{
+		{"release-20260706.0", "amd64", "https://storage.googleapis.com/gvisor/releases/release/20260706.0/x86_64/gvisor.tar.bz2"},
+		{"release-20260706", "arm64", "https://storage.googleapis.com/gvisor/releases/release/20260706/aarch64/gvisor.tar.bz2"},
+		{"gfoo-20260706.0", "amd64", "https://storage.googleapis.com/gvisor/releases/release/20260706.0/x86_64/gvisor.tar.bz2"},
+		{"release-20260706.0-14-gabcdef123456", "amd64", ""},
+		{"gfoo-20260706.0-14-gabcdef123456", "amd64", ""},
+		{"xfoo-20260706.0", "amd64", ""},
+		{"g1-20260706.0", "amd64", ""},
+		{"VERSION_MISSING", "amd64", ""},
+		{"release-20260706.0", "riscv64", ""},
+	} {
+		got, err := releaseTarballURL(tc.version, tc.goarch)
+		if tc.want == "" {
+			if err == nil {
+				t.Errorf("releaseTarballURL(%q, %q) = %q, want error", tc.version, tc.goarch, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("releaseTarballURL(%q, %q): %v", tc.version, tc.goarch, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("releaseTarballURL(%q, %q) = %q, want %q", tc.version, tc.goarch, got, tc.want)
+		}
 	}
 }

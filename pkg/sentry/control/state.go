@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -43,9 +44,6 @@ import (
 type SaveRestoreExecMode string
 
 const (
-	// DefaultSaveRestoreExecTimeout is the default timeout for the save/restore
-	// binary.
-	DefaultSaveRestoreExecTimeout = 10 * time.Minute
 	// SaveRestoreExecSave is the save mode for the save/restore exec.
 	SaveRestoreExecSave SaveRestoreExecMode = "save"
 	// SaveRestoreExecRestore is the restore mode for the save/restore exec.
@@ -66,67 +64,10 @@ type State struct {
 	Watchdog *watchdog.Watchdog
 }
 
-// SaveOpts contains options for the Save RPC call.
-type SaveOpts struct {
-	// Key is used to enable state integrity check.
-	Key []byte `json:"key"`
-
-	// Metadata is the set of metadata to prepend to the state file.
-	Metadata map[string]string `json:"metadata"`
-
-	// AppMFExcludeCommittedZeroPages is the value of
-	// pgalloc.SaveOpts.ExcludeCommittedZeroPages for the application memory
-	// file.
-	AppMFExcludeCommittedZeroPages bool `json:"app_mf_exclude_committed_zero_pages"`
-
-	// HavePagesFile indicates whether the pages file and its corresponding
-	// metadata file is provided.
-	HavePagesFile bool `json:"have_pages_file"`
-
-	// FilePayload contains the following:
-	// 1. checkpoint state file.
-	// 2. optional checkpoint pages metadata file.
-	// 3. optional checkpoint pages file.
-	urpc.FilePayload
-
-	// Resume indicates if the sandbox process should continue running
-	// after checkpointing.
-	Resume bool
-
-	// ExecOpts contains options for executing a binary during save/restore.
-	ExecOpts SaveRestoreExecOpts
-
-	// If UseCheckpointGofer is true, the first and only file in FilePayload is
-	// a Unix domain socket connected to a URPC server implementing
-	// stateipc.AsyncFileServer and providing checkpoint files.
-	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
-
-	// CudaCheckpointPath is the path to the cuda-checkpoint binary.
-	CudaCheckpointPath string `json:"cuda_checkpoint_path"`
-
-	// CudaCheckpointSequential indicates whether cuda-checkpoint should be run
-	// sequentially (rather than in parallel).
-	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
-}
-
-// SaveRestoreExecOpts contains options for executing a binary
-// during save/restore.
-type SaveRestoreExecOpts struct {
-	// Argv is the argv of the save/restore binary split by spaces.
-	// The first element is the path to the binary.
-	Argv string
-
-	// Timeout is the timeout for waiting for the save/restore binary.
-	Timeout time.Duration
-
-	// ContainerID is the ID of the container that the save/restore binary executes in.
-	ContainerID string
-}
-
 // ConvertToStateSaveOpts converts a control.SaveOpts to a state.SaveOpts.
 // state.SaveOpts.Close() must be called when the state.SaveOpts is no longer
 // needed.
-func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
+func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 	saveOpts := &state.SaveOpts{
 		Key:                            o.Key,
 		Metadata:                       o.Metadata,
@@ -134,6 +75,7 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+		ValidateMetadata:               o.ValidateMetadata,
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
@@ -142,19 +84,27 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 	return saveOpts, nil
 }
 
-func setSaveOpts(o *SaveOpts, saveOpts *state.SaveOpts) error {
+func setSaveOpts(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) error {
+	// TODO(b/541219576): Support checkpoint gofer with split checkpoint.
+	if len(o.SplitFSCheckpointPaths) > 0 && o.UseCheckpointGofer {
+		return fmt.Errorf("split filesystem checkpoint is not supported with checkpoint gofer")
+	}
 	if o.UseCheckpointGofer {
 		return setSaveOptsForCheckpointGofer(o, saveOpts)
 	}
 	return setSaveOptsForLocalCheckpointFiles(o, saveOpts)
 }
 
-func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) error {
+func setSaveOptsForLocalCheckpointFiles(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) error {
 	wantFiles := 1
 	if o.HavePagesFile {
 		wantFiles += 2
 	}
-	if gotFiles := len(o.FilePayload.Files); gotFiles != wantFiles {
+	fsFilesStart := wantFiles
+	// Each filesystem checkpoint bundle comprises 4 files:
+	// manifest, multi-tar archive, pages metadata, and pages file.
+	wantFiles += 4 * len(o.SplitFSCheckpointPaths)
+	if gotFiles := len(o.Files); gotFiles != wantFiles {
 		return fmt.Errorf("got %d files, wanted %d", gotFiles, wantFiles)
 	}
 
@@ -183,10 +133,42 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 		}
 		saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(pagesFileFD))
 	}
+
+	if len(o.SplitFSCheckpointPaths) > 0 {
+		saveOpts.FSSaveOpts = &kernel.FSSaveOpts{
+			RunscVersion: o.RunscVersion,
+			Bundles:      make([]kernel.FSSaveBundle, len(o.SplitFSCheckpointPaths)),
+		}
+		for i := range o.SplitFSCheckpointPaths {
+			offset := fsFilesStart + 4*i
+			bundle := &saveOpts.FSSaveOpts.Bundles[i]
+			bundle.Paths = o.SplitFSCheckpointPaths[i].Paths
+			manifestFile, err := o.ReleaseFD(offset)
+			if err != nil {
+				return err
+			}
+			bundle.ManifestFile = stateio.NewBufioWriteCloser(manifestFile)
+			multiTarFile, err := o.ReleaseFD(offset + 1)
+			if err != nil {
+				return err
+			}
+			bundle.MultiTarFile = stateio.NewBufioWriteCloser(multiTarFile)
+			pagesMetadataFile, err := o.ReleaseFD(offset + 2)
+			if err != nil {
+				return err
+			}
+			bundle.PagesMetadataFile = stateio.NewBufioWriteCloser(pagesMetadataFile)
+			pagesFileFD, err := unix.Dup(int(o.Files[offset+3].Fd()))
+			if err != nil {
+				return err
+			}
+			bundle.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(pagesFileFD))
+		}
+	}
 	return nil
 }
 
-func setSaveOptsForCheckpointGofer(o *SaveOpts, saveOpts *state.SaveOpts) error {
+func setSaveOptsForCheckpointGofer(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) error {
 	if gotFiles := len(o.Files); gotFiles != 1 {
 		return fmt.Errorf("got %d files, wanted 1", gotFiles)
 	}
@@ -233,34 +215,39 @@ func setSaveOptsForCheckpointGofer(o *SaveOpts, saveOpts *state.SaveOpts) error 
 }
 
 // Save saves the running system.
-func (s *State) Save(o *SaveOpts, _ *struct{}) error {
+func (s *State) Save(o *controlapi.SaveOpts, _ *struct{}) (err error) {
+	if len(o.SplitFSCheckpointPaths) > 0 {
+		defer func() {
+			s.Kernel.SignalAllFSSaveWaiters(err)
+		}()
+	}
+
 	saveOpts, err := ConvertToStateSaveOpts(o)
 	if err != nil {
 		return err
 	}
 	defer saveOpts.Close()
 
-	return s.SaveWithOpts(saveOpts, &o.ExecOpts)
-}
-
-// SaveWithOpts saves the running system with the given options.
-func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExecOpts) error {
-	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
-		return err
-	}
-	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
+	if err := s.SaveWithOpts(saveOpts, &o.ExecOpts); err != nil {
 		return err
 	}
 	if saveOpts.Resume {
-		if err := PostResume(s.Kernel, nil); err != nil {
-			return err
-		}
+		return PostResume(s.Kernel, nil)
 	}
 	return nil
 }
 
+// SaveWithOpts saves the running system with the given options. If
+// saveOpts.Resume is true, the caller must call PostResume afterwards.
+func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) error {
+	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
+		return err
+	}
+	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
+}
+
 // preSave is called before saving the kernel.
-func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *SaveRestoreExecOpts) error {
+func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) error {
 	if err := preSaveTPU(k); err != nil {
 		return err
 	}
@@ -292,15 +279,16 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 		// We can not invoke the save/restore binary on such a kernel.
 		return nil
 	}
+	// Undo preSave in reverse order.
+	if err := postResumeCuda(k, timeline); err != nil {
+		return err
+	}
+
 	if err := SaveRestoreExec(k, SaveRestoreExecResume); err != nil {
 		return fmt.Errorf("failed to wait for save/restore binary: %w", err)
 	}
 
-	if err := postResumeTPU(k); err != nil {
-		return err
-	}
-
-	return postResumeCuda(k, timeline)
+	return postResumeTPU(k)
 }
 
 // PostRestore is called after restoring the kernel.
@@ -318,15 +306,16 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 		// We can not invoke cuda-checkpoint on such a kernel.
 		return nil
 	}
+	// Undo preSave in reverse order.
+	if err := postRestoreCuda(k, timeline); err != nil {
+		return err
+	}
+
 	if err := SaveRestoreExec(k, SaveRestoreExecRestore); err != nil {
 		return fmt.Errorf("failed to wait for save/restore binary: %w", err)
 	}
 
-	if err := postRestoreTPU(k); err != nil {
-		return err
-	}
-
-	return postRestoreCuda(k, timeline)
+	return postRestoreTPU(k)
 }
 
 // SaveRestoreExec creates a new process that executes the save/restore
@@ -378,22 +367,18 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 		execOut = fdcollector.NewAgent(ctx, rfd, argv[0]) // transfers ownership of rfd
 		cu.Add(execOut.Stop)
 	}
-	// TODO(b/419041893): Support running the save/restore binary with container
-	// env vars without relying on the Saver().
-	var envv []string
-	if k.Saver() != nil {
-		contName := k.ContainerName(contID)
-		envv = k.Saver().SpecEnviron(contName)
-	}
+	envv := k.SpecEnviron(contID)
 
 	proc := Proc{
 		Kernel: k,
 	}
 	execArgs := ExecArgs{
-		Filename:       argv[0],
-		Argv:           argv,
-		Envv:           append(envv, fmt.Sprintf("%s=%s", saveRestoreExecEnvVar, mode)),
-		ContainerID:    contID,
+		ExecArgs: controlapi.ExecArgs{
+			Filename:    argv[0],
+			Argv:        argv,
+			Envv:        append(envv, fmt.Sprintf("%s=%s", saveRestoreExecEnvVar, mode)),
+			ContainerID: contID,
+		},
 		MountNamespace: mntns,
 		PIDNamespace:   leader.PIDNamespace(),
 		Limits:         limits.NewLimitSet(),
@@ -415,7 +400,7 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 			return fmt.Errorf("%v exited with non-zero status %d", argv[0], tg.ExitStatus())
 		}
 	case <-time.After(timeout):
-		tg.SendSignal(&linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+		tg.SendForcedSignal(&linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		return fmt.Errorf("%s timed out after %v", argv[0], timeout)
 	}
 	log.Debugf("save/restore binary %s output: %s", argv[0], execOut.String())
@@ -425,20 +410,21 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 // ConfigureSaveRestoreExec sets the configuration for the save/restore binary.
 // If containerID is empty, the global init process will be used for the
 // save/restore binary's leader task.
+//
+// A previously stored configuration is replaced: a sandbox may be
+// checkpointed repeatedly, and the configuration also survives in the kernel
+// state across a restore. The leader task is always resolved anew, since a
+// task stored by an earlier call may have exited.
 func ConfigureSaveRestoreExec(k *kernel.Kernel, argv []string, timeout time.Duration, containerID string) error {
-	if k.SaveRestoreExecConfig != nil {
-		return fmt.Errorf("save/restore binary is already set")
-	}
-	k.SaveRestoreExecConfig = &kernel.SaveRestoreExecConfig{
-		Argv:    argv,
-		Timeout: timeout,
-	}
-
 	leader, err := findContainerInitProcess(k, containerID)
 	if err != nil {
 		return err
 	}
-	k.SaveRestoreExecConfig.LeaderTask = leader
+	k.SaveRestoreExecConfig = &kernel.SaveRestoreExecConfig{
+		Argv:       argv,
+		Timeout:    timeout,
+		LeaderTask: leader,
+	}
 	return nil
 }
 
@@ -446,12 +432,14 @@ func ConfigureSaveRestoreExec(k *kernel.Kernel, argv []string, timeout time.Dura
 // the given containerID. If containerID is empty, the global init process is returned.
 func findContainerInitProcess(k *kernel.Kernel, containerID string) (*kernel.Task, error) {
 	if containerID == "" {
-		return k.GlobalInit().Leader(), nil
+		init := k.GlobalInit()
+		if init == nil {
+			return nil, fmt.Errorf("sandbox has no global init process")
+		}
+		return init.Leader(), nil
 	}
-	// To find the init process of a container, we look for the process with no
-	// parent (root of execution) that is not an exec process.
 	for _, tg := range k.RootPIDNamespace().ThreadGroups() {
-		if leader := tg.Leader(); leader.Parent() == nil && leader.Origin != kernel.OriginExec && leader.ContainerID() == containerID {
+		if leader := tg.Leader(); tg.IsContainerInit() && leader.ContainerID() == containerID {
 			return leader, nil
 		}
 	}
