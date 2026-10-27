@@ -449,13 +449,15 @@ type Config struct {
 	// like "docs.github.com" or wildcard like "*.github.com") whose resolved
 	// addresses the sandbox is allowed to reach. The Sentry snoops plain UDP
 	// DNS responses for these names to learn the addresses. Only supported with
-	// sandbox networking.
+	// sandbox networking. The root container's configuration applies to all
+	// containers in the sandbox, including the shared DNS-learned addresses.
 	EgressAllowDomains string `flag:"egress-allow-domains"`
 
 	// EgressAllowIPs is a comma-separated list of IPs and CIDRs (v4/v6) the
 	// sandbox is always allowed to reach on any port. When either egress
 	// allowlist flag is set, all other egress is blocked by the Sentry. Only
-	// supported with sandbox networking.
+	// supported with sandbox networking. The root container's configuration
+	// applies to all containers in the sandbox.
 	EgressAllowIPs string `flag:"egress-allow-ips"`
 
 	// egressAllowDomainsBase and egressAllowIPsBase snapshot the

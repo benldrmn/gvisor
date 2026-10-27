@@ -135,7 +135,10 @@ func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pk
 		// response does not keep the gate open and tax every inbound packet.
 		f.pending.maybeSweep(f.clock.NowMonotonic())
 		if f.pending.nonEmpty() {
-			f.snoopInbound(protocol, pkt)
+			// The NIC sets RXChecksumValidated from link capabilities after this
+			// callback. Use the same decision without mutating the packet.
+			rxChecksumValidated := e.Capabilities()&stack.CapabilityRXChecksumOffload != 0
+			f.snoopInbound(protocol, pkt, rxChecksumValidated)
 		}
 	}
 	e.Endpoint.DeliverNetworkPacket(protocol, pkt)

@@ -198,7 +198,9 @@ func (f *Filter) trackDNSQuery(pkt *stack.PacketBuffer, dst tcpip.Address, l4pro
 // query and, if found, learns its addresses. It never mutates or drops pkt and
 // never panics. Learning happens before the caller delivers the packet up, so
 // the workload's resolve-then-connect sequence cannot race the learner.
-func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+//
+// rxChecksumValidated must match the receiving NIC's checksum offload decision.
+func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, rxChecksumValidated bool) {
 	switch protocol {
 	case header.IPv4ProtocolNumber, header.IPv6ProtocolNumber:
 	default:
@@ -217,7 +219,7 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 			return
 		}
 		ipHdr := header.IPv4(clone.NetworkHeader().Slice())
-		if !clone.RXChecksumValidated && !ipHdr.IsChecksumValid() {
+		if !rxChecksumValidated && !ipHdr.IsChecksumValid() {
 			return
 		}
 		// A fragmented response is not reassembled here, so its payload cannot be
@@ -263,7 +265,7 @@ func (f *Filter) snoopInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		protocol,
 		src,
 		dst,
-		clone.RXChecksumValidated,
+		rxChecksumValidated,
 	)
 	if !lengthValid || !checksumValid {
 		return

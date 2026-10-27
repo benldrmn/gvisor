@@ -230,10 +230,16 @@ These flags are only supported with `--network=sandbox`. Combining them with
 `--network=host`, `none`, or `plugin` (or with XDP redirect/tunnel mode) is a
 hard error.
 
-The flags may be set per-container via OCI annotations
-(`dev.gvisor.flag.egress-allow-domains` / `dev.gvisor.flag.egress-allow-ips`),
-but an annotation may only **narrow** the allowlist, never widen it, so a
-container author cannot weaken the operator's policy:
+The allowlist is configured per-sandbox, like the qdisc/TBF settings. Set the
+flags when creating the root sandbox, or use OCI annotations
+(`dev.gvisor.flag.egress-allow-domains` / `dev.gvisor.flag.egress-allow-ips`)
+on the root container. For Kubernetes, use Pod annotations forwarded by
+containerd to the sandbox's OCI spec. All containers in the sandbox share the
+policy and DNS-learned addresses. Annotations on child containers do not change
+the sandbox's policy.
+
+An annotation may only **narrow** the runtime-configured allowlist, never widen
+it, so a sandbox author cannot weaken the operator's policy:
 
 *   If the runtime configured no allowlist, an annotation may add one (that only
     restricts egress).
@@ -255,8 +261,9 @@ zone cuts, and a multi-tenant suffix such as `*.github.io` covers every tenant.
 Single-label and broad suffix patterns are accepted because DNS syntax alone
 cannot identify administrative boundaries.
 
-The configured resolver is trusted. It can authorize any address in a response
-for an allowed name. Its statically allowed IP is also reachable on every port
+Any allowed IP, including one learned through DNS, is trusted to answer DNS
+queries for allowed names and authorize other addresses.
+The configured resolver's statically allowed IP is also reachable on every port
 and protocol, and queries for names outside the domain list still reach it, so
 this feature is not a complete data-exfiltration boundary against a workload
 that can communicate through the resolver.

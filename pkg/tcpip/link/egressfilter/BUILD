@@ -34,6 +34,7 @@ go_test(
     name = "egressfilter_test",
     size = "small",
     srcs = [
+        "checksum_test.go",
         "dns_test.go",
         "egressfilter_test.go",
         "rst_test.go",
@@ -48,7 +49,10 @@ go_test(
         "//pkg/tcpip/header",
         "//pkg/tcpip/header/parse",
         "//pkg/tcpip/link/channel",
+        "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/stack",
+        "//pkg/tcpip/transport/udp",
+        "//pkg/waiter",
         "@org_golang_x_net//dns/dnsmessage:go_default_library",
     ],
 )

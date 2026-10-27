@@ -613,7 +613,7 @@ func TestIPv6DNSFragmentHandling(t *testing.T) {
 				aResource(t, "a.example.com.", [4]byte{1, 2, 3, 4}),
 			})
 			pkt := inboundV6FragmentedUDP(t, server, local, dnsPort, 40000, resp, tc.more)
-			f.snoopInbound(header.IPv6ProtocolNumber, pkt)
+			f.snoopInbound(header.IPv6ProtocolNumber, pkt, false)
 			pkt.DecRef()
 			if got := f.learned.contains(learned); got != tc.learns {
 				t.Fatalf("learned = %t, want %t", got, tc.learns)
