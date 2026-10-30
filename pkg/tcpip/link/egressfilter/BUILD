@@ -34,6 +34,7 @@ go_test(
     name = "egressfilter_test",
     size = "small",
     srcs = [
+        "benchmark_test.go",
         "checksum_test.go",
         "dns_test.go",
         "egressfilter_test.go",
