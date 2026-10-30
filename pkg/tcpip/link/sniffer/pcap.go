@@ -55,7 +55,7 @@ type pcapPacket struct {
 }
 
 func (p *pcapPacket) MarshalBinary() ([]byte, error) {
-	pkt := trimmedClone(p.packet)
+	pkt := p.packet.TrimmedNetworkClone()
 	defer pkt.DecRef()
 	packetSize := pkt.Size()
 	captureLen := p.maxCaptureLen

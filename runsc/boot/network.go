@@ -22,12 +22,14 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/egressallowlist"
 	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/link/egressfilter"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
@@ -121,6 +123,24 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 	}
 	if got := len(args.FilePayload.Files); got != wantFDs {
 		return fmt.Errorf("args.FilePayload.Files has %d FDs but we need %d entries based on FDBasedLinks, XDPLinks, and PCAP", got, wantFDs)
+	}
+
+	// Share the egress policy and learned addresses across external NICs.
+	var egressFilter *egressfilter.Filter
+	if args.EgressAllowDomains != "" || args.EgressAllowIPs != "" {
+		domains := egressallowlist.SplitList(args.EgressAllowDomains)
+		ips := egressallowlist.SplitList(args.EgressAllowIPs)
+		var err error
+		egressFilter, err = egressfilter.NewFilter(egressfilter.Config{
+			Domains: domains,
+			IPs:     ips,
+			Clock:   n.Stack.Clock(),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create egress filter: %w", err)
+		}
+		log.Infof("Egress allowlist active: %d domain(s), %d IP(s), all other egress is blocked",
+			len(domains), len(ips))
 	}
 
 	nicids := make(map[string]tcpip.NICID)
@@ -225,6 +245,11 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 				linkEP = sniffer.New(linkEP)
 			}
 
+			// Filter before capture and after queueing.
+			if egressFilter != nil {
+				linkEP = egressfilter.New(linkEP, egressFilter)
+			}
+
 			var qDisc stack.QueueingDiscipline
 			switch link.QDisc {
 			case config.QDiscNone:
@@ -324,6 +349,11 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 			fdOffset++
 		} else if args.LogPackets {
 			linkEP = sniffer.New(linkEP)
+		}
+
+		// Filter before capture and after queueing.
+		if egressFilter != nil {
+			linkEP = egressfilter.New(linkEP, egressFilter)
 		}
 
 		var qDisc stack.QueueingDiscipline

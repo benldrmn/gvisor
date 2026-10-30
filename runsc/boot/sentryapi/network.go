@@ -185,6 +185,12 @@ type CreateLinksAndRoutesArgs struct {
 
 	// IsRestore indicates whether this is part of a restore flow.
 	IsRestore bool
+
+	// EgressAllowDomains is copied from config.Config.EgressAllowDomains.
+	EgressAllowDomains string
+
+	// EgressAllowIPs is copied from config.Config.EgressAllowIPs.
+	EgressAllowIPs string
 }
 
 // NetworkInitPluginStack initializes third-party network stack.

@@ -199,6 +199,83 @@ Offload (GSO) to run with a kernel that is newer than 3.17. Add the
 }
 ```
 
+## Egress allowlist {#egress-allowlist}
+
+With `--network=sandbox` (the default), gVisor can restrict outbound traffic to
+allowed IPs and addresses learned from DNS for allowed domains. The Sentry
+applies the policy to all outbound packets, including raw socket traffic.
+
+To enable it, add the following `runtimeArgs` to your Docker configuration
+(`/etc/docker/daemon.json`) and restart the Docker daemon:
+
+```json
+{
+    "runtimes": {
+        "runsc": {
+            "path": "/usr/local/bin/runsc",
+            "runtimeArgs": [
+                "--egress-allow-domains=docs.github.com,*.github.com",
+                "--egress-allow-ips=8.8.8.8,10.0.0.0/8"
+            ]
+       }
+    }
+}
+```
+
+*   `--egress-allow-domains`: Comma-separated, case-insensitive ASCII domain
+    patterns. `*.github.com` matches subdomains at any depth, but not
+    `github.com` itself. List the bare domain separately if needed.
+*   `--egress-allow-ips`: Comma-separated IPv4/IPv6 addresses and CIDRs, allowed
+    on all ports and protocols.
+
+Each list accepts up to 1024 distinct entries. Setting either flag blocks other
+outbound traffic. Blocked TCP connections return `ECONNREFUSED`.
+These flags do not support other network modes or XDP redirect/tunnel mode.
+
+The policy is per-sandbox. Set flags or OCI annotations
+(`dev.gvisor.flag.egress-allow-domains` and `dev.gvisor.flag.egress-allow-ips`)
+on the root container. For Kubernetes, use Pod annotations forwarded by
+containerd. All child containers share the policy and learned addresses.
+Child annotations do not change the policy.
+
+Annotations may add an allowlist or narrow the runtime-configured one. Widening
+it requires `--allow-flag-override`.
+
+### DNS resolver {#egress-resolver}
+
+Add the resolver's IP from the container's `/etc/resolv.conf` to
+`--egress-allow-ips`. Domain rules require a non-empty IP allowlist. A resolver
+reachable only over loopback cannot be used for learning.
+
+DNS queries to allowed resolvers are not filtered by name. Resolving an
+unlisted name does not authorize its addresses.
+
+### Security notes {#egress-threat-model}
+
+The policy allows IP addresses, including every service and virtual host sharing
+an address. Review broad wildcards and shared hosting domains accordingly.
+Any allowed IP serving DNS, including a learned IP, can authorize other addresses
+for allowed names. Allowed peers may also proxy traffic to other destinations.
+
+Loopback and supported link-local ARP, NDP, IGMP, and MLD control traffic are
+exempt. The allowlist does not isolate tenants sharing an untrusted L2 network.
+
+### Limitations {#egress-limitations}
+
+*   Learning requires ordinary UDP/53 DNS queries and A/AAAA answers. TCP and
+    encrypted DNS, raw-socket queries, and fragmented responses are not learned.
+    List destination IPs statically when using these paths.
+*   Learned addresses do not expire with DNS TTLs. Checkpoint/restore loses them
+    and uses the restore invocation's static policy. Resolve names again after
+    restore or allowlist IPs for connections that must survive it.
+*   Replies to inbound connections require an allowed peer IP. Traffic such as
+    DHCP, mDNS, and non-link-local multicast also needs explicit allowance.
+*   Learning is limited to 65536 addresses per sandbox, 64 A/AAAA records per
+    response, and 4096 pending queries. Addresses beyond these limits are not
+    learned. Existing learned addresses are not evicted.
+*   Packet captures omit dropped egress and synthesized TCP resets. Check the
+    Sentry log for dropped destinations.
+
 [netstack]: /docs/architecture_guide/networking/
 [Production guide]: /docs/user_guide/production/
 [tbf-source]: https://cs.opensource.google/gvisor/gvisor/+/master:pkg/tcpip/link/qdisc/tbf/
