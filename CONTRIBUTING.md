@@ -139,6 +139,8 @@ Rules:
 
     *   Itself.
     *   Go standard library.
+    *   `@org_golang_x_net//dns/dnsmessage:go_default_library` (Go import
+        `golang.org/x/net/dns/dnsmessage`).
     *   `@org_golang_x_sys//unix:go_default_library` (Go import
         `golang.org/x/sys/unix`).
     *   `@org_golang_x_time//rate:go_default_library` (Go import
