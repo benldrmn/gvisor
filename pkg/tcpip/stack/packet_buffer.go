@@ -433,6 +433,12 @@ func (pk *PacketBuffer) Network() header.Network {
 	}
 }
 
+// TrimmedNetworkClone returns a clone with virtio and link headers removed and
+// the network packet in Data, ready for parsing. The caller must DecRef it.
+func (pk *PacketBuffer) TrimmedNetworkClone() *PacketBuffer {
+	return NewPacketBuffer(PacketBufferOptions{Payload: BufferSince(pk.NetworkHeader())})
+}
+
 // CloneToInbound makes a semi-deep copy of the packet buffer (similar to
 // Clone) to be used as an inbound packet.
 //

@@ -18,6 +18,7 @@ go_library(
     importpath = "gvisor.dev/gvisor/runsc/config",
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/egressallowlist",
         "//pkg/log",
         "//pkg/refs",
         "//pkg/sentry/devices/nvproxy/nvconf",

@@ -336,6 +336,8 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (sentryapi.Cre
 		PauseExternalNetworking:      conf.PauseExternalNetworking,
 		AllowConnectedOnSave:         conf.AllowConnectedOnSave,
 		AllowExternalLoopbackTraffic: conf.Netgofer.AllowLoopback(),
+		EgressAllowDomains:           conf.EgressAllowDomains,
+		EgressAllowIPs:               conf.EgressAllowIPs,
 	}
 
 	for _, iface := range ifaces {
