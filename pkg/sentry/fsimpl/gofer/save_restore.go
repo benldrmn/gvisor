@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rand"
@@ -53,7 +52,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 	// Purge cached dentries, which may not be reopenable after restore due to
 	// permission changes.
 	fs.renameMu.Lock()
-	fs.evictAllCachedDentriesLocked(ctx)
+	fs.evictAllCachedDentriesLocked(ctx, false /* keepRenameMu */)
 	fs.renameMu.Unlock()
 	fs.savedDentryRW = make(map[*dentry]savedDentryRW)
 
@@ -279,6 +278,8 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	fs.opts.fd = fd
 	fs.inoByKey = make(map[inoKey]uint64)
 	fs.inodeByKey = make(map[inoKey]*inode)
+	prevDevMinors := fs.devMinorByHostDev
+	fs.devMinorByHostDev = make(map[uint64]uint32, len(prevDevMinors))
 
 	if err := fs.restoreRoot(ctx, &opts); err != nil {
 		return vfs.PrependErrMsg("failed to restore root", err)
@@ -349,6 +350,8 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 			delete(dirsToDelete, leafD)
 		}
 	}
+
+	fs.releaseDevMinors(prevDevMinors)
 
 	// Discard state only required during restore.
 	fs.savedDeletedOpenDentries = nil
@@ -495,12 +498,11 @@ func (fd *specialFileFD) completeRestore(ctx context.Context) error {
 	fd.handle = h
 	fd.mmapFile.SetFD(int(h.fd))
 
-	ftype := d.inode.fileType()
-	fd.haveQueue = (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK) && fd.handle.fd >= 0
-	if fd.haveQueue {
-		if err := fdnotifier.AddFD(fd.handle.fd, &fd.queue); err != nil {
-			return fmt.Errorf("failed to add FD to fdnotified for %q: %w", genericDebugPathname(d.inode.fs, d), err)
-		}
+	if h.fd < 0 && !fd.queue.IsEmpty() {
+		return fmt.Errorf("cannot restore waiters for %q: gofer did not donate a host file descriptor", genericDebugPathname(d.inode.fs, d))
+	}
+	if err := fd.initWaitQueue(d.inode.fileType()); err != nil {
+		return fmt.Errorf("restoring wait queue for %q: %w", genericDebugPathname(d.inode.fs, d), err)
 	}
 
 	return nil

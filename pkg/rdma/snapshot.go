@@ -57,7 +57,10 @@ type Port struct {
 	// GIDNames are the entry names of the GID table (typically "0".."255").
 	// The same names index gids/<n>, gid_attrs/types/<n> and
 	// gid_attrs/ndevs/<n>, all served live.
-	GIDNames       []string `json:"gid_names"`
+	GIDNames []string `json:"gid_names"`
+	// PKeyNames are the entry names of the P_Key table (pkeys/<n>), served
+	// live. Empty when the port has no P_Key table (pkey_tbl_len == 0).
+	PKeyNames      []string `json:"pkey_names"`
 	CounterNames   []string `json:"counter_names"`
 	HWCounterNames []string `json:"hw_counter_names"`
 }
@@ -104,8 +107,9 @@ type NUMA struct {
 type Snapshot struct {
 	VerbsABIVersion string `json:"verbs_abi_version"`
 	// PCINodes contains every PCI directory in the closure: the leaves
-	// (NICs, GPUs) and all their ancestor bridges/roots. Sorted by Path,
-	// which places parents before children.
+	// (NICs, the functions NCCL reads in their place, GPUs) and all their
+	// ancestor bridges/roots. Sorted by Path, which places parents before
+	// children.
 	PCINodes []PCINode `json:"pci_nodes"`
 	Devices  []Device  `json:"devices"`
 	NUMA     *NUMA     `json:"numa,omitempty"`

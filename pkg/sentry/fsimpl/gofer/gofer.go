@@ -31,6 +31,7 @@
 //	            dentry.handleMu
 //	              dentry.dataMu
 //	          filesystem.ancestryMu
+//	          filesystem.devMu
 //	          filesystem.inoMu
 //	          filesystem.inodeMu
 //	specialFileFD.mu
@@ -91,6 +92,7 @@ const (
 	moptDisableFileHandleSharing = "disable_file_handle_sharing"
 	moptDisableFifoOpen          = "disable_fifo_open"
 	moptCharDevicePolicy         = "char_device_policy"
+	moptVirtualInodeNumbers      = "virtual_inode_numbers"
 
 	// Directfs options.
 	moptDirectfs = "directfs"
@@ -155,6 +157,9 @@ func (cache *stringFixedCache) add(name string) string {
 
 // +stateify savable
 type dentryCache struct {
+	// isGlobal indicates that this cache is shared across filesystems.
+	// isGlobal is immutable and preserved across checkpoint/restore.
+	isGlobal bool
 	// maxCachedDentries is the maximum number of cacheable dentries.
 	// maxCachedDentries is immutable.
 	maxCachedDentries uint64
@@ -176,7 +181,7 @@ func SetDentryCacheSize(size int) {
 		log.Warningf("Global dentry cache has already been initialized. Ignoring subsequent attempt.")
 		return
 	}
-	globalDentryCache = &dentryCache{maxCachedDentries: uint64(size)}
+	globalDentryCache = &dentryCache{isGlobal: true, maxCachedDentries: uint64(size)}
 }
 
 // globalDentryCache is a global cache of dentries across all gofer clients.
@@ -211,7 +216,9 @@ type filesystem struct {
 	// clock is a realtime clock used to set timestamps in file operations.
 	clock ktime.Clock
 
-	// devMinor is the filesystem's minor device number. devMinor is immutable.
+	// devMinor is the filesystem's minor device number. It is used for
+	// synthetic files, and for all files if opts.virtualInodeNumbers.
+	// devMinor is immutable.
 	devMinor uint32
 
 	// root is the root dentry. root is immutable.
@@ -241,18 +248,29 @@ type filesystem struct {
 	syncableDentries dentryList
 	specialFileFDs   specialFDList
 
+	// devMinorByHostDev maps host device numbers, as encoded by unix.Mkdev,
+	// to minor device numbers assigned to files on those devices. It is only
+	// used if !opts.virtualInodeNumbers. Host device numbers may change
+	// across checkpoint/restore, so devMinorByHostDev is rebuilt on restore.
+	// devMinorByHostDev is protected by devMu.
+	devMu             sync.RWMutex `state:"nosave"`
+	devMinorByHostDev map[uint64]uint32
+
 	// inoByKey maps previously-observed device ID and host inode numbers to
-	// internal inode numbers assigned to those files. inoByKey is not preserved
-	// across checkpoint/restore because inode numbers may be reused between
+	// internal inode numbers assigned to those files. It is only used if
+	// opts.virtualInodeNumbers. inoByKey is not preserved across
+	// checkpoint/restore because inode numbers may be reused between
 	// different gofer processes, so inode numbers may be repeated for different
 	// files across checkpoint/restore. inoByKey is protected by inoMu.
 	inoMu    sync.Mutex        `state:"nosave"`
 	inoByKey map[inoKey]uint64 `state:"nosave"`
 	// inodeByKey maps inoKey to non-directory inodes. inodeByKey is protected by
-	// inodeMu. inodeByKey is similar to inoByKey, except that is not an
+	// inodeMu. inodeByKey is similar to inoByKey, except that it is not an
 	// ever-growing map. This is to allow for the sharing of inodes across
-	// dentries. As non-directory dentries are destroyed, their associated inode
-	// entry in this map is cleared.
+	// dentries. An entry may be replaced by a newer inode if the host reuses
+	// inoKey for a different file type; as non-directory inodes are destroyed,
+	// their entry in this map is cleared if it still points to the destroyed
+	// inode.
 	inodeMu    sync.Mutex        `state:"nosave"`
 	inodeByKey map[inoKey]*inode `state:"nosave"`
 
@@ -271,15 +289,22 @@ type filesystem struct {
 	released atomicbitops.Int32
 }
 
-// getOrCreateInode returns an inode for the given inoKey, to avoid creating
-// multiple inodes objects for the same inoKey. This is useful for sharing
-// inodes across dentries.
+// getOrCreateInode returns an inode for the given inoKey and fileType, to
+// avoid creating multiple inode objects for the same file. This is useful for
+// sharing inodes across dentries.
+//
+// A cached inode with a different fileType is treated as a miss (for example,
+// when the host filesystem unlinks a file and recycles its inode number for a
+// new file of a different type while the old gofer.inode is still referenced
+// in the sentry). Sharing here is best-effort under concurrent walks across an
+// inode-number reuse race (last writer takes the slot, degrading a later walk
+// to another miss rather than panicking).
 //
 // If a miss, `createInode` is called and the result is cached. If a hit,
 // `onCacheHit` is called. This path locks fs.inodeMu.
 //
 // The caller is responsible for decrementing the inode's reference count when done.
-func (fs *filesystem) getOrCreateInode(inoKey inoKey, dontCache bool, onCacheHit func(), createInode func() *inode) *inode {
+func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache bool, onCacheHit func(), createInode func() *inode) *inode {
 	if dontCache {
 		// Create a new inode and return it bypassing the cache. This is used for
 		// creating inodes that are not meant to be shared across dentries.
@@ -287,7 +312,7 @@ func (fs *filesystem) getOrCreateInode(inoKey inoKey, dontCache bool, onCacheHit
 	}
 	fs.inodeMu.Lock()
 	defer fs.inodeMu.Unlock()
-	if cachedInode, ok := fs.inodeByKey[inoKey]; ok {
+	if cachedInode, ok := fs.inodeByKey[inoKey]; ok && cachedInode.fileType() == fileType {
 		onCacheHit()
 		cachedInode.incRef()
 		return cachedInode
@@ -347,6 +372,12 @@ type filesystemOptions struct {
 	// dispatched to the sentry's device registry, passed through to the host
 	// via the gofer, or a combination of both.
 	charDevicePolicy charDevicePolicy
+
+	// If virtualInodeNumbers is true, files are assigned sequential inode
+	// numbers, recorded in filesystem.inoByKey, and the filesystem's device
+	// number. Otherwise files report their host inode numbers, and their host
+	// device numbers are mapped to sandbox-private device numbers.
+	virtualInodeNumbers bool
 
 	// directfs holds options for directfs mode.
 	directfs directfsOpts
@@ -603,7 +634,15 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	if _, ok := mopts[moptDirectfs]; ok {
 		delete(mopts, moptDirectfs)
+		if procSelfFD < 0 {
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: directfs requires SetProcSelfFD()")
+			return nil, nil, linuxerr.EINVAL
+		}
 		fsopts.directfs.enabled = true
+	}
+	if _, ok := mopts[moptVirtualInodeNumbers]; ok {
+		delete(mopts, moptVirtualInodeNumbers)
+		fsopts.virtualInodeNumbers = true
 	}
 	// fsopts.regularFilesUseSpecialFileFD can only be enabled by specifying
 	// "cache=none".
@@ -638,13 +677,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 	fs := &filesystem{
-		mf:         mf,
-		opts:       fsopts,
-		iopts:      iopts,
-		clock:      ktime.RealtimeClockFromContext(ctx),
-		devMinor:   devMinor,
-		inoByKey:   make(map[inoKey]uint64),
-		inodeByKey: make(map[inoKey]*inode),
+		mf:                mf,
+		opts:              fsopts,
+		iopts:             iopts,
+		clock:             ktime.RealtimeClockFromContext(ctx),
+		devMinor:          devMinor,
+		inoByKey:          make(map[inoKey]uint64),
+		inodeByKey:        make(map[inoKey]*inode),
+		devMinorByHostDev: make(map[uint64]uint32),
 	}
 
 	// Did the user configure a global dentry cache?
@@ -813,7 +853,7 @@ func (fs *filesystem) Release(ctx context.Context) {
 	if refs.GetLeakMode() != refs.NoLeakChecking && fs.root != nil {
 		fs.renameMu.Lock()
 		fs.root.releaseExtraRefsRecursiveLocked(ctx)
-		fs.evictAllCachedDentriesLocked(ctx)
+		fs.evictAllCachedDentriesLocked(ctx, false /* keepRenameMu */)
 		fs.renameMu.Unlock()
 
 		// An extra reference was held by the filesystem on the root to prevent it from
@@ -828,7 +868,11 @@ func (fs *filesystem) Release(ctx context.Context) {
 		}
 	}
 
-	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+	vfsObj := fs.vfsfs.VirtualFilesystem()
+	vfsObj.PutAnonBlockDevMinor(fs.devMinor)
+	for _, devMinor := range fs.devMinorByHostDev {
+		vfsObj.PutAnonBlockDevMinor(devMinor)
+	}
 }
 
 // releaseExtraRefsRecursiveLocked traverses the tree with root d and
@@ -840,7 +884,7 @@ func (fs *filesystem) Release(ctx context.Context) {
 func (d *dentry) releaseExtraRefsRecursiveLocked(ctx context.Context) {
 	if d.inode.isSynthetic() || d.inode.endpoint != nil {
 		d.decRefNoCaching()
-		d.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+		d.checkCachingLocked(ctx, true /* renameMuWriteLocked */, false /* keepRenameMu */)
 	}
 	if d.isDir() {
 		var children []*dentry
@@ -914,7 +958,8 @@ type inode struct {
 	//   - Lock metadataMu and use atomic operations to update because we might
 	//     have atomic readers that don't hold the lock.
 	metadataMu sync.Mutex          `state:"nosave"`
-	ino        uint64              // immutable
+	ino        uint64              // immutable, except during restore
+	devMinor   uint32              // immutable, except during restore
 	mode       atomicbitops.Uint32 // type is immutable, perms are mutable
 	uid        atomicbitops.Uint32 // auth.KUID, but stored as raw uint32 for sync/atomic
 	gid        atomicbitops.Uint32 // auth.KGID, but ...
@@ -1251,7 +1296,12 @@ type dentryListElem struct {
 	dentryEntry
 }
 
+// inoFromKey returns the inode number of the file identified by key. With
+// virtual inode numbers, key must include the host device numbers.
 func (fs *filesystem) inoFromKey(key inoKey) uint64 {
+	if !fs.opts.virtualInodeNumbers {
+		return key.ino
+	}
 	fs.inoMu.Lock()
 	defer fs.inoMu.Unlock()
 
@@ -1261,6 +1311,111 @@ func (fs *filesystem) inoFromKey(key inoKey) uint64 {
 	ino := fs.nextIno()
 	fs.inoByKey[key] = ino
 	return ino
+}
+
+// devMinorFromKey returns the minor device number of the file identified by
+// key.
+func (fs *filesystem) devMinorFromKey(key inoKey) (uint32, error) {
+	if fs.opts.virtualInodeNumbers {
+		return fs.devMinor, nil
+	}
+	dev := unix.Mkdev(key.devMajor, key.devMinor)
+	fs.devMu.RLock()
+	devMinor, ok := fs.devMinorByHostDev[dev]
+	fs.devMu.RUnlock()
+	if ok {
+		return devMinor, nil
+	}
+	fs.devMu.Lock()
+	defer fs.devMu.Unlock()
+	if devMinor, ok := fs.devMinorByHostDev[dev]; ok {
+		return devMinor, nil
+	}
+	return fs.newDevMinorLocked(dev)
+}
+
+// Preconditions: fs.devMu is locked.
+func (fs *filesystem) newDevMinorLocked(dev uint64) (uint32, error) {
+	devMinor, err := fs.vfsfs.VirtualFilesystem().GetAnonBlockDevMinor()
+	if err != nil {
+		return 0, err
+	}
+	fs.devMinorByHostDev[dev] = devMinor
+	return devMinor, nil
+}
+
+func hasDevMinor(devMinorByHostDev map[uint64]uint32, devMinor uint32) bool {
+	for _, m := range devMinorByHostDev {
+		if m == devMinor {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreDevMinor returns the minor device number for the host device of key,
+// which identifies a restored inode that had minor device number saved at
+// checkpoint. saved is reused unless another host device has already been
+// mapped to it, so that device numbers are stable across checkpoint/restore
+// when the host filesystem is unchanged.
+func (fs *filesystem) restoreDevMinor(key inoKey, saved uint32) (uint32, error) {
+	dev := unix.Mkdev(key.devMajor, key.devMinor)
+	fs.devMu.Lock()
+	defer fs.devMu.Unlock()
+	if devMinor, ok := fs.devMinorByHostDev[dev]; ok {
+		return devMinor, nil
+	}
+	if hasDevMinor(fs.devMinorByHostDev, saved) {
+		return fs.newDevMinorLocked(dev)
+	}
+	fs.devMinorByHostDev[dev] = saved
+	return saved, nil
+}
+
+// releaseDevMinors releases the minor device numbers in prevDevMinors, the
+// devMinorByHostDev saved at checkpoint, that restore did not reuse.
+func (fs *filesystem) releaseDevMinors(prevDevMinors map[uint64]uint32) {
+	vfsObj := fs.vfsfs.VirtualFilesystem()
+	fs.devMu.Lock()
+	defer fs.devMu.Unlock()
+	for _, devMinor := range prevDevMinors {
+		if !hasDevMinor(fs.devMinorByHostDev, devMinor) {
+			vfsObj.PutAnonBlockDevMinor(devMinor)
+		}
+	}
+}
+
+// restoreInoKey records the host identity of a restored inode, and updates
+// the inode and device numbers derived from it. Host inode and device
+// numbers are not preserved across checkpoint/restore, so:
+//
+//   - We must assume that the host filesystem did not change in a way that
+//     would invalidate dentries, since we can't revalidate dentries by
+//     checking inoKey.
+//
+//   - With virtual inode numbers, the new inoKey is associated with the
+//     existing i.ino. Otherwise, i.ino follows the host inode number.
+func (i *inode) restoreInoKey(key inoKey) error {
+	i.inoKey = key
+	if i.fs.opts.virtualInodeNumbers {
+		i.fs.inoMu.Lock()
+		i.fs.inoByKey[key] = i.ino
+		i.fs.inoMu.Unlock()
+	} else {
+		i.ino = key.ino
+		devMinor, err := i.fs.restoreDevMinor(key, i.devMinor)
+		if err != nil {
+			return err
+		}
+		i.devMinor = devMinor
+	}
+	// inodeByKey contains non-directory inodes only.
+	if i.fileType() != linux.S_IFDIR {
+		i.fs.inodeMu.Lock()
+		i.fs.inodeByKey[key] = i
+		i.fs.inodeMu.Unlock()
+	}
+	return nil
 }
 
 func (fs *filesystem) nextIno() uint64 {
@@ -1346,7 +1501,7 @@ func (d *dentry) statTo(stat *linux.Statx) {
 	stat.Ctime = linux.NsecToStatxTimestamp(d.inode.ctime.Load())
 	stat.Mtime = linux.NsecToStatxTimestamp(d.inode.mtime.Load())
 	stat.DevMajor = linux.UNNAMED_MAJOR
-	stat.DevMinor = d.inode.fs.devMinor
+	stat.DevMinor = d.inode.devMinor
 	stat.RdevMajor = d.inode.rdevMajor
 	stat.RdevMinor = d.inode.rdevMinor
 }
@@ -1669,7 +1824,7 @@ func (d *dentry) TryIncRef() bool {
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
 	if d.decRefNoCaching() == 0 {
-		d.checkCachingLocked(ctx, false /* renameMuWriteLocked */)
+		d.checkCachingLocked(ctx, false /* renameMuWriteLocked */, false /* keepRenameMu */)
 	}
 }
 
@@ -1751,7 +1906,7 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 		*ds = appendDentry(*ds, d)
 		return
 	}
-	d.checkCachingLocked(ctx, false /* renameMuWriteLocked */)
+	d.checkCachingLocked(ctx, false /* renameMuWriteLocked */, false /* keepRenameMu */)
 }
 
 // checkCachingLocked should be called after d's reference count becomes 0 or
@@ -1769,8 +1924,9 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 // do nothing.
 //
 // Preconditions: d.inode.fs.renameMu must be locked for writing if
-// renameMuWriteLocked is true; it may be temporarily unlocked.
-func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked bool) {
+// renameMuWriteLocked is true; it may be temporarily unlocked unless keepRenameMu
+// is true. keepRenameMu requires renameMuWriteLocked and a per-filesystem cache.
+func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked, keepRenameMu bool) {
 	d.cachingMu.Lock()
 	refs := d.refs.Load()
 	if refs == -1 {
@@ -1815,11 +1971,11 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 			// links to the inode, so the list may contain dentries other than d.
 			d.inode.watches.HandleDeletion(withCheckCachingList(ctx, &ds))
 		}
-		d.destroyLocked(ctx) // +checklocksforce: renameMu must be acquired at this point.
+		d.destroyLocked(ctx, keepRenameMu) // +checklocksforce: renameMu must be acquired at this point.
 		if ds != nil {
 			// d is destroyed now, so checkCachingLocked is a no-op for it.
 			for _, td := range *ds {
-				td.checkCachingLocked(ctx, true /* renameMuWriteLocked */) // +checklocksforce: renameMu must be acquired at this point.
+				td.checkCachingLocked(ctx, true /* renameMuWriteLocked */, keepRenameMu) // +checklocksforce: renameMu must be acquired at this point.
 			}
 			putDentrySlice(ds)
 		}
@@ -1829,7 +1985,7 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 		d.cachingMu.Unlock()
 		// Attempt to evict.
 		if renameMuWriteLocked {
-			d.evictLocked(ctx) // +checklocksforce: renameMu is locked in this case.
+			d.evictLocked(ctx, keepRenameMu) // +checklocksforce: renameMu is locked in this case.
 			return
 		}
 		d.evict(ctx)
@@ -1860,7 +2016,7 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 			delete(parent.children, d.name)
 			parent.childrenMu.Unlock()
 		}
-		d.destroyLocked(ctx) // +checklocksforce: see above.
+		d.destroyLocked(ctx, keepRenameMu) // +checklocksforce: see above.
 		return
 	}
 
@@ -1889,7 +2045,7 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 			d.inode.fs.renameMu.Lock()
 			defer d.inode.fs.renameMu.Unlock()
 		}
-		d.inode.fs.evictCachedDentryLocked(ctx) // +checklocksforce: see above.
+		d.inode.fs.evictCachedDentryLocked(ctx, keepRenameMu) // +checklocksforce: see above.
 	}
 }
 
@@ -1904,32 +2060,39 @@ func (d *dentry) removeFromCacheLocked() {
 	}
 }
 
-// Precondition: fs.renameMu must be locked for writing; it may be temporarily
-// unlocked.
+// Preconditions:
+//   - fs.renameMu must be locked for writing; it may be temporarily unlocked
+//     unless keepRenameMu is true.
+//   - keepRenameMu requires a per-filesystem cache.
+//
 // +checklocks:fs.renameMu
-func (fs *filesystem) evictAllCachedDentriesLocked(ctx context.Context) {
-	for fs.dentryCache.dentriesLen != 0 {
-		fs.evictCachedDentryLocked(ctx)
+func (fs *filesystem) evictAllCachedDentriesLocked(ctx context.Context, keepRenameMu bool) {
+	// Evicting a child can release its parent's last reference and add the
+	// parent to the cache. Drain these newly eligible ancestors as well.
+	for fs.evictCachedDentryLocked(ctx, keepRenameMu) {
 	}
 }
 
+// evictCachedDentryLocked attempts to evict one cached dentry. It returns whether
+// it found a victim, even if references or watches prevent destruction.
+//
 // Preconditions:
-//   - fs.renameMu must be locked for writing; it may be temporarily unlocked.
+//   - fs.renameMu must be locked for writing; it may be temporarily unlocked
+//     unless keepRenameMu is true.
+//   - keepRenameMu requires a per-filesystem cache.
 //
 // +checklocks:fs.renameMu
-func (fs *filesystem) evictCachedDentryLocked(ctx context.Context) {
+func (fs *filesystem) evictCachedDentryLocked(ctx context.Context, keepRenameMu bool) bool {
 	fs.dentryCache.mu.Lock()
 	victim := fs.dentryCache.dentries.Back()
 	fs.dentryCache.mu.Unlock()
 	if victim == nil {
-		// fs.dentryCache.dentries may have become empty between when it was
-		// checked and when we locked fs.dentryCache.mu.
-		return
+		return false
 	}
 
 	if victim.d.inode.fs == fs {
-		victim.d.evictLocked(ctx) // +checklocksforce: owned as precondition, victim.fs == fs
-		return
+		victim.d.evictLocked(ctx, keepRenameMu) // +checklocksforce: owned as precondition, victim.fs == fs
+		return true
 	}
 
 	// The dentry cache is shared between all gofer filesystems and the victim is
@@ -1939,6 +2102,7 @@ func (fs *filesystem) evictCachedDentryLocked(ctx context.Context) {
 	fs.renameMu.Unlock()
 	defer fs.renameMu.Lock()
 	victim.d.evict(ctx)
+	return true
 }
 
 // Preconditions:
@@ -1946,14 +2110,16 @@ func (fs *filesystem) evictCachedDentryLocked(ctx context.Context) {
 func (d *dentry) evict(ctx context.Context) {
 	d.inode.fs.renameMu.Lock()
 	defer d.inode.fs.renameMu.Unlock()
-	d.evictLocked(ctx)
+	d.evictLocked(ctx, false /* keepRenameMu */)
 }
 
 // Preconditions:
-//   - d.inode.fs.renameMu must be locked for writing; it may be temporarily unlocked.
+//   - d.inode.fs.renameMu must be locked for writing; it may be temporarily
+//     unlocked unless keepRenameMu is true.
+//   - keepRenameMu requires a per-filesystem cache.
 //
 // +checklocks:d.inode.fs.renameMu
-func (d *dentry) evictLocked(ctx context.Context) {
+func (d *dentry) evictLocked(ctx context.Context, keepRenameMu bool) {
 	d.cachingMu.Lock()
 	d.removeFromCacheLocked()
 	// d.refs or d.inode.watches.Size() may have become non-zero from an earlier path
@@ -1987,7 +2153,7 @@ func (d *dentry) evictLocked(ctx context.Context) {
 	// try to acquire fs.renameMu (which we have already acquiredd). Hence,
 	// fs.renameMu will synchronize the destroy attempts.
 	d.cachingMu.Unlock()
-	d.destroyLocked(ctx) // +checklocksforce: owned as precondition.
+	d.destroyLocked(ctx, keepRenameMu) // +checklocksforce: owned as precondition.
 }
 
 // destroyDisconnected destroys an uncached, unparented dentry. There are no
@@ -2020,13 +2186,15 @@ func (d *dentry) destroyDisconnected(ctx context.Context, destroyInode bool) {
 // destroyLocked destroys the dentry.
 //
 // Preconditions:
-//   - d.inode.fs.renameMu must be locked for writing; it may be temporarily unlocked.
+//   - d.inode.fs.renameMu must be locked for writing; it may be temporarily
+//     unlocked unless keepRenameMu is true.
+//   - keepRenameMu requires a per-filesystem cache.
 //   - d.refs == 0.
 //   - d.parent.children[d.name] != d, i.e. d is not reachable by path traversal
 //     from its former parent dentry.
 //
 // +checklocks:d.inode.fs.renameMu
-func (d *dentry) destroyLocked(ctx context.Context) {
+func (d *dentry) destroyLocked(ctx context.Context, keepRenameMu bool) {
 	switch d.refs.Load() {
 	case 0:
 		// Mark the dentry destroyed.
@@ -2042,27 +2210,29 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.inode.fs.inodeMu.Lock()
 	d.inode.refs.DecRef(func() {
 		destroyInode = true
-		if !d.isDir() {
+		if !d.isDir() && d.inode.fs.inodeByKey[d.inode.inoKey] == d.inode {
 			// Only non-directory inodes are cached in inodeByKey.
+			// Check pointer identity so a stale inode whose inoKey
+			// was superseded doesn't evict the newer inode.
 			delete(d.inode.fs.inodeByKey, d.inode.inoKey)
 		}
 	})
 	d.inode.fs.inodeMu.Unlock()
 
-	// Allow the following to proceed without renameMu locked to improve
-	// scalability.
-	d.inode.fs.renameMu.Unlock()
-
-	// No locks need to be held during destoryDisconnected.
-	d.destroyDisconnected(ctx, destroyInode)
-
-	d.inode.fs.renameMu.Lock()
+	if keepRenameMu {
+		d.destroyDisconnected(ctx, destroyInode)
+	} else {
+		// Release renameMu during resource cleanup to improve scalability.
+		d.inode.fs.renameMu.Unlock()
+		d.destroyDisconnected(ctx, destroyInode)
+		d.inode.fs.renameMu.Lock()
+	}
 
 	// Drop the reference held by d on its parent without recursively locking
 	// d.inode.fs.renameMu.
 
 	if parent := d.parent.Load(); parent != nil && parent.decRefNoCaching() == 0 {
-		parent.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+		parent.checkCachingLocked(ctx, true /* renameMuWriteLocked */, keepRenameMu)
 	}
 }
 
@@ -2164,10 +2334,22 @@ func (d *dentry) removeXattr(ctx context.Context, creds *auth.Credentials, name 
 // Preconditions:
 //   - !d.inode.isSynthetic().
 //   - d.isRegularFile() || d.isDir().
-//   - fs.renameMu is locked.
 func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool) error {
 	// O_TRUNC unconditionally requires us to obtain a new handle (opened with
 	// O_TRUNC).
+	if !trunc {
+		// Handles are only ever upgraded while the inode is alive, so a check
+		// under the read lock suffices in the common case where the current
+		// handles are sufficient. Avoid taking handleMu for writing, which
+		// would serialize concurrent opens and block I/O on the file.
+		d.inode.handleMu.RLock()
+		canReuseCurHandle := (!read || d.inode.isReadHandleOk()) && (!write || d.inode.isWriteHandleOk())
+		d.inode.handleMu.RUnlock()
+		if canReuseCurHandle {
+			return nil
+		}
+	}
+
 	d.inode.handleMu.Lock()
 	needNewHandle := (read && !d.inode.isReadHandleOk()) || (write && !d.inode.isWriteHandleOk()) || trunc
 	if !needNewHandle {

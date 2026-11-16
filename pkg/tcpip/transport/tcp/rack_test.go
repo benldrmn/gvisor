@@ -353,6 +353,43 @@ func TestRACKInitialDSACKWindow(t *testing.T) {
 	}
 }
 
+func TestRACKRetransmissionTimestampWrap(t *testing.T) {
+	const wrap = 1 << 32 * time.Millisecond
+	const rtt = 5 * time.Millisecond
+	for _, test := range []struct {
+		name       string
+		retransmit time.Duration
+		echo       time.Duration
+		wantRTT    time.Duration
+	}{
+		// An echo from before the wrap belongs to the original transmission.
+		{"original", wrap + time.Millisecond, wrap - time.Millisecond, 0},
+		// A later echo can acknowledge a retransmission from before the wrap.
+		{"retransmission", wrap - time.Millisecond, wrap + time.Millisecond, rtt},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			ctx := newRACKTestContext(clock, 0)
+			defer ctx.cleanup()
+			ctx.snd.ep.mu.Lock()
+			defer ctx.snd.ep.mu.Unlock()
+
+			clock.Advance(test.retransmit)
+			seg := ctx.addSegment(1, clock.NowMonotonic())
+			seg.xmitCount = 2
+			clock.Advance(rtt)
+			ack := newOutgoingSegment(stack.TransportEndpointID{}, clock, buffer.Buffer{}, 0)
+			defer ack.DecRef()
+			ack.parsedOptions.TS = true
+			ack.parsedOptions.TSEcr = ctx.snd.ep.tsVal(tcpip.MonotonicTime{}.Add(test.echo))
+			ctx.snd.rc.update(seg, ack)
+			if got, want := ctx.snd.rc.RTT, test.wantRTT; got != want {
+				t.Errorf("RACK RTT = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
 func TestRACKEqualTransmitTimeOrdersByEndSequence(t *testing.T) {
 	clock := faketime.NewManualClock()
 	ctx := newRACKTestContext(clock, 0)
@@ -411,5 +448,78 @@ func TestRACKZeroClockResolutionPreservesLossBoundary(t *testing.T) {
 
 	if got := ctx.snd.rc.detectLoss(tcpip.MonotonicTime{}); got != 1 {
 		t.Fatalf("detectLoss at zero-resolution boundary got %d losses, want 1", got)
+	}
+}
+
+// TestRACKPTODuration checks the PTO allowance for single- and multi-segment
+// flights. It also checks the fallback before an RTT sample and the RTO cap.
+func TestRACKPTODuration(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		outstanding int
+		srtt        time.Duration
+		inited      bool
+		rto         time.Duration
+		want        time.Duration
+	}{
+		{"one-min-rtt", 1, time.Millisecond, true, 0, 202 * time.Millisecond},
+		{"two-min-rtt", 2, time.Millisecond, true, 0, 4 * time.Millisecond},
+		{"many-min-rtt", 42, time.Millisecond, true, 0, 4 * time.Millisecond},
+		{"two-larger-rtt", 2, 5 * time.Millisecond, true, 0, 12 * time.Millisecond},
+		{"two-wan-rtt", 2, 250 * time.Millisecond, true, 0, 502 * time.Millisecond},
+		{"uninitialized-rtt", 2, 5 * time.Millisecond, false, 0, time.Second},
+		{"zero-rtt", 2, 0, true, 0, time.Second},
+		{"rto-before-pto", 2, time.Millisecond, true, 3 * time.Millisecond, 3 * time.Millisecond},
+		{"rto-equals-pto", 2, time.Millisecond, true, 4 * time.Millisecond, 4 * time.Millisecond},
+		{"rto-after-pto", 2, time.Millisecond, true, 5 * time.Millisecond, 4 * time.Millisecond},
+		{"one-rto-cap", 1, time.Millisecond, true, 20 * time.Millisecond, 20 * time.Millisecond},
+		{"fallback-rto-cap", 2, 0, false, 200 * time.Millisecond, 200 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			ctx := newRACKTestContext(clock, 0 /* resolution */)
+			defer ctx.cleanup()
+			ctx.snd.ep.mu.Lock()
+			defer ctx.snd.ep.mu.Unlock()
+			ctx.snd.Outstanding = test.outstanding
+			ctx.snd.rtt.Lock()
+			ctx.snd.rtt.TCPRTTState.SRTTInited = test.inited
+			ctx.snd.rtt.TCPRTTState.SRTT = test.srtt
+			ctx.snd.rtt.Unlock()
+			var expirations int
+			ctx.snd.probeTimer.init(clock, func() {
+				if ctx.snd.probeTimer.checkExpiration() {
+					expirations++
+				}
+			})
+			defer ctx.snd.probeTimer.cleanup()
+			ctx.snd.resendTimer.init(clock, func() {})
+			defer ctx.snd.resendTimer.cleanup()
+			if test.rto != 0 {
+				// Some of the RTO has already elapsed. Bound the PTO by the
+				// remaining time, not the RTO's original duration.
+				ctx.snd.resendTimer.enable(test.rto + time.Millisecond)
+			}
+			clock.Advance(time.Millisecond)
+			now := clock.NowMonotonic()
+			ctx.snd.schedulePTO()
+			if !ctx.snd.probeTimer.enabled() {
+				t.Fatal("probe timer is not enabled")
+			}
+			if got := ctx.snd.probeTimer.target.Sub(now); got != test.want {
+				t.Fatalf("PTO = %v, want %v", got, test.want)
+			}
+			if ctx.snd.resendTimer.enabled() {
+				t.Error("RTO timer is still enabled alongside the probe timer")
+			}
+			clock.Advance(test.want - time.Nanosecond)
+			if expirations != 0 {
+				t.Fatalf("probe expired before PTO: %d expirations", expirations)
+			}
+			clock.Advance(time.Nanosecond)
+			if expirations != 1 {
+				t.Fatalf("probe expirations at PTO = %d, want 1", expirations)
+			}
+		})
 	}
 }

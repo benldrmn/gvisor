@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -26,9 +28,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/sandboxposture"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/gvisorbinaries"
+	"gvisor.dev/gvisor/runsc/sandbox"
 )
 
 // This test checks the security posture of the Sentry (`boot`) process.
@@ -48,6 +52,9 @@ type postureCase struct {
 
 	// fdLimit, when non-zero, is passed as --fdlimit.
 	fdLimit int
+
+	// coreTags is passed as --enable-core-tags.
+	coreTags bool
 }
 
 // TestBootPosture checks the Sentry process (`boot`)'s security posture.
@@ -65,6 +72,7 @@ func TestBootPosture(t *testing.T) {
 		{name: "no_directfs_hostinet", directfs: false, network: config.NetworkHost},
 		{name: "kvm", directfs: true, network: config.NetworkSandbox, platform: "kvm", extraFDClasses: sandboxposture.KVMFDClasses()},
 		{name: "fdlimit", directfs: true, network: config.NetworkSandbox, fdLimit: postureFDLimit},
+		{name: "coretags", directfs: true, network: config.NetworkSandbox, coreTags: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testBootPosture(t, tc)
@@ -85,6 +93,15 @@ func testBootPosture(t *testing.T, tc postureCase) {
 		}
 		f.Close()
 	}
+	if tc.coreTags {
+		supported, err := sandboxposture.CoreTagsSupported()
+		if err != nil {
+			t.Fatalf("Checking for core scheduling support: %v", err)
+		}
+		if !supported {
+			t.Skip("This kernel does not support core scheduling, or SMT is inactive")
+		}
+	}
 	isHostNetwork := tc.network == config.NetworkHost
 
 	conf := testutil.TestConfig(t)
@@ -96,6 +113,7 @@ func testBootPosture(t *testing.T, tc postureCase) {
 	if tc.fdLimit != 0 {
 		conf.FDLimit = tc.fdLimit
 	}
+	conf.EnableCoreTags = tc.coreTags
 	// testutil.TestConfig sets this so that tests can run without privileges.
 	// Undo it here since we do want to test the non-test case.
 	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = false
@@ -160,10 +178,11 @@ func testBootPosture(t *testing.T, tc postureCase) {
 		NetworkMode:          tc.network.String(),
 		EnableRaw:            conf.EnableRaw,
 		RequiresCapSysPtrace: sandboxposture.PlatformCapSysPtrace[conf.Platform],
-		GoDebug:              sandboxposture.GoDebug(conf.Platform),
+		GoDebug:              sandboxposture.GoDebug(conf.Platform, conf.ProfileEnable),
 		Cgroup:               !conf.IgnoreCgroups,
 		ExtraFDClasses:       tc.extraFDClasses,
 		CgoEnabled:           config.CgoEnabled,
+		CoreTags:             conf.EnableCoreTags,
 		// We call container.New directly below, so we are the sandbox parent
 		// (unlike when the containerd shim is in the middle).
 		ChildOfRef: true,
@@ -199,7 +218,52 @@ func testBootPosture(t *testing.T, tc postureCase) {
 		if err := checkProcessCaps(goferPid, goferCaps); err != nil {
 			t.Errorf("Gofer capabilities: %v", err)
 		}
+		checkGoferPosture(t, goferPid)
 	})
+}
+
+func checkGoferPosture(t *testing.T, pid int) {
+	t.Helper()
+	rawEnv, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		t.Fatalf("Reading gofer environ: %v", err)
+	}
+	var gomaxprocsVals, godebugVals []string
+	for _, entry := range strings.Split(strings.TrimSuffix(string(rawEnv), "\x00"), "\x00") {
+		if v, ok := strings.CutPrefix(entry, "GOMAXPROCS="); ok {
+			gomaxprocsVals = append(gomaxprocsVals, v)
+		}
+		if v, ok := strings.CutPrefix(entry, "GODEBUG="); ok {
+			godebugVals = append(godebugVals, v)
+		}
+	}
+	selfCg, _ := cgroup.NewSelf()
+	selfCPUs, _ := sandbox.CalculateCPUNum(selfCg, nil, true /* cpuNumFromQuota */)
+	wantProcs := strconv.Itoa(max(1, min(selfCPUs, 8)))
+	if len(gomaxprocsVals) != 1 || gomaxprocsVals[0] != wantProcs {
+		t.Errorf("Gofer GOMAXPROCS = %v, want [%s]", gomaxprocsVals, wantProcs)
+	}
+	if len(godebugVals) != 1 || !strings.HasSuffix(godebugVals[0], "containermaxprocs=0,updatemaxprocs=0") {
+		t.Errorf("Gofer GODEBUG = %v, want single entry ending with containermaxprocs=0,updatemaxprocs=0", godebugVals)
+	}
+
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	fds, err := os.ReadDir(fdDir)
+	if err != nil {
+		t.Fatalf("Reading %s: %v", fdDir, err)
+	}
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(target, "config.json") {
+			t.Errorf("Gofer FD %s still points to spec file %q after startup", fd.Name(), target)
+		}
+		if strings.HasPrefix(target, "/sys/fs/cgroup/") {
+			t.Errorf("Gofer FD %s holds host cgroup file %q", fd.Name(), target)
+		}
+	}
 }
 
 // ownNetNS is whether this process has a network namespace of its own.

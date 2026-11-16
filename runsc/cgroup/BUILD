@@ -11,6 +11,8 @@ go_library(
         "cgroup.go",
         "cgroup_v2.go",
         "cgroup_v2_unsafe.go",
+        "devices.go",
+        "devices_unsafe.go",
         "systemd.go",
     ],
     importpath = "gvisor.dev/gvisor/runsc/cgroup",
@@ -34,11 +36,12 @@ go_test(
     srcs = [
         "cgroup_test.go",
         "cgroup_v2_test.go",
+        "devices_test.go",
         "systemd_test.go",
     ],
     embed = [":cgroup"],
-    tags = ["local"],
     deps = [
+        "//pkg/test/capabilitytest",
         "//pkg/test/testutil",
         "@com_github_coreos_go_systemd_v22//dbus:go_default_library",
         "@com_github_godbus_dbus_v5//:go_default_library",

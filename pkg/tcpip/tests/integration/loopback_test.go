@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
@@ -971,30 +972,214 @@ func TestIPv6DisabledLoopback(t *testing.T) {
 		loopbackNICID = 2
 	)
 
-	s, e, err := setupIPv6LoopbackStack(externalNICID, loopbackNICID)
-	if err != nil {
-		t.Fatalf("setupIPv6LoopbackStack(%d, %d): %v", externalNICID, loopbackNICID, err)
+	tests := []struct {
+		name    string
+		disable func(*stack.Stack, tcpip.NICID) tcpip.Error
+		enable  func(*stack.Stack, tcpip.NICID) tcpip.Error
+	}{
+		{
+			name:    "NIC disabled",
+			disable: (*stack.Stack).DisableNIC,
+			enable:  (*stack.Stack).EnableNIC,
+		},
+		{
+			name: "IPv6 protocol disabled",
+			disable: func(s *stack.Stack, id tcpip.NICID) tcpip.Error {
+				return s.SetNICNetworkProtocolEnabled(id, ipv6.ProtocolNumber, false /* enabled */)
+			},
+			enable: func(s *stack.Stack, id tcpip.NICID) tcpip.Error {
+				return s.SetNICNetworkProtocolEnabled(id, ipv6.ProtocolNumber, true /* enabled */)
+			},
+		},
 	}
-	defer s.Destroy()
 
-	if err := s.EnableNIC(loopbackNICID); err != nil {
-		t.Fatalf("s.EnableNIC(%d): %s", loopbackNICID, err)
-	}
-	if err := verifyIPv6LoopbackTraffic(s, loopbackNICID, e, true /* wantReachable */); err != nil {
-		t.Errorf("verifyIPv6LoopbackTraffic(enabled): %v", err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, e, err := setupIPv6LoopbackStack(externalNICID, loopbackNICID)
+			if err != nil {
+				t.Fatalf("setupIPv6LoopbackStack(%d, %d): %v", externalNICID, loopbackNICID, err)
+			}
+			defer s.Destroy()
 
-	if err := s.DisableNIC(loopbackNICID); err != nil {
-		t.Fatalf("s.DisableNIC(%d): %s", loopbackNICID, err)
-	}
-	if err := verifyIPv6LoopbackTraffic(s, loopbackNICID, e, false /* wantReachable */); err != nil {
-		t.Errorf("verifyIPv6LoopbackTraffic(disabled): %v", err)
-	}
+			if err := tc.enable(s, loopbackNICID); err != nil {
+				t.Fatalf("enable(%d): %s", loopbackNICID, err)
+			}
+			if err := verifyIPv6LoopbackTraffic(s, loopbackNICID, e, true /* wantReachable */); err != nil {
+				t.Errorf("verifyIPv6LoopbackTraffic(enabled): %v", err)
+			}
 
-	if err := s.EnableNIC(loopbackNICID); err != nil {
-		t.Fatalf("s.EnableNIC(%d): %s", loopbackNICID, err)
+			if err := tc.disable(s, loopbackNICID); err != nil {
+				t.Fatalf("disable(%d): %s", loopbackNICID, err)
+			}
+			if err := verifyIPv6LoopbackTraffic(s, loopbackNICID, e, false /* wantReachable */); err != nil {
+				t.Errorf("verifyIPv6LoopbackTraffic(disabled): %v", err)
+			}
+
+			if err := tc.enable(s, loopbackNICID); err != nil {
+				t.Fatalf("enable(%d): %s", loopbackNICID, err)
+			}
+			if err := verifyIPv6LoopbackTraffic(s, loopbackNICID, e, true /* wantReachable */); err != nil {
+				t.Errorf("verifyIPv6LoopbackTraffic(re-enabled): %v", err)
+			}
+		})
 	}
-	if err := verifyIPv6LoopbackTraffic(s, loopbackNICID, e, true /* wantReachable */); err != nil {
-		t.Errorf("verifyIPv6LoopbackTraffic(re-enabled): %v", err)
+}
+
+func TestPerNICExternalIPv4LoopbackTraffic(t *testing.T) {
+	const (
+		proxyNICID    = 1
+		regularNICID  = 2
+		loopbackNICID = 3
+
+		ttl = 64
+	)
+	ipv4Loopback := testutil.MustParse4("127.0.0.1")
+
+	for _, tc := range []struct {
+		name       string
+		forwarding bool
+	}{
+		{
+			name:       "without forwarding",
+			forwarding: false,
+		},
+		{
+			name:       "with forwarding",
+			forwarding: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol4, icmp.NewProtocol6},
+			})
+			defer s.Destroy()
+
+			epProxy := channel.New(1, header.IPv6MinimumMTU, "")
+			if err := s.CreateNICWithOptions(proxyNICID, epProxy, stack.NICOptions{
+				AllowExternalIPv4LoopbackTraffic: true,
+			}); err != nil {
+				t.Fatalf("CreateNICWithOptions(%d): %s", proxyNICID, err)
+			}
+			for _, addr := range []tcpip.ProtocolAddress{
+				{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: utils.Ipv4Addr},
+				{Protocol: ipv6.ProtocolNumber, AddressWithPrefix: utils.Ipv6Addr},
+			} {
+				if err := s.AddProtocolAddress(proxyNICID, addr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress(%d, %+v): %s", proxyNICID, addr, err)
+				}
+			}
+
+			epRegular := channel.New(1, header.IPv6MinimumMTU, "")
+			if err := s.CreateNIC(regularNICID, epRegular); err != nil {
+				t.Fatalf("CreateNIC(%d): %s", regularNICID, err)
+			}
+			if err := s.AddProtocolAddress(regularNICID, utils.Ipv4Addr1, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v): %s", regularNICID, utils.Ipv4Addr1, err)
+			}
+
+			if err := s.CreateNIC(loopbackNICID, loopback.New()); err != nil {
+				t.Fatalf("CreateNIC(%d): %s", loopbackNICID, err)
+			}
+			for _, addr := range []tcpip.ProtocolAddress{
+				{
+					Protocol: ipv4.ProtocolNumber,
+					AddressWithPrefix: tcpip.AddressWithPrefix{
+						Address:   ipv4Loopback,
+						PrefixLen: 8,
+					},
+				},
+				{
+					Protocol:          ipv6.ProtocolNumber,
+					AddressWithPrefix: header.IPv6Loopback.WithPrefix(),
+				},
+			} {
+				if err := s.AddProtocolAddress(loopbackNICID, addr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress(%d, %+v): %s", loopbackNICID, addr, err)
+				}
+			}
+
+			if tc.forwarding {
+				if err := s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true); err != nil {
+					t.Fatalf("SetForwardingDefaultAndAllNICs(ipv4, true): %s", err)
+				}
+			}
+
+			s.SetRouteTable([]tcpip.Route{
+				{Destination: utils.Ipv4Addr.Subnet(), NIC: proxyNICID},
+				{Destination: utils.Ipv6Addr.Subnet(), NIC: proxyNICID},
+				{Destination: utils.Ipv4Addr1.AddressWithPrefix.Subnet(), NIC: regularNICID},
+				{Destination: ipv4Loopback.WithPrefix().Subnet(), NIC: loopbackNICID},
+				{Destination: header.IPv6Loopback.WithPrefix().Subnet(), NIC: loopbackNICID},
+			})
+
+			invalidSrc := s.Stats().IP.InvalidSourceAddressesReceived
+			invalidDst := s.Stats().IP.InvalidDestinationAddressesReceived
+			delivered := s.Stats().IP.PacketsDelivered
+
+			// IPv4 loopback-sourced packet on NIC with AllowExternalIPv4LoopbackTraffic is accepted.
+			beforeDelivered := delivered.Value()
+			beforeInvalidSrc := invalidSrc.Value()
+			utils.RxICMPv4EchoRequest(epProxy, ipv4Loopback, utils.Ipv4Addr.Address, ttl)
+			if got, want := invalidSrc.Value()-beforeInvalidSrc, uint64(0); got != want {
+				t.Errorf("proxy NIC IPv4 loopback src InvalidSourceAddressesReceived delta = %d, want %d", got, want)
+			}
+			if got, want := delivered.Value()-beforeDelivered, uint64(1); got != want {
+				t.Errorf("proxy NIC IPv4 loopback src PacketsDelivered delta = %d, want %d", got, want)
+			}
+
+			// IPv4 loopback-destined packet on NIC with AllowExternalIPv4LoopbackTraffic bypasses martian check (delivered when forwarding is enabled).
+			beforeDelivered = delivered.Value()
+			beforeInvalidDst := invalidDst.Value()
+			utils.RxICMPv4EchoRequest(epProxy, utils.RemoteIPv4Addr, ipv4Loopback, ttl)
+			if tc.forwarding {
+				if got, want := invalidDst.Value()-beforeInvalidDst, uint64(0); got != want {
+					t.Errorf("proxy NIC IPv4 loopback dst (forwarding) InvalidDestinationAddressesReceived delta = %d, want %d", got, want)
+				}
+				if got, want := delivered.Value()-beforeDelivered, uint64(1); got != want {
+					t.Errorf("proxy NIC IPv4 loopback dst (forwarding) PacketsDelivered delta = %d, want %d", got, want)
+				}
+			} else {
+				if got, want := invalidDst.Value()-beforeInvalidDst, uint64(1); got != want {
+					t.Errorf("proxy NIC IPv4 loopback dst (no forwarding) InvalidDestinationAddressesReceived delta = %d, want %d", got, want)
+				}
+				if got, want := delivered.Value()-beforeDelivered, uint64(0); got != want {
+					t.Errorf("proxy NIC IPv4 loopback dst (no forwarding) PacketsDelivered delta = %d, want %d", got, want)
+				}
+			}
+
+			// IPv6 loopback-sourced packet on the same proxy NIC is still rejected.
+			beforeDelivered = delivered.Value()
+			beforeInvalidSrc = invalidSrc.Value()
+			utils.RxICMPv6EchoRequest(epProxy, header.IPv6Loopback, utils.Ipv6Addr.Address, ttl)
+			if got, want := invalidSrc.Value()-beforeInvalidSrc, uint64(1); got != want {
+				t.Errorf("proxy NIC IPv6 loopback src InvalidSourceAddressesReceived delta = %d, want %d", got, want)
+			}
+			if got, want := delivered.Value()-beforeDelivered, uint64(0); got != want {
+				t.Errorf("proxy NIC IPv6 loopback src PacketsDelivered delta = %d, want %d", got, want)
+			}
+
+			// IPv4 loopback-sourced packet on a different NIC on the same stack is still rejected.
+			beforeDelivered = delivered.Value()
+			beforeInvalidSrc = invalidSrc.Value()
+			utils.RxICMPv4EchoRequest(epRegular, ipv4Loopback, utils.Ipv4Addr1.AddressWithPrefix.Address, ttl)
+			if got, want := invalidSrc.Value()-beforeInvalidSrc, uint64(1); got != want {
+				t.Errorf("regular NIC IPv4 loopback src InvalidSourceAddressesReceived delta = %d, want %d", got, want)
+			}
+			if got, want := delivered.Value()-beforeDelivered, uint64(0); got != want {
+				t.Errorf("regular NIC IPv4 loopback src PacketsDelivered delta = %d, want %d", got, want)
+			}
+
+			// IPv4 loopback-destined packet on a different NIC is still rejected even when forwarding is enabled.
+			beforeDelivered = delivered.Value()
+			beforeInvalidDst = invalidDst.Value()
+			utils.RxICMPv4EchoRequest(epRegular, utils.RemoteIPv4Addr, ipv4Loopback, ttl)
+			if got, want := invalidDst.Value()-beforeInvalidDst, uint64(1); got != want {
+				t.Errorf("regular NIC IPv4 loopback dst InvalidDestinationAddressesReceived delta = %d, want %d", got, want)
+			}
+			if got, want := delivered.Value()-beforeDelivered, uint64(0); got != want {
+				t.Errorf("regular NIC IPv4 loopback dst PacketsDelivered delta = %d, want %d", got, want)
+			}
+		})
 	}
 }

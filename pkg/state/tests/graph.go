@@ -1,0 +1,771 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tests
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"sync/atomic"
+
+	"gvisor.dev/gvisor/pkg/state"
+)
+
+// +stateify savable
+type gRoot struct {
+	first   *gNode
+	entries []*gNode
+	any     any
+	all     []*gNode
+}
+
+// +stateify savable
+type gInner struct {
+	x int64
+	p *gNode
+	s string
+}
+
+// +stateify savable
+type gKey struct {
+	a int32
+	b string
+}
+
+// +stateify savable
+type gPlain struct {
+	a      int32
+	b      uint8
+	c      [3]uint16
+	f      float64
+	flag   bool
+	nested gPlainInner
+}
+
+// +stateify savable
+type gPlainInner struct {
+	x uint64
+}
+
+// +stateify savable
+type gSaved struct {
+	v int64
+	n *gNode
+}
+
+type gID int64
+
+type gIface interface {
+	gID() gID
+}
+
+func (n *gNode) gID() gID { return gID(n.id) }
+
+// +stateify savable
+type gNode struct {
+	id    int64
+	name  string
+	flag  bool
+	small uint8
+	i16   int16
+	f32   float32
+	f64   float64
+	c128  complex128
+	raw   [7]byte
+	nums  [3]uint16
+
+	next  *gNode
+	other *gNode
+
+	inner gInner
+	arr   [2]gInner
+
+	innerPtr *gInner
+	intPtr   *int64
+	bytePtr  *byte
+
+	nodes  []*gNode
+	vals   []gInner
+	window []gInner
+	blob   []byte
+	strs   []string
+
+	byID      map[int64]*gNode
+	keyed     map[gKey]*gNode
+	byNode    map[*gNode]int
+	inners    map[int32]gInner
+	shared    map[string]int64
+	sharedPtr *map[string]int64
+
+	iface  any
+	ifaces []any
+
+	plain    gPlain
+	plains   []gPlain
+	plainPtr *int32
+
+	impls    []gIface
+	implsArr *[2]gIface
+	byGID    map[gID]*gNode
+	gidPtr   *gID
+	gid      gID
+
+	waitFor *gNode `state:"wait"`
+
+	later [2]*gNode
+
+	saved     int64 `state:".(gSaved)"`
+	savedNode *gNode
+
+	alias atomic.Pointer[gNode] `state:".(*gNode)"`
+
+	saveCalls int  `state:"nosave"`
+	loaded    bool `state:"nosave"`
+	skipped   int  `state:"nosave"`
+}
+
+func (n *gNode) beforeSave() {
+	n.saveCalls++
+}
+
+func (n *gNode) afterLoad(context.Context) {
+	if n.waitFor != nil && !n.waitFor.loaded {
+		panic(fmt.Sprintf("node %d loaded before node %d that it waits for", n.id, n.waitFor.id))
+	}
+	if a := n.alias.Load(); a != nil && !a.loaded {
+		panic(fmt.Sprintf("node %d loaded before node %d in its alias", n.id, a.id))
+	}
+	for _, l := range n.later {
+		if l != nil && !l.loaded {
+			panic(fmt.Sprintf("node %d loaded before node %d in its array", n.id, l.id))
+		}
+	}
+	n.loaded = true
+}
+
+func (n *gNode) saveSaved() gSaved {
+	return gSaved{v: n.saved, n: n.savedNode}
+}
+
+func (n *gNode) loadSaved(_ context.Context, s gSaved) {
+	n.saved = s.v
+	if s.n != n.savedNode {
+		panic(fmt.Sprintf("node %d: saved pointer %p differs from savedNode %p", n.id, s.n, n.savedNode))
+	}
+}
+
+func (n *gNode) saveAlias() *gNode {
+	return n.alias.Load()
+}
+
+func (n *gNode) loadAlias(_ context.Context, p *gNode) {
+	n.alias.Store(p)
+}
+
+type graphOptions struct {
+	nodes   int
+	all     bool
+	windows bool
+}
+
+// randomGraph builds a random object graph. It is deterministic for a given
+// seed and options.
+func randomGraph(seed int64, opts graphOptions) *gRoot {
+	if opts.nodes <= 0 {
+		panic("opts.nodes must be positive")
+	}
+	r := rand.New(rand.NewSource(seed))
+	nodes := make([]*gNode, opts.nodes)
+	for i := range nodes {
+		nodes[i] = randomNode(r, i)
+	}
+	pick := func() *gNode {
+		if r.Intn(4) == 0 {
+			return nil
+		}
+		return nodes[r.Intn(len(nodes))]
+	}
+	pickNonNil := func() *gNode {
+		return nodes[r.Intn(len(nodes))]
+	}
+	for i, n := range nodes {
+		n.next = pick()
+		n.other = pick()
+		n.inner.p = pick()
+		n.arr[0].p = pick()
+		n.arr[1].p = pick()
+		for j := range n.vals {
+			n.vals[j].p = pick()
+		}
+		n.savedNode = pick()
+
+		// Interior pointers.
+		switch t := pickNonNil(); r.Intn(5) {
+		case 0:
+			n.innerPtr = &t.inner
+		case 1:
+			n.innerPtr = &t.arr[r.Intn(2)]
+		case 2:
+			if len(t.vals) > 0 {
+				n.innerPtr = &t.vals[r.Intn(len(t.vals))]
+			}
+		case 3:
+			n.innerPtr = &gInner{x: r.Int63(), p: pick()}
+		}
+		switch t := pickNonNil(); r.Intn(6) {
+		case 0:
+			n.intPtr = &t.id
+		case 1:
+			n.intPtr = &t.inner.x
+		case 2:
+			n.intPtr = &t.arr[r.Intn(2)].x
+		case 3:
+			if len(t.vals) > 0 {
+				n.intPtr = &t.vals[r.Intn(len(t.vals))].x
+			}
+		case 4:
+			v := r.Int63()
+			n.intPtr = &v
+		}
+		switch t := pickNonNil(); r.Intn(3) {
+		case 0:
+			n.bytePtr = &t.raw[r.Intn(len(t.raw))]
+		case 1:
+			if len(t.blob) > 0 {
+				n.bytePtr = &t.blob[r.Intn(len(t.blob))]
+			}
+		}
+
+		// Slices.
+		switch r.Intn(4) {
+		case 0:
+			// Leave nil.
+		case 1:
+			n.nodes = []*gNode{}
+		default:
+			l := r.Intn(5)
+			n.nodes = make([]*gNode, l, l+r.Intn(3))
+			for j := range n.nodes {
+				n.nodes[j] = pick()
+			}
+		}
+		if t := pickNonNil(); opts.windows && len(t.vals) > 0 && r.Intn(3) == 0 {
+			lo := r.Intn(len(t.vals))
+			hi := lo + r.Intn(len(t.vals)-lo+1)
+			n.window = t.vals[lo:hi]
+		}
+
+		// Maps.
+		if r.Intn(3) != 0 {
+			n.byID = make(map[int64]*gNode)
+			for j := r.Intn(4); j > 0; j-- {
+				t := pickNonNil()
+				n.byID[t.id] = t
+			}
+		}
+		if r.Intn(2) == 0 {
+			n.keyed = make(map[gKey]*gNode)
+			for j := r.Intn(4); j > 0; j-- {
+				n.keyed[gKey{a: r.Int31(), b: fmt.Sprintf("k%d", r.Intn(10))}] = pick()
+			}
+		}
+		if r.Intn(2) == 0 {
+			n.inners = make(map[int32]gInner)
+			for j := r.Intn(6); j > 0; j-- {
+				var v gInner
+				if r.Intn(2) == 0 {
+					v.x = r.Int63()
+				}
+				if r.Intn(2) == 0 {
+					v.p = pick()
+				}
+				if r.Intn(2) == 0 {
+					v.s = fmt.Sprintf("v%d", r.Intn(10))
+				}
+				n.inners[r.Int31()] = v
+			}
+		}
+		if opts.all && r.Intn(2) == 0 {
+			n.byNode = make(map[*gNode]int)
+			for j := r.Intn(4); j > 0; j-- {
+				n.byNode[pickNonNil()] = r.Int()
+			}
+		}
+		if i > 0 && r.Intn(3) == 0 {
+			n.shared = nodes[r.Intn(i)].shared
+		} else if r.Intn(4) != 0 {
+			n.shared = map[string]int64{fmt.Sprintf("s%d", i): int64(i)}
+		}
+		if r.Intn(3) == 0 {
+			n.sharedPtr = &pickNonNil().shared
+		}
+
+		// Plain data.
+		n.plain = randomPlain(r)
+		if r.Intn(2) == 0 {
+			n.plains = make([]gPlain, r.Intn(4))
+			for j := range n.plains {
+				n.plains[j] = randomPlain(r)
+			}
+		}
+		switch t := pickNonNil(); r.Intn(3) {
+		case 0:
+			n.plainPtr = &t.plain.a
+		case 1:
+			if len(t.plains) > 0 {
+				n.plainPtr = &t.plains[r.Intn(len(t.plains))].a
+			}
+		}
+
+		// Unregistered named types.
+		if r.Intn(2) == 0 {
+			n.impls = make([]gIface, r.Intn(4))
+			for j := range n.impls {
+				if p := pick(); p != nil {
+					n.impls[j] = p
+				}
+			}
+		}
+		if r.Intn(3) == 0 {
+			n.implsArr = &[2]gIface{pickNonNil(), nil}
+		}
+		if r.Intn(2) == 0 {
+			n.byGID = make(map[gID]*gNode)
+			for j := r.Intn(3); j > 0; j-- {
+				t := pickNonNil()
+				n.byGID[t.gID()] = t
+			}
+		}
+		if r.Intn(3) == 0 {
+			v := gID(r.Int63())
+			n.gidPtr = &v
+		}
+		n.gid = gID(r.Int63())
+
+		// Interfaces.
+		n.iface = randomAny(r, nodes, pick)
+		if r.Intn(2) == 0 {
+			n.ifaces = make([]any, r.Intn(5))
+			for j := range n.ifaces {
+				n.ifaces[j] = randomAny(r, nodes, pick)
+			}
+		}
+
+		// Wait dependencies only go to later nodes.
+		if i+1 < len(nodes) && r.Intn(3) == 0 {
+			n.waitFor = nodes[i+1+r.Intn(len(nodes)-i-1)]
+		}
+		if i+1 < len(nodes) && r.Intn(3) == 0 {
+			n.alias.Store(nodes[i+1+r.Intn(len(nodes)-i-1)])
+		}
+		for j := range n.later {
+			if i+1 < len(nodes) && r.Intn(3) == 0 {
+				n.later[j] = nodes[i+1+r.Intn(len(nodes)-i-1)]
+			}
+		}
+	}
+
+	root := &gRoot{first: nodes[0]}
+	for j := r.Intn(4); j > 0; j-- {
+		root.entries = append(root.entries, pickNonNil())
+	}
+	root.any = randomAny(r, nodes, pick)
+	if opts.all {
+		root.all = nodes
+	}
+	return root
+}
+
+func randomNode(r *rand.Rand, i int) *gNode {
+	n := &gNode{
+		id:      int64(i)<<20 | r.Int63n(1<<20),
+		name:    fmt.Sprintf("node-%d", i),
+		flag:    r.Intn(2) == 0,
+		small:   uint8(r.Intn(256)),
+		i16:     int16(r.Intn(1<<16) - 1<<15),
+		f32:     r.Float32(),
+		f64:     r.NormFloat64(),
+		c128:    complex(r.Float64(), -r.Float64()),
+		inner:   gInner{x: r.Int63(), s: fmt.Sprintf("inner-%d", i)},
+		saved:   r.Int63(),
+		skipped: i + 1,
+	}
+	r.Read(n.raw[:])
+	for j := range n.nums {
+		n.nums[j] = uint16(r.Intn(1 << 16))
+	}
+	for j := range n.arr {
+		n.arr[j].x = r.Int63()
+	}
+	if l := r.Intn(5); l > 0 || r.Intn(2) == 0 {
+		n.vals = make([]gInner, l, l+r.Intn(3))
+		for j := range n.vals {
+			n.vals[j] = gInner{x: r.Int63(), s: fmt.Sprintf("val-%d-%d", i, j)}
+		}
+	}
+	switch r.Intn(3) {
+	case 0:
+		n.blob = make([]byte, r.Intn(40))
+		r.Read(n.blob)
+	case 1:
+		n.blob = []byte{}
+	}
+	for j := r.Intn(3); j > 0; j-- {
+		n.strs = append(n.strs, fmt.Sprintf("str-%d", r.Int()))
+	}
+	return n
+}
+
+func randomPlain(r *rand.Rand) gPlain {
+	p := gPlain{a: r.Int31(), b: uint8(r.Intn(256)), f: r.NormFloat64(), flag: r.Intn(2) == 0}
+	for i := range p.c {
+		p.c[i] = uint16(r.Intn(1 << 16))
+	}
+	p.nested.x = r.Uint64()
+	return p
+}
+
+func randomAny(r *rand.Rand, nodes []*gNode, pick func() *gNode) any {
+	t := nodes[r.Intn(len(nodes))]
+	switch r.Intn(12) {
+	case 0:
+		return nil
+	case 1:
+		return pick()
+	case 2:
+		return gInner{x: r.Int63(), p: pick(), s: "boxed"}
+	case 3:
+		return &t.inner
+	case 4:
+		return r.Int63()
+	case 5:
+		return fmt.Sprintf("any-%d", r.Int())
+	case 6:
+		return []int64{r.Int63(), r.Int63()}
+	case 7:
+		return t.shared
+	case 8:
+		return &t.id
+	case 9:
+		return [2]int32{r.Int31(), r.Int31()}
+	case 10:
+		if r.Intn(2) == 0 {
+			return randomPlain(r)
+		}
+		return gKey{a: r.Int31(), b: "iface"}
+	default:
+		return uint8(r.Intn(256))
+	}
+}
+
+// +stateify savable
+type gSpliceChild struct {
+	val             int64
+	tag             string
+	m               map[string]int64
+	beforeSaveCalls int `state:"nosave"`
+}
+
+func (c *gSpliceChild) beforeSave() {
+	c.beforeSaveCalls++
+}
+
+// +stateify savable
+type gSpliceMid struct {
+	child gSpliceChild
+	extra int64
+}
+
+// +stateify savable
+type gSpliceContainer struct {
+	converted gSpliceChild `state:".(int64)"`
+	manual    gSpliceChild `state:"manual"`
+	normal    gSpliceChild
+	mid       gSpliceMid `state:".(int64)"`
+	seed      int64
+}
+
+func (s *gSpliceContainer) saveConverted() int64 {
+	return s.converted.val + 100
+}
+
+func (s *gSpliceContainer) loadConverted(_ context.Context, v int64) {
+	s.converted = gSpliceChild{val: v - 100, tag: "converted"}
+}
+
+func (s *gSpliceContainer) saveMid() int64 {
+	return s.mid.child.val + s.mid.extra
+}
+
+func (s *gSpliceContainer) loadMid(_ context.Context, v int64) {
+	s.mid = gSpliceMid{
+		child: gSpliceChild{val: v - s.seed, tag: "mid"},
+		extra: s.seed,
+	}
+}
+
+func (s *gSpliceContainer) afterLoad(context.Context) {
+	s.manual = gSpliceChild{val: s.seed * 10, tag: "manual"}
+}
+
+// +stateify savable
+type gDeadLeaf struct {
+	val int64
+}
+
+func (d *gDeadLeaf) afterLoad(ctx context.Context) {
+	if countPtr, ok := ctx.Value(gDeadAfterLoadKey{}).(*int); ok {
+		*countPtr++
+	}
+}
+
+type gDeadAfterLoadKey struct{}
+
+// +stateify savable
+type gCacheFlushHolder struct {
+	cachedMap    map[string]int64
+	cachedIfaces []gIface
+	cachedDead   *gDeadLeaf
+	saved        int64
+}
+
+func (h *gCacheFlushHolder) beforeSave() {
+	h.cachedMap = nil
+	h.cachedIfaces = nil
+	h.cachedDead = nil
+}
+
+// +stateify savable
+type gCacheFlushRoot struct {
+	mp   *map[string]int64
+	ip   *[]gIface
+	dp   **gDeadLeaf
+	node *gNode
+}
+
+// +stateify savable
+type gValueMapHolder struct {
+	m map[string]int64 `state:".(int64)"`
+}
+
+func (h *gValueMapHolder) saveM() int64 {
+	return h.m["k"]
+}
+
+func (h *gValueMapHolder) loadM(_ context.Context, v int64) {
+	h.m = map[string]int64{"k": v}
+}
+
+// +stateify savable
+type gOverlapIfaceArrayHolder struct {
+	p2 *[2]gIface
+}
+
+// +stateify savable
+type gOverlapIfaceArrayRoot struct {
+	p1     *[2]gIface
+	holder *gOverlapIfaceArrayHolder
+}
+
+// +stateify savable
+type gBytesRoot struct {
+	b   [1]byte
+	arr [3]byte
+	n   int64
+	s   string
+}
+
+// gAliasNamedMap is an unregistered named map type sharing its underlying type
+// with map[string]int64.
+type gAliasNamedMap map[string]int64
+
+// +stateify savable
+type gAliasMapRoot struct {
+	m  map[string]int64
+	nm gAliasNamedMap
+}
+
+// +stateify savable
+type gSliceOfArraysRoot struct {
+	sliceFirst [][2]int64
+	ptrSecond  *[2][2]int64
+	ptrFirst   *[2][2]int64
+	sliceNext  [][2]int64
+}
+
+type gCallbackLogKey struct{}
+
+// +stateify savable
+type gCallbackValue struct {
+	delta int64
+	tag   string
+}
+
+// +stateify savable
+type gCallbackNode struct {
+	name               string
+	base               int64
+	savedGen           int64
+	prepared           int64
+	mutatedByValueSave int64
+
+	early      []*gCallbackNode
+	waitSingle *gCallbackNode   `state:"wait"`
+	waitList   []*gCallbackNode `state:"wait"`
+
+	derived  int64                         `state:".(gCallbackValue)"`
+	valueDep atomic.Pointer[gCallbackNode] `state:".(*gCallbackNode)"`
+
+	// Non-saved fields modified and checked by save and load callbacks.
+	saveLog         *[]string `state:"nosave"`
+	beforeSaveCalls int       `state:"nosave"`
+	saveDerivedRuns int       `state:"nosave"`
+	saveDepRuns     int       `state:"nosave"`
+	loadDerivedRuns int       `state:"nosave"`
+	loadDepRuns     int       `state:"nosave"`
+	afterLoadRuns   int       `state:"nosave"`
+	derivedTag      string    `state:"nosave"`
+	loadedFromValue int64     `state:"nosave"`
+	acc             int64     `state:"nosave"`
+	resolvedDeps    []string  `state:"nosave"`
+}
+
+func (n *gCallbackNode) beforeSave() {
+	n.beforeSaveCalls++
+	n.savedGen++
+	n.prepared = n.base*3 + n.savedGen
+	n.derived = n.prepared + 7
+	if n.saveLog != nil {
+		*n.saveLog = append(*n.saveLog, n.name+":beforeSave")
+	}
+}
+
+func (n *gCallbackNode) saveDerived() gCallbackValue {
+	if n.beforeSaveCalls != 1 {
+		state.Failf("%s: saveDerived ran with beforeSaveCalls=%d, want 1", n.name, n.beforeSaveCalls)
+	}
+	n.saveDerivedRuns++
+	// Modify a normal field during value computation; generated StateSave
+	// computes values before saving normal fields so this mutation must be
+	// persisted in the serialized stream.
+	n.mutatedByValueSave = n.prepared + 100
+	if n.saveLog != nil {
+		*n.saveLog = append(*n.saveLog, n.name+":saveDerived")
+	}
+	return gCallbackValue{
+		delta: n.prepared + 7,
+		tag:   fmt.Sprintf("%s#%d", n.name, n.savedGen),
+	}
+}
+
+func (n *gCallbackNode) loadDerived(ctx context.Context, v gCallbackValue) {
+	if n.loadDerivedRuns != 0 || n.afterLoadRuns != 0 {
+		state.Failf("%s: loadDerived ran out of order (derivedRuns=%d afterRuns=%d)", n.name, n.loadDerivedRuns, n.afterLoadRuns)
+	}
+	n.loadDerivedRuns++
+	n.derived = v.delta
+	n.derivedTag = v.tag
+	if logPtr, ok := ctx.Value(gCallbackLogKey{}).(*[]string); ok {
+		*logPtr = append(*logPtr, n.name+":loadDerived")
+	}
+}
+
+func (n *gCallbackNode) saveValueDep() *gCallbackNode {
+	if n.beforeSaveCalls != 1 {
+		state.Failf("%s: saveValueDep ran with beforeSaveCalls=%d, want 1", n.name, n.beforeSaveCalls)
+	}
+	n.saveDepRuns++
+	if n.saveLog != nil {
+		*n.saveLog = append(*n.saveLog, n.name+":saveValueDep")
+	}
+	return n.valueDep.Load()
+}
+
+func (n *gCallbackNode) loadValueDep(ctx context.Context, dep *gCallbackNode) {
+	if n.loadDepRuns != 0 || n.afterLoadRuns != 0 {
+		state.Failf("%s: loadValueDep ran out of order (depRuns=%d afterRuns=%d)", n.name, n.loadDepRuns, n.afterLoadRuns)
+	}
+	if dep != nil {
+		if want := dep.prepared + 100; dep.mutatedByValueSave != want {
+			state.Failf("%s: loadValueDep ran before dependency %s decoded fields (mutatedByValueSave=%d, want %d)", n.name, dep.name, dep.mutatedByValueSave, want)
+		}
+		n.loadedFromValue = dep.prepared * 10
+	}
+	n.loadDepRuns++
+	n.valueDep.Store(dep)
+	if logPtr, ok := ctx.Value(gCallbackLogKey{}).(*[]string); ok {
+		*logPtr = append(*logPtr, n.name+":loadValueDep")
+	}
+}
+
+func (n *gCallbackNode) afterLoad(ctx context.Context) {
+	if n.loadDerivedRuns != 1 || n.loadDepRuns != 1 || n.afterLoadRuns != 0 {
+		state.Failf("%s: afterLoad ran out of order (derived=%d dep=%d after=%d)", n.name, n.loadDerivedRuns, n.loadDepRuns, n.afterLoadRuns)
+	}
+	if want := n.prepared + 100; n.mutatedByValueSave != want {
+		state.Failf("%s: mutatedByValueSave = %d, want %d", n.name, n.mutatedByValueSave, want)
+	}
+	acc := n.prepared + n.derived + n.loadedFromValue
+	if dep := n.valueDep.Load(); dep != nil {
+		if dep.afterLoadRuns != 1 {
+			state.Failf("%s: valueDep dependency %s had afterLoadRuns=%d, want 1", n.name, dep.name, dep.afterLoadRuns)
+		}
+		acc = acc*31 + dep.acc
+		n.resolvedDeps = append(n.resolvedDeps, "val:"+dep.name)
+	}
+	if n.waitSingle != nil {
+		if n.waitSingle.afterLoadRuns != 1 {
+			state.Failf("%s: waitSingle dependency %s had afterLoadRuns=%d, want 1", n.name, n.waitSingle.name, n.waitSingle.afterLoadRuns)
+		}
+		acc = acc*31 + n.waitSingle.acc
+		n.resolvedDeps = append(n.resolvedDeps, n.waitSingle.name)
+	}
+	for _, dep := range n.waitList {
+		if dep == nil {
+			continue
+		}
+		if dep.afterLoadRuns != 1 {
+			state.Failf("%s: waitList dependency %s had afterLoadRuns=%d, want 1", n.name, dep.name, dep.afterLoadRuns)
+		}
+		acc = acc*31 + dep.acc
+		n.resolvedDeps = append(n.resolvedDeps, dep.name)
+	}
+	n.acc = acc
+	n.afterLoadRuns++
+	if logPtr, ok := ctx.Value(gCallbackLogKey{}).(*[]string); ok {
+		*logPtr = append(*logPtr, n.name+":afterLoad")
+	}
+}
+
+// +stateify savable
+type gConvertedBox struct {
+	a     int64
+	b     string
+	inner any
+	extra int64 `state:"nosave"`
+}
+
+// +stateify savable
+type gNestedValue struct {
+	v gConvertedBox `state:".(gConvertedBox)"`
+}
+
+func (n *gNestedValue) saveV() gConvertedBox {
+	return n.v
+}
+
+func (n *gNestedValue) loadV(_ context.Context, v gConvertedBox) {
+	n.v = v
+}

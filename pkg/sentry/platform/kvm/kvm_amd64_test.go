@@ -19,13 +19,21 @@ package kvm
 
 import (
 	"fmt"
+	"os"
+	"reflect"
+	"runtime"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
+	"gvisor.dev/gvisor/pkg/safecopy"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/kvm/testutil"
@@ -152,4 +160,330 @@ func disallowedVDSOExit(c *vCPU) (string, bool) {
 	default:
 		return fmt.Sprintf("system call %d at rip %#x", sysno, regs.Rip), false
 	}
+}
+
+func getVCPUEvents(t *testing.T, c *vCPU) kvmVcpuEvents {
+	t.Helper()
+	var events kvmVcpuEvents
+	if errno := hostsyscall.RawSyscallErrno(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_GET_VCPU_EVENTS,
+		uintptr(unsafe.Pointer(&events))); errno != 0 {
+		t.Fatalf("KVM_GET_VCPU_EVENTS failed: %v", errno)
+	}
+	return events
+}
+
+func setVCPUEvents(t *testing.T, c *vCPU, events *kvmVcpuEvents) {
+	t.Helper()
+	if errno := hostsyscall.RawSyscallErrno(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_SET_VCPU_EVENTS,
+		uintptr(unsafe.Pointer(events))); errno != 0 {
+		t.Fatalf("KVM_SET_VCPU_EVENTS failed: %v", errno)
+	}
+}
+
+func TestKVMVcpuEvents(t *testing.T) {
+	wantSize := uintptr((KVM_GET_VCPU_EVENTS >> 16) & 0x3fff)
+	if gotSize := unsafe.Sizeof(kvmVcpuEvents{}); gotSize != wantSize {
+		t.Fatalf("sizeof(kvmVcpuEvents) = %d, want %d", gotSize, wantSize)
+	}
+	bluepillTest(t, func(c *vCPU) {
+		redpill()
+
+		events := getVCPUEvents(t, c)
+		events.interrupt.shadow = 1
+		events.flags |= _KVM_VCPUEVENT_VALID_SHADOW
+		setVCPUEvents(t, c, &events)
+
+		// Intel VMX reports 1 (MOV SS); AMD SVM tracks a single
+		// interrupt-shadow bit and reports 3 (MOV SS | STI).
+		if got := getVCPUEvents(t, c).interrupt.shadow; got&1 == 0 {
+			t.Fatalf("interrupt.shadow = %d, want bit 0 set", got)
+		}
+
+		events = getVCPUEvents(t, c)
+		events.interrupt.shadow = 0
+		events.flags |= _KVM_VCPUEVENT_VALID_SHADOW
+		setVCPUEvents(t, c, &events)
+
+		if got := getVCPUEvents(t, c).interrupt.shadow; got != 0 {
+			t.Fatalf("interrupt.shadow = %d, want 0", got)
+		}
+	})
+}
+
+// TestSigbusInMovSSShadow verifies that an access to unbacked memory made by
+// the instruction right after MOV SS (i.e. inside its interrupt shadow)
+// produces SIGBUS at that instruction.
+func TestSigbusInMovSSShadow(t *testing.T) {
+	memfd, err := memutil.CreateMemFD("kvm_movss_sigbus", 0)
+	if err != nil {
+		t.Fatalf("CreateMemFD failed: %v", err)
+	}
+	memfile := os.NewFile(uintptr(memfd), "kvm_movss_sigbus")
+	defer memfile.Close()
+
+	// Map two pages over a one-page file: the second page is unbacked and
+	// any access to it raises SIGBUS.
+	const pageSize = uintptr(hostarch.PageSize)
+	const mapLen = 2 * pageSize
+	if err := memfile.Truncate(int64(pageSize)); err != nil {
+		t.Fatalf("Truncate failed: %v", err)
+	}
+
+	// movl $0x2b, %eax; movl %eax, %ss
+	movSS := []byte{0xb8, 0x2b, 0x00, 0x00, 0x00, 0x8e, 0xd0}
+
+	for _, tc := range []struct {
+		name string
+		// code is placed in the first page at codeOff.
+		code    func(pageSize uintptr) (code []byte, codeOff uintptr)
+		setRegs func(regs *arch.Registers, addr uintptr)
+		// wantRIP is the expected RIP offset from addr.
+		wantRIP func(pageSize uintptr) uintptr
+	}{
+		{
+			// The load from the unbacked page is the instruction in the
+			// MOV SS shadow.
+			name: "DataLoad",
+			code: func(uintptr) ([]byte, uintptr) {
+				// movq (%rdi), %rbx; syscall
+				return append(append([]byte{}, movSS...), 0x48, 0x8b, 0x1f, 0x0f, 0x05), 0
+			},
+			setRegs: func(regs *arch.Registers, addr uintptr) {
+				regs.Rdi = uint64(addr + pageSize)
+			},
+			wantRIP: func(uintptr) uintptr { return uintptr(len(movSS)) },
+		},
+		{
+			// MOV SS is the last instruction in the first page, so the
+			// fetch of the next instruction from the unbacked page
+			// happens in the MOV SS shadow.
+			name: "InstructionFetch",
+			code: func(pageSize uintptr) ([]byte, uintptr) {
+				return movSS, pageSize - uintptr(len(movSS))
+			},
+			setRegs: func(*arch.Registers, uintptr) {},
+			wantRIP: func(pageSize uintptr) uintptr { return pageSize },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			applicationTest(t, true, testutil.AddrOfSyscallLoop(), func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
+				addr, _, errno := unix.RawSyscall6(
+					unix.SYS_MMAP,
+					0,
+					mapLen,
+					unix.PROT_READ|unix.PROT_WRITE,
+					unix.MAP_SHARED|unix.MAP_FILE,
+					memfile.Fd(),
+					0)
+				if errno != 0 {
+					t.Fatalf("mmap failed: %v", errno)
+				}
+				defer unix.RawSyscall(unix.SYS_MUNMAP, addr, mapLen, 0)
+
+				code, codeOff := tc.code(pageSize)
+				copy(unsafe.Slice((*byte)(unsafe.Pointer(addr+codeOff)), len(code)), code)
+
+				for {
+					testutil.SetTestRegs(regs)
+					regs.Rip = uint64(addr + codeOff)
+					tc.setRegs(regs, addr)
+
+					var si linux.SignalInfo
+					_, err := c.SwitchToUser(ring0.SwitchOpts{
+						Registers:          regs,
+						FloatingPointState: &dummyFPState,
+						PageTables:         pt,
+						FullRestore:        true,
+					}, &si)
+					if err == platform.ErrContextInterrupt {
+						continue // Retry.
+					}
+					if err != platform.ErrContextSignal || si.Signo != int32(unix.SIGBUS) {
+						t.Fatalf("SwitchToUser got (%v, signo=%d), want (%v, SIGBUS)", err, si.Signo, platform.ErrContextSignal)
+					}
+					break
+				}
+				if want := uint64(addr + tc.wantRIP(pageSize)); regs.Rip != want {
+					t.Errorf("regs.Rip = %#x, want %#x", regs.Rip, want)
+				}
+				return false
+			})
+		})
+	}
+}
+
+func wrDR0(val uint64)
+func wrDR7(val uint64)
+
+const (
+	// dr7LocalRW0 enables DR0 locally for 2-byte read/write data accesses
+	// (L0 | LE | reserved bit 10 | R/W0=0b11 | LEN0=0b01).
+	dr7LocalRW0 = uint64(0x1 | 0x100 | 0x400 | (0x3 << 16) | (0x1 << 18))
+)
+
+// switchToUserWithWatchpoint enters guest user mode with a hardware data
+// watchpoint armed on addr and clears the watchpoint before returning.
+//
+//go:nosplit
+func switchToUserWithWatchpoint(c *vCPU, switchOpts ring0.SwitchOpts, addr uint64) ring0.Vector {
+	entersyscall()
+	bluepill(c)
+	wrDR0(addr)
+	wrDR6(_DR6_RESERVED)
+	wrDR7(dr7LocalRW0)
+	vec := c.CPU.SwitchToUser(switchOpts)
+	wrDR7(0)
+	wrDR0(0)
+	wrDR6(_DR6_RESERVED)
+	exitsyscall()
+	return vec
+}
+
+// deferredWatchpointTest runs targetFn with a hardware data watchpoint on the
+// selector word read by MOV (AX), SS so that #DB is deferred across the MOV SS
+// shadow onto the first instruction of the subsequent ring 0 entry point.
+func deferredWatchpointTest(t *testing.T, targetFn uintptr, wantVec ring0.Vector) {
+	ssSelector := uint16(ring0.Udata)
+	ssAddr := uint64(reflect.ValueOf(&ssSelector).Pointer())
+	var userStack [64]uint64
+	stackTop := uint64(reflect.ValueOf(&userStack[len(userStack)-1]).Pointer())
+
+	applicationTest(t, true, targetFn, func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
+		regs.Rax = ssAddr
+		regs.Rsp = stackTop
+		// Set an unmapped canonical user GS base so any ring 0 entry path
+		// that dereferences GS before SWAP_GS faults immediately.
+		regs.Gs_base = 0x1000
+		switchOpts := ring0.SwitchOpts{
+			Registers:          regs,
+			FloatingPointState: &dummyFPState,
+			PageTables:         pt,
+			FullRestore:        true,
+		}
+		if c.PCIDs != nil {
+			var requireFlushPCID bool
+			switchOpts.UserPCID, requireFlushPCID = c.PCIDs.Assign(switchOpts.PageTables)
+			switchOpts.KernelPCID = fixedKernelPCID
+			switchOpts.Flush = switchOpts.Flush || requireFlushPCID
+		}
+		vec := switchToUserWithWatchpoint(c, switchOpts, ssAddr)
+		runtime.KeepAlive(&ssSelector)
+		runtime.KeepAlive(&userStack)
+		if vec == ring0.Vector(bounce) {
+			return true // Retry.
+		}
+		if vec != wantVec {
+			code, user := c.ErrorCode()
+			t.Errorf("SwitchToUser returned vector %v (want %v): rip=%#x (target=%#x, off=%#x) errCode=%#x user=%v cs=%#x ss=%#x eflags=%#x",
+				vec, wantVec, regs.Rip, targetFn, regs.Rip-uint64(targetFn), code, user, regs.Cs, regs.Ss, regs.Eflags)
+		}
+		if regs.Rip >= uint64(ring0.KernelStartAddress) || regs.Rsp >= uint64(ring0.KernelStartAddress) {
+			t.Errorf("unexpected kernel address in user registers: rip=%#x rsp=%#x", regs.Rip, regs.Rsp)
+		}
+		return false
+	})
+}
+
+func TestDeferredDBOnSyscall(t *testing.T) {
+	deferredWatchpointTest(t, testutil.AddrOfLoadSSSyscall(), ring0.Syscall)
+}
+
+func TestDeferredDBOnInt3(t *testing.T) {
+	deferredWatchpointTest(t, testutil.AddrOfLoadSSInt3(), ring0.Breakpoint)
+}
+
+// TestApplicationSigbus verifies that handling a user-mode NMI (SIGBUS on an
+// unbacked file page) clears the CPU's architectural NMI-blocking state, so
+// subsequent NMIs in ring 0 (safecopy) and in user mode after SYSRET are not
+// blocked.
+func TestApplicationSigbus(t *testing.T) {
+	memfd, err := memutil.CreateMemFD(fmt.Sprintf("kvm_sigbus_test_%d", os.Getpid()), 0)
+	if err != nil {
+		t.Fatalf("error creating memfd: %v", err)
+	}
+	memfile := os.NewFile(uintptr(memfd), "kvm_sigbus_test")
+	defer memfile.Close()
+	if err := memfile.Truncate(0); err != nil {
+		t.Fatalf("error truncating memfd: %v", err)
+	}
+
+	buf := make([]byte, hostarch.PageSize)
+	applicationTest(t, true, testutil.AddrOfTouch(), func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
+		addr, _, errno := unix.RawSyscall6(
+			unix.SYS_MMAP,
+			0,
+			hostarch.PageSize,
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_SHARED|unix.MAP_FILE,
+			memfile.Fd(),
+			0)
+		if errno != 0 {
+			t.Fatalf("error mapping file: %v", errno)
+		}
+		defer unix.RawSyscall(unix.SYS_MUNMAP, addr, hostarch.PageSize, 0)
+
+		// 1. Trigger a user-mode SIGBUS (NMI) via IRET (FullRestore: true).
+		for {
+			regs.Rip = uint64(testutil.AddrOfTouch())
+			regs.Rax = uint64(addr)
+			var si linux.SignalInfo
+			_, err := c.SwitchToUser(ring0.SwitchOpts{
+				Registers:          regs,
+				FloatingPointState: &dummyFPState,
+				PageTables:         pt,
+				FullRestore:        true,
+			}, &si)
+			if err == platform.ErrContextInterrupt {
+				continue
+			}
+			if err != platform.ErrContextSignal || si.Signo != int32(unix.SIGBUS) {
+				t.Fatalf("first SwitchToUser got (%v, %+v), want (%v, SIGBUS)", err, si, platform.ErrContextSignal)
+			}
+			break
+		}
+
+		// Handling the user-mode NMI must have cleared the NMI-blocking
+		// latch. Leave guest mode without executing IRET and check it.
+		redpill()
+		if masked := getVCPUEvents(t, c).nmi.masked; masked != 0 {
+			t.Fatalf("nmi.masked = %d after a user-mode NMI, want 0", masked)
+		}
+
+		// 2. Trigger a ring-0 safecopy SIGBUS (NMI) on the same vCPU.
+		wantBus := safecopy.BusError{addr}
+		bluepill(c)
+		if _, err := safecopy.CopyIn(buf, unsafe.Pointer(addr)); err != wantBus {
+			t.Fatalf("safecopy.CopyIn got %v, want %v", err, wantBus)
+		}
+
+		// 3. Trigger another user-mode SIGBUS via SYSRET (FullRestore: false) followed
+		// by a third user-mode SIGBUS via SYSRET on the same vCPU.
+		for i := 0; i < 2; i++ {
+			for {
+				regs.Rip = uint64(testutil.AddrOfTouch())
+				regs.Rax = uint64(addr)
+				var si linux.SignalInfo
+				_, err := c.SwitchToUser(ring0.SwitchOpts{
+					Registers:          regs,
+					FloatingPointState: &dummyFPState,
+					PageTables:         pt,
+					FullRestore:        false,
+				}, &si)
+				if err == platform.ErrContextInterrupt {
+					continue
+				}
+				if err != platform.ErrContextSignal || si.Signo != int32(unix.SIGBUS) {
+					t.Fatalf("SYSRET SwitchToUser #%d got (%v, %+v), want (%v, SIGBUS)", i, err, si, platform.ErrContextSignal)
+				}
+				break
+			}
+		}
+		return false
+	})
 }

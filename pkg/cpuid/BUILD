@@ -32,6 +32,7 @@ go_test(
     size = "small",
     srcs = [
         "cpuid_amd64_test.go",
+        "cpuid_arm64_test.go",
         "cpuid_test.go",
     ],
     embed = [":cpuid"],
@@ -40,6 +41,7 @@ go_test(
     # at some point in the future, but for now we can simply skip nogo analysis
     # on the test itself. It still applies to the core library.
     nogo = False,
+    deps = ["//pkg/state"],
 )
 
 go_test(

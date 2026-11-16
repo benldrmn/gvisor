@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -1616,6 +1617,49 @@ TEST(ProcCpuinfo, DeniesWriteRoot) {
   }
 }
 
+#if defined(__aarch64__)
+// On arm64, /proc/cpuinfo and AT_HWCAP both come from elf_hwcap, so the
+// Features line must name exactly the HWCAP bits that getauxval(AT_HWCAP)
+// reports. Names are hwcap_str in arch/arm64/kernel/cpuinfo.c, indexed by bit.
+TEST(ProcCpuinfo, FeaturesMatchAtHwcap) {
+  static const char* const kHwcapNames[32] = {
+      "fp",       "asimd", "evtstrm", "aes",    "pmull",   "sha1",
+      "sha2",     "crc32", "atomics", "fphp",   "asimdhp", "cpuid",
+      "asimdrdm", "jscvt", "fcma",    "lrcpc",  "dcpop",   "sha3",
+      "sm3",      "sm4",   "asimddp", "sha512", "sve",     "asimdfhm",
+      "dit",      "uscat", "ilrcpc",  "flagm",  "ssbs",    "sb",
+      "paca",     "pacg",
+  };
+
+  std::string proc_cpuinfo =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/cpuinfo"));
+  absl::flat_hash_set<std::string> features;
+  bool found = false;
+  for (absl::string_view line : absl::StrSplit(proc_cpuinfo, '\n')) {
+    if (!absl::StartsWith(line, "Features")) {
+      continue;
+    }
+    std::pair<absl::string_view, absl::string_view> split =
+        absl::StrSplit(line, absl::MaxSplits(':', 1));
+    for (absl::string_view name :
+         absl::StrSplit(split.second, ' ', absl::SkipWhitespace())) {
+      features.insert(std::string(name));
+    }
+    found = true;
+    break;
+  }
+  ASSERT_TRUE(found) << proc_cpuinfo;
+
+  const unsigned long hwcap = getauxval(AT_HWCAP);  // NOLINT
+  for (int bit = 0; bit < 32; bit++) {
+    EXPECT_EQ(features.contains(kHwcapNames[bit]), (hwcap & (1UL << bit)) != 0)
+        << "feature " << kHwcapNames[bit] << " (HWCAP bit " << bit
+        << "), AT_HWCAP=" << absl::StrFormat("%#x", hwcap) << ", cpuinfo:\n"
+        << proc_cpuinfo;
+  }
+}
+#endif  // defined(__aarch64__)
+
 // Cpuinfo should not change across save/restore.
 TEST(ProcCpuinfo, Stable) {
   std::string output_before;
@@ -3199,6 +3243,44 @@ TEST(ProcTask, ProcRootNeverListsZeroTID) {
   reader3.Join();
   reader4.Join();
   EXPECT_FALSE(listed_zero.load(std::memory_order_relaxed));
+}
+
+TEST(ProcTask, ImmutableTaskDirectories) {
+  struct statvfs st;
+  ASSERT_THAT(statvfs("/proc", &st), SyscallSucceeds());
+  SKIP_IF(st.f_flag & ST_RDONLY);  // rename requires a writable mount.
+
+  for (const char* dir : {"/proc/self", "/proc/thread-self"}) {
+    SCOPED_TRACE(dir);
+    EXPECT_THAT(access(dir, R_OK | X_OK), SyscallSucceeds());
+    EXPECT_THAT(access(dir, W_OK), SyscallFailsWithErrno(EPERM));
+  }
+
+  // Immutability takes precedence over the directory's mode bits.
+  AutoCapability cap(CAP_DAC_OVERRIDE, false);
+  EXPECT_THAT(rename("/proc/self/status", "/proc/version"),
+              SyscallFailsWithErrno(EPERM));
+}
+
+TEST(ProcTask, OpenImmutableTaskDirectories) {
+  const bool has_override =
+      ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_DAC_OVERRIDE));
+  for (const bool with_override : {true, false}) {
+    if (with_override && !has_override) {
+      continue;
+    }
+    SCOPED_TRACE(with_override ? "with CAP_DAC_OVERRIDE"
+                               : "without CAP_DAC_OVERRIDE");
+    AutoCapability cap(CAP_DAC_OVERRIDE, with_override);
+    for (const char* dir : {"/proc/self", "/proc/thread-self"}) {
+      SCOPED_TRACE(dir);
+      for (const int flags :
+           {O_WRONLY, O_RDWR, O_RDONLY | O_TRUNC, O_CREAT | O_RDONLY}) {
+        SCOPED_TRACE(flags);
+        EXPECT_THAT(Open(dir, flags, 0600), PosixErrorIs(EISDIR));
+      }
+    }
+  }
 }
 
 TEST(ProcTask, TaskDirCannotBeDeleted) {

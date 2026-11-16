@@ -449,6 +449,10 @@ func (d *Dentry) cacheLocked(ctx context.Context) {
 func (fs *Filesystem) evictCachedDentryLocked(ctx context.Context) {
 	// Evict the least recently used dentry because cache size is greater than
 	// max cache size (configured on mount).
+	//
+	// TODO(b/579946399): Don't evict dentries with inotify watches. Watches
+	// don't hold a reference on their target, so this may destroy the watches
+	// of inodes that are created on lookup.
 	fs.cachedDentries.Back().evictLocked(ctx)
 }
 
@@ -726,6 +730,17 @@ func (d *Dentry) Parent() *Dentry {
 	return d.parent.Load()
 }
 
+// IsFilesystemRoot implements vfs.MountVisibilityDentry.IsFilesystemRoot.
+func (d *Dentry) IsFilesystemRoot() bool {
+	return d.fs.root == d
+}
+
+// IsEmptyDir implements vfs.MountVisibilityDentry.IsEmptyDir.
+func (d *Dentry) IsEmptyDir() bool {
+	inode, ok := d.inode.(emptyDirInode)
+	return ok && inode.IsEmptyDir()
+}
+
 // The Inode interface maps filesystem-level operations that operate on paths to
 // equivalent operations on specific filesystem nodes.
 //
@@ -949,4 +964,10 @@ type InodeWithXattrs interface {
 
 	// RemoveXattr removes the given extended attribute.
 	RemoveXattr(ctx context.Context, name string) error
+}
+
+// emptyDirInode is implemented by directory inodes that can never contain
+// entries, analogous to Linux's make_empty_dir_inode()/is_empty_dir_inode().
+type emptyDirInode interface {
+	IsEmptyDir() bool
 }

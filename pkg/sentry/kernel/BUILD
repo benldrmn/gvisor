@@ -368,6 +368,7 @@ go_library(
         "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/metric",
+        "//pkg/rand",
         "//pkg/refs",
         "//pkg/safemem",
         "//pkg/secio",
@@ -436,6 +437,7 @@ go_test(
     srcs = [
         "fd_table_test.go",
         "kcov_test.go",
+        "kernel_idle_test.go",
         "kernel_restore_test.go",
         "pending_signals_test.go",
         "seccomp_cache_test.go",
@@ -453,6 +455,7 @@ go_test(
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/contexttest",

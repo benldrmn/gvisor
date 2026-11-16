@@ -375,6 +375,10 @@ type Cgroup interface {
 	Update(res *specs.LinuxResources) error
 	Uninstall() error
 	Join() (func(), error)
+	// AllowDevices lets processes in the cgroup access the devices matched by
+	// rules, besides those allowed by earlier calls from any process. Other
+	// devices are denied.
+	AllowDevices(rules []DeviceRule) error
 	CloneIntoCgroup() (*os.File, error)
 	CPUQuota() (int64, error)
 	CPUPeriod() (int64, error)
@@ -415,6 +419,34 @@ func NewFromPath(cgroupsPath string, useSystemd bool) (Cgroup, error) {
 // cgroup path to be in the form `slice:prefix:name`.
 func NewFromPid(pid int, useSystemd bool) (Cgroup, error) {
 	return new(strconv.Itoa(pid), "", useSystemd)
+}
+
+// NewSelf loads the cgroup of the current process for inspection. Unlike
+// NewFromPid, it preserves the leaf cgroup path on cgroup v2 rather than
+// resolving its parent directory.
+func NewSelf() (Cgroup, error) {
+	parents, err := loadPaths("self")
+	if err != nil {
+		return nil, fmt.Errorf("finding current cgroups: %w", err)
+	}
+	return newSelf(parents, IsOnlyV2(), cgroupRoot())
+}
+
+func newSelf(parents map[string]string, isV2 bool, root string) (Cgroup, error) {
+	if isV2 {
+		p, ok := parents[cgroup2Key]
+		if !ok {
+			return nil, ErrInvalidGroupPath
+		}
+		return &cgroupV2{
+			Mountpoint: root,
+			Path:       p,
+		}, nil
+	}
+	return &cgroupV1{
+		Parents: parents,
+		Own:     make(map[string]bool),
+	}, nil
 }
 
 // LikelySystemdPath returns true if the path looks like a systemd path. This is
@@ -991,7 +1023,22 @@ func (*blockIO) optional() bool {
 }
 
 func (*blockIO) skip(spec *specs.LinuxResources) error {
-	if spec != nil && spec.BlockIO != nil {
+	if spec == nil || spec.BlockIO == nil {
+		return nil
+	}
+
+	// Docker always populates BlockIO, even when no I/O limits are set
+	// (empty object, or Weight explicitly set to 0). Treat those as
+	// "no limits" so runsc still starts when the blkio controller is
+	// absent from the host.
+	b := spec.BlockIO
+	if (b.Weight != nil && *b.Weight != 0) ||
+		(b.LeafWeight != nil && *b.LeafWeight != 0) ||
+		len(b.WeightDevice) > 0 ||
+		len(b.ThrottleReadBpsDevice) > 0 ||
+		len(b.ThrottleWriteBpsDevice) > 0 ||
+		len(b.ThrottleReadIOPSDevice) > 0 ||
+		len(b.ThrottleWriteIOPSDevice) > 0 {
 		return fmt.Errorf("blkio controller is missing but limits are set in OCI spec")
 	}
 	return nil

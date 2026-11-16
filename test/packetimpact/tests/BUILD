@@ -84,6 +84,7 @@ packetimpact_testbench(
     name = "tcp_zero_window_probe",
     srcs = ["tcp_zero_window_probe_test.go"],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
         "@org_golang_x_sys//unix:go_default_library",
@@ -125,6 +126,7 @@ packetimpact_testbench(
     name = "tcp_outside_the_window",
     srcs = ["tcp_outside_the_window_test.go"],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//test/packetimpact/testbench",
@@ -156,6 +158,7 @@ packetimpact_testbench(
     name = "tcp_unacc_seq_ack",
     srcs = ["tcp_unacc_seq_ack_test.go"],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//test/packetimpact/testbench",

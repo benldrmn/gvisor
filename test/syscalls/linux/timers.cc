@@ -455,6 +455,42 @@ TEST(IntervalTimerTest, PeriodicThreadDirectedSignal) {
   sigtimedwait(&mask, &si, &zero_ts);
 }
 
+// A relative CLOCK_REALTIME timer measures its duration with CLOCK_MONOTONIC,
+// so that changes to the realtime clock, such as when the sandbox is
+// checkpointed and restored while the timer is armed, do not affect it.
+TEST(IntervalTimerTest, RelativeClockRealtimeMeasuresMonotonicTime) {
+  constexpr int kSigno = SIGUSR1;
+  constexpr absl::Duration kDelay = absl::Seconds(2);
+
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, kSigno);
+  const auto scoped_sigmask =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSignalMask(SIG_BLOCK, mask));
+
+  struct sigevent sev = {};
+  sev.sigev_notify = SIGEV_THREAD_ID;
+  sev.sigev_signo = kSigno;
+  sev.sigev_notify_thread_id = gettid();
+  auto timer = ASSERT_NO_ERRNO_AND_VALUE(TimerCreate(CLOCK_REALTIME, sev));
+
+  struct timespec before, after;
+  ASSERT_THAT(clock_gettime(CLOCK_MONOTONIC, &before), SyscallSucceeds());
+  struct itimerspec its = {};
+  its.it_value = absl::ToTimespec(kDelay);
+  // This also checkpoints and restores while the timer is armed, if
+  // save/restore is enabled.
+  ASSERT_NO_ERRNO(timer.Set(0, its));
+
+  siginfo_t si;
+  ASSERT_THAT(RetryEINTR(sigwaitinfo)(&mask, &si),
+              SyscallSucceedsWithValue(kSigno));
+  ASSERT_THAT(clock_gettime(CLOCK_MONOTONIC, &after), SyscallSucceeds());
+  EXPECT_EQ(si.si_code, SI_TIMER);
+  EXPECT_GE(absl::TimeFromTimespec(after) - absl::TimeFromTimespec(before),
+            kDelay);
+}
+
 TEST(IntervalTimerTest, OtherThreadGroup) {
   constexpr int kSigno = SIGUSR1;
 
@@ -584,18 +620,15 @@ TEST(IntervalTimerTest, AlreadyPendingSignal) {
 }
 
 TEST(IntervalTimerTest, NegativeInterval) {
-  timer_t timerid;
-  EXPECT_THAT(timer_create(CLOCK_PROCESS_CPUTIME_ID, nullptr, &timerid),
-              SyscallSucceeds());
+  struct sigevent sev = {};
+  sev.sigev_notify = SIGEV_NONE;
+  const auto timer =
+      ASSERT_NO_ERRNO_AND_VALUE(TimerCreate(CLOCK_PROCESS_CPUTIME_ID, sev));
+
   struct itimerspec new_value = {};
-  new_value.it_interval.tv_sec = 0;
-  new_value.it_interval.tv_nsec = -2;  // Negative.
-  new_value.it_value.tv_sec = 0;
+  new_value.it_interval.tv_nsec = -2;
   new_value.it_value.tv_nsec = 1000000;
-  // Make sure this fails with EINVAL.
-  EXPECT_THAT(timer_settime(timerid, 0, &new_value, nullptr),
-              SyscallFailsWithErrno(EINVAL));
-  timer_delete(timerid);
+  EXPECT_THAT(timer.Set(0, new_value), PosixErrorIs(EINVAL, _));
 }
 
 }  // namespace

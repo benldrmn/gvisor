@@ -69,6 +69,7 @@ var localFSTests = map[string]TestFunc{
 	"Stat":            testStat,
 	"RegularFileIO":   testRegularFileIO,
 	"RegularFileOpen": testRegularFileOpen,
+	"FlushCloses":     testFlushCloses,
 	"SetStat":         testSetStat,
 	"Allocate":        testAllocate,
 	"StatFS":          testStatFS,
@@ -371,6 +372,32 @@ func testRegularFileIO(ctx context.Context, t *testing.T, tester Tester, root li
 	// Test syncing the writable FD.
 	if err := fd.Sync(ctx); err != nil {
 		t.Errorf("syncing the FD failed: %v", err)
+	}
+}
+
+func testFlushCloses(ctx context.Context, t *testing.T, tester Tester, root lisafs.ClientFD) {
+	client := root.Client()
+	if err := client.FlushCloses(ctx); err != nil {
+		t.Fatalf("flushing an empty queue: %v", err)
+	}
+	controlFile, _, fd, hostFD := openCreateFile(ctx, t, root, "tempFile")
+	defer unix.Close(hostFD)
+	// Keep the ID to check whether the server has processed the queued close.
+	closedFile := controlFile
+	fd.Close(ctx, false /* flush */)
+	controlFile.Close(ctx, false /* flush */)
+	var stat lisafs.Statx
+	if err := closedFile.StatTo(ctx, &stat); err != nil {
+		t.Fatalf("FD closed before flushing the queue: %v", err)
+	}
+	if err := client.FlushCloses(ctx); err != nil {
+		t.Fatalf("flushing queued closes: %v", err)
+	}
+	if err := closedFile.StatTo(ctx, &stat); err != unix.EBADF {
+		t.Fatalf("stat after flushing closes: got %v, want EBADF", err)
+	}
+	if err := client.FlushCloses(ctx); err != nil {
+		t.Fatalf("flushing the queue again: %v", err)
 	}
 }
 
@@ -702,6 +729,10 @@ func testGetdents(ctx context.Context, t *testing.T, tester Tester, root lisafs.
 		}
 		if uint64(dirent.Ino) != stat.Ino {
 			t.Errorf("dirent ino of %s is incorrect: want %d, got %d", dirent.Name, stat.Ino, dirent.Ino)
+		}
+		// Servers may omit device numbers.
+		if dirent.DevMinor == 0 && dirent.DevMajor == 0 {
+			continue
 		}
 		if uint32(dirent.DevMinor) != stat.DevMinor {
 			t.Errorf("dirent dev minor of %s is incorrect: want %d, got %d", dirent.Name, stat.DevMinor, dirent.DevMinor)

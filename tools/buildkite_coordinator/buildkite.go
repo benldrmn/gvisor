@@ -144,24 +144,24 @@ type JobPool struct {
 	// It is immutable.
 	jobsPerBuild uint
 
-	// trustedAuthors lists author IDs whose builds will be placed in trustedBuilds.
-	// It is immutable.
-	trustedAuthors map[authorID]struct{}
-
-	// mu protects queues.
+	// mu protects queues and trustedAuthors.
 	mu sync.Mutex
 
 	// queues stores pool data associated with each queue.
 	// queues is protected by mu.
 	queues map[string]Queue
+
+	// trustedAuthors lists author IDs whose builds will be placed in trustedBuilds.
+	// trustedAuthors is protected by mu.
+	trustedAuthors map[authorID]struct{}
 }
 
 // NewJobPool returns an empty job pool.
 func NewJobPool(jobsPerBuild uint, queues map[string]struct{}, trustedAuthors map[authorID]struct{}) *JobPool {
 	p := &JobPool{
 		jobsPerBuild:   jobsPerBuild,
-		trustedAuthors: trustedAuthors,
 		queues:         make(map[string]Queue),
+		trustedAuthors: trustedAuthors,
 	}
 	for queue := range queues {
 		p.queues[queue] = Queue{
@@ -172,13 +172,39 @@ func NewJobPool(jobsPerBuild uint, queues map[string]struct{}, trustedAuthors ma
 	return p
 }
 
-// countLocked returns how many jobs from the given build on the given queue are in
+// setTrustedAuthors replaces the set of trusted authors.
+//
+// It doesn't affect the builds already in the pool.
+func (p *JobPool) setTrustedAuthors(trustedAuthors map[authorID]struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.trustedAuthors = trustedAuthors
+}
+
+// countBuildLocked returns how many jobs from the given build on the given queue are in
 // the pool.
 //
 // p.mu must be held.
-func (p *JobPool) countLocked(queue string, uuid BuildUUID) uint {
+func (p *JobPool) countBuildLocked(queue string, uuid BuildUUID) uint {
 	q := p.queues[queue]
 	return uint(len(q.trustedBuilds[uuid].reservedJobs) + len(q.untrustedBuilds[uuid].reservedJobs))
+}
+
+// count returns how many jobs are reserved in the pool for each queue.
+func (p *JobPool) count() map[string]uint {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	counts := make(map[string]uint, len(p.queues))
+	for queue, q := range p.queues {
+		counts[queue] = 0
+		for _, builds := range []map[BuildUUID]Build{q.trustedBuilds, q.untrustedBuilds} {
+			for _, b := range builds {
+				counts[queue] += uint(len(b.reservedJobs))
+			}
+		}
+	}
+	return counts
 }
 
 // addLocked implements add.
@@ -192,7 +218,7 @@ func (p *JobPool) addLocked(queue string, uuid BuildUUID, metadata BuildMetadata
 
 	q := p.queues[queue]
 	builds := q.untrustedBuilds
-	if p.trusted(metadata) {
+	if p.trustedLocked(metadata) {
 		builds = q.trustedBuilds
 	}
 	b, ok := builds[uuid]
@@ -230,6 +256,15 @@ func (p *JobPool) jobIDsLocked() []JobUUID {
 // trusted returns whether a build with the given metadata may run on trusted
 // agents.
 func (p *JobPool) trusted(metadata BuildMetadata) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.trustedLocked(metadata)
+}
+
+// trustedLocked implements trusted.
+//
+// p.mu must be held.
+func (p *JobPool) trustedLocked(metadata BuildMetadata) bool {
 	switch metadata.source {
 	case buildSourceSchedule:
 		// Scheduled builds run from branches configured by pipeline admins,
@@ -502,7 +537,7 @@ func (s *BuildkiteStack) Replenish(ctx context.Context, pool *JobPool, listLimit
 			n, ok := needed[buildUUID]
 			if !ok {
 				// How many more jobs does this build need?
-				count := pool.countLocked(queue, buildUUID)
+				count := pool.countBuildLocked(queue, buildUUID)
 				if count < pool.jobsPerBuild {
 					n = pool.jobsPerBuild - count
 				}

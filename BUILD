@@ -230,6 +230,7 @@ go_path(
         "//tools/checklocks",
 
         # Packages that are not dependencies of the above.
+        "//runsc/client",
         "//pkg/sentry/kernel/memevent",
         "//pkg/sentry/socket/plugin/stack",
         "//pkg/tcpip/adapters/gonet",
@@ -247,6 +248,9 @@ go_path(
         "//pkg/tcpip/sample/tun_tcp_echo",
         "//pkg/tcpip/transport/tcpconntrack",
         "//runsc/checkpointgofer/gcs",
+        "//runsc/cgoextras",
+        "//runsc/coretagprime",
+        "//runsc/gofer/net",
         "//runsc/metricserver",
         "//sandboxexec/sandbox",
         "//tools/xdp/cmd",

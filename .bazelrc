@@ -15,6 +15,9 @@
 # Ensure a strong hash function.
 startup --host_jvm_args=-Dbazel.DigestFunction=SHA256
 
+# With a private registry, pass --module_mirrors= to skip this public mirror.
+common --module_mirrors=https://bcr.cloudflaremirrors.com
+
 # Start Python programs with the declared interpreter, without requiring a host
 # Python interpreter to bootstrap it.
 build --@rules_python//python/config_settings:bootstrap_impl=script
@@ -23,6 +26,11 @@ build --@rules_python//python/config_settings:bootstrap_impl=script
 # com_google_protobuf is compiled with a few warnings.
 build --cxxopt=-std=c++17 --cxxopt=-Wno-error=maybe-uninitialized
 build --host_cxxopt=-std=c++17 --host_cxxopt=-Wno-error=maybe-uninitialized
+
+# Libraries such as GoogleTest export third-party headers through cc_library's
+# includes attribute. Treat those directories as system headers so that a
+# warning in an included dependency does not fail a gVisor build under -Werror.
+build --features=system_include_paths --host_features=system_include_paths
 
 # Display the current git revision in the info block.
 build --stamp --workspace_status_command tools/workspace_status.sh
@@ -47,8 +55,9 @@ build --build_tag_filters=-nogo
 # Select the ordinary syscall tests used by public CI.
 test:syscalls-amd64 --test_tag_filters=-allsave,-runsc_slimvm
 test:syscalls-arm64 --test_tag_filters=-allsave,runsc_ptrace,runsc_systrap
-build:syscalls-arm64-64k --test_tag_filters=-allsave,runsc_systrap
-build:syscalls-arm64-64k --//tools/bazeldefs:page_size=64k
+# ARM64 binaries support both 4K and 64K pages, so 64K page hosts run the same
+# binaries as 4K page hosts; only the selected platforms differ.
+test:syscalls-arm64-64k --test_tag_filters=-allsave,runsc_systrap
 
 # Set flags for x86_64.
 build:x86_64 --crosstool_top=@crosstool//:toolchains

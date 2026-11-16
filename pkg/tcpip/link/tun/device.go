@@ -85,9 +85,7 @@ func (d *Device) SetPersistent(v bool) error {
 		return linuxerr.EBADFD
 	}
 
-	d.endpoint.setPersistent(v)
-
-	return nil
+	return d.endpoint.setPersistent(v)
 }
 
 // Release releases the device's reference to its attached endpoint.
@@ -178,10 +176,13 @@ func attachOrCreateNIC(ctx context.Context, s *stack.Stack, name, prefix string,
 		if endpoint.name == "" {
 			endpoint.name = fmt.Sprintf("%s%d", prefix, id)
 		}
+		// Linux's tun_net_initialize sets IFF_MULTICAST for TUN and uses
+		// ether_setup for TAP.
 		err := s.CreateNICWithOptions(id, packetsocket.New(endpoint), stack.NICOptions{
-			Name:   endpoint.name,
-			Kind:   "tun",
-			MinMTU: header.IPv4MinimumMTU,
+			Name:      endpoint.name,
+			Kind:      "tun",
+			Multicast: true,
+			MinMTU:    header.IPv4MinimumMTU,
 			// Linux drivers/net/tun.c:tun_net_initialize sets max_mtu to
 			// MAX_MTU minus hard_header_len, excluding packet-info bytes.
 			MaxMTU: maxMTU - uint32(endpoint.MaxHeaderLength()),
@@ -398,6 +399,8 @@ type tunEndpoint struct {
 	mu endpointMutex `state:"nosave"`
 	// +checklocks:mu
 	onCloseAction func() `state:"nosave"`
+	// The endpoint owns a reference while persistent is true.
+	//
 	// +checklocks:mu
 	persistent bool
 	// +checklocks:mu
@@ -405,20 +408,25 @@ type tunEndpoint struct {
 }
 
 // +checklocksexclude:e.mu
-func (e *tunEndpoint) setPersistent(v bool) {
+func (e *tunEndpoint) setPersistent(v bool) error {
 	e.mu.Lock()
-	if e.persistent == v || e.closed {
+	if e.closed {
 		e.mu.Unlock()
-		return
+		return linuxerr.EBADFD
+	}
+	if e.persistent == v {
+		e.mu.Unlock()
+		return nil
+	}
+	if v {
+		e.IncRef()
 	}
 	e.persistent = v
 	e.mu.Unlock()
-	// Update refs without holding the lock.
-	if v {
-		e.IncRef()
-	} else {
+	if !v {
 		e.DecRef(context.Background())
 	}
+	return nil
 }
 
 // +checklocksexclude:e.mu
@@ -430,6 +438,7 @@ func (e *tunEndpoint) Close() {
 	}
 	e.closed = true
 	decref := e.persistent
+	e.persistent = false
 	action := e.onCloseAction
 	e.onCloseAction = nil
 	e.mu.Unlock()

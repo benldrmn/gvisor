@@ -26,22 +26,23 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/moby/sys/capability"
 	"golang.org/x/sync/errgroup"
+
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
+	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 func TestPortForwardLocalMode(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	server := dockerutil.MakeContainer(ctx, t)
 	defer server.CleanUp(ctx)
 
@@ -52,7 +53,7 @@ func TestPortForwardLocalMode(t *testing.T) {
 		t.Fatalf("failed to create redis server: %v", err)
 	}
 
-	if err := waitUntilServerIsUp(ctx, server, redisPort); err != nil {
+	if err := waitForReply(ctx, server, "PONG", "redis-cli", "--raw", "-p", fmt.Sprint(redisPort), "PING"); err != nil {
 		t.Fatalf("failed to wait for redis server to be up: %v", err)
 	}
 
@@ -104,7 +105,7 @@ func TestPortForwardLocalMode(t *testing.T) {
 }
 
 func TestPortForwardStreamMode(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sockAddrDir, err := os.MkdirTemp("", "temp-")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -122,7 +123,8 @@ func TestPortForwardStreamMode(t *testing.T) {
 		t.Fatalf("failed to create nginx server: %v", err)
 	}
 
-	if err := waitUntilServerIsUp(ctx, server, nginxPort); err != nil {
+	url := fmt.Sprintf("http://127.0.0.1:%d/", nginxPort)
+	if err := waitForReply(ctx, server, "200", "curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", url); err != nil {
 		t.Fatalf("failed to wait for nginx server to be up: %v", err)
 	}
 
@@ -172,34 +174,19 @@ func getUnusedPort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-func waitUntilServerIsUp(ctx context.Context, server *dockerutil.Container, port int) error {
-	// This is a bit crude, but we need to make sure the server is up without exposing a port to the
-	// host. When the server container boots, the nginx process should run first. If we run nginx
-	// again, it will fail to bind to port 80. Run exec calls until we get that failure.
-	serverUpChan := make(chan struct{})
-	var upOut string
-	var upErr error
-	reg := regexp.MustCompile(fmt.Sprintf(`0\.0\.0\.0:%d[\s]*0\.0\.0\.0:\*[\s]*LISTEN`, port))
-	go func() {
-		for {
-			time.Sleep(time.Millisecond * 500)
-			upOut, upErr = server.Exec(ctx, dockerutil.ExecOpts{}, []string{"netstat", "-l"}...)
-			if reg.MatchString(upOut) {
-				close(serverUpChan)
-				return
-			}
+func waitForReply(ctx context.Context, server *dockerutil.Container, want string, command ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return testutil.PollContext(ctx, func() error {
+		out, err := server.Exec(ctx, dockerutil.ExecOpts{}, command...)
+		if err != nil {
+			return fmt.Errorf("%s: %w: %s", command[0], err, out)
 		}
-	}()
-
-	// If the server isn't up after 30 seconds, there is probably something wrong.
-	select {
-	case <-serverUpChan:
-		break
-	case <-time.After(time.Second * 30):
-		return fmt.Errorf("could not verify server is up: err: %v out: %s", upErr, upOut)
-	}
-
-	return nil
+		if got := strings.TrimSpace(out); got != want {
+			return fmt.Errorf("%s returned %q, want %q", command[0], got, want)
+		}
+		return nil
+	})
 }
 
 type portForwardProcess struct {

@@ -19,13 +19,11 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -38,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/test/capabilitytest"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
@@ -46,16 +45,19 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
-func init() {
-	// Reserve the initial thread for main so capability tests use threads that
-	// can exit if restoration fails. Locking during init pins main to this thread:
-	// https://pkg.go.dev/runtime#LockOSThread.
-	runtime.LockOSThread()
+// procSelfFD is passed as Args.ProcSelfFD to every loader created by tests.
+var procSelfFD int
 
+func init() {
 	log.SetLevel(log.Debug)
 	if err := fsgofer.OpenProcSelfFD("/proc/self/fd"); err != nil {
 		panic(err)
 	}
+	fd, err := unix.Open("/proc/self/fd", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		panic(err)
+	}
+	procSelfFD = fd
 }
 
 func testConfig() *config.Config {
@@ -157,6 +159,7 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		GoferMountConfs:  []specutils.GoferMountConf{{Lower: specutils.Lisafs, Upper: specutils.NoOverlay}},
 		PodInitConfigFD:  -1,
 		ExecFD:           -1,
+		ProcSelfFD:       procSelfFD,
 		RootfsUpperTarFD: -1,
 		CPUDMALatencyFD:  -1,
 	}
@@ -272,41 +275,77 @@ func TestRestoreFailBeforeStart(t *testing.T) {
 	}
 }
 
+// watchStartupHeapReleases replaces l.freeOSMemory. It returns a channel that
+// receives a value for each release.
+func watchStartupHeapReleases(l *Loader) <-chan struct{} {
+	released := make(chan struct{}, 10)
+	l.freeOSMemory = func() { released <- struct{}{} }
+	return released
+}
+
+// expectOneStartupHeapRelease checks that exactly one release happens.
+func expectOneStartupHeapRelease(t *testing.T, released <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-released:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("startup heap was not released")
+	}
+	select {
+	case <-released:
+		t.Errorf("startup heap was released more than once")
+	case <-time.After(2 * startupHeapReleaseIdleDelay):
+	}
+}
+
+// TestStartupHeapReleaseOnStart checks that the startup heap is released once
+// after the root container starts.
+func TestStartupHeapReleaseOnStart(t *testing.T) {
+	l, cleanup, err := createLoader(testConfig(), testSpec())
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer l.Destroy()
+	defer cleanup()
+	released := watchStartupHeapReleases(l)
+
+	go func() { <-l.ctrl.manager.startResultChan }()
+	if err := l.Run(); err != nil {
+		t.Fatalf("error running container: %v", err)
+	}
+	expectOneStartupHeapRelease(t, released)
+	if status := l.WaitExit(); !status.Exited() || status.ExitStatus() != 0 {
+		t.Errorf("application exited with %s, want exit status 0", status)
+	}
+}
+
+// TestStartupHeapReleaseOnRestore checks that the startup heap is released
+// once after a restore is complete.
+func TestStartupHeapReleaseOnRestore(t *testing.T) {
+	l, cleanup, err := createLoader(testConfig(), testSpec())
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer l.Destroy()
+	defer cleanup()
+	released := watchStartupHeapReleases(l)
+	defer l.ctrl.srv.Stop(time.Hour)
+
+	// Put the loader in the state that a restore leaves it in after the
+	// restored kernel starts (see containerManager.Restore and Loader.run).
+	l.mu.Lock()
+	l.state = restoringStarted
+	l.mu.Unlock()
+	l.ctrl.manager.onRestoreDone(sentryapi.Savings{})
+	// A second trigger while the release is pending doesn't add a release.
+	l.releaseStartupHeapWhenIdle()
+	expectOneStartupHeapRelease(t, released)
+}
+
 // Test that network=host with raw sockets enabled requires CAP_NET_RAW on the
 // host.
 func TestHostnetWithRawSockets(t *testing.T) {
-	// Capabilities are per-thread. Pin before saving or changing them.
-	runtime.LockOSThread()
-	restoreFailed := false
-	t.Cleanup(func() {
-		if !restoreFailed {
-			runtime.UnlockOSThread()
-		}
-	})
-
-	// Drop CAP_NET_RAW from effective capabilities, if we have it.
-	pid := os.Getpid()
-	caps, err := capability.NewPid2(0)
-	if err != nil {
-		t.Fatalf("error getting capabilities for pid %d: %v", pid, err)
-	}
-	if err := caps.Load(); err != nil {
-		t.Fatalf("error loading capabilities: %v", err)
-	}
-	if caps.Get(capability.EFFECTIVE, capability.CAP_NET_RAW) {
-		caps.Unset(capability.EFFECTIVE, capability.CAP_NET_RAW)
-		if err := caps.Apply(capability.CAPS); err != nil {
-			t.Fatalf("error applying capabilities: %v", err)
-		}
-		t.Cleanup(func() {
-			caps.Set(capability.EFFECTIVE, capability.CAP_NET_RAW)
-			if err := caps.Apply(capability.CAPS); err != nil {
-				// Do not return a thread with altered capabilities to the runtime.
-				restoreFailed = true
-				t.Errorf("error restoring capabilities: %v", err)
-			}
-		})
-	}
+	capabilitytest.DropEffective(t, unix.CAP_NET_RAW)
 
 	// Configure host network with raw sockets.
 	conf := testConfig()

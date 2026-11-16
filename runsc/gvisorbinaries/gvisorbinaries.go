@@ -66,6 +66,7 @@ import (
 const (
 	metricServerName            = "runsc-metric-server"
 	checkpointGoferName         = "checkpointgofer"
+	netgoferName                = "runsc-netgofer"
 	gvisorSentryName            = "gvisor_sentry"
 	gvisorSentryPluginStackName = "gvisor_sentry_plugin_stack"
 	prewarmerName               = "gvisor-sentry-prewarmer"
@@ -205,6 +206,8 @@ var (
 	MetricServer = Binary{Name: metricServerName}
 	// CheckpointGofer is the checkpoint gofer sidecar binary.
 	CheckpointGofer = Binary{Name: checkpointGoferName}
+	// Netgofer is the netgofer sidecar binary.
+	Netgofer = Binary{Name: netgoferName}
 	// GvisorSentry is the sentry (kernel) sidecar binary.
 	GvisorSentry = Binary{Name: gvisorSentryName}
 	// GvisorSentryPluginStack is the sentry sidecar binary with a plugin
@@ -222,7 +225,7 @@ var (
 )
 
 // All lists every sidecar present in a standard installation.
-var All = []*Binary{&MetricServer, &CheckpointGofer, &GvisorSentry, &GvisorSentryPrewarmer, &FDParking, &ProcUmounter}
+var All = []*Binary{&MetricServer, &CheckpointGofer, &Netgofer, &GvisorSentry, &GvisorSentryPrewarmer, &FDParking, &ProcUmounter}
 
 // Options is the set of options used to execute a sidecar binary.
 type Options struct {
@@ -263,16 +266,21 @@ var (
 
 // resolveDir resolves the directory in which sidecar binaries are located.
 func resolveDir() (string, error) {
+	return DirForExecutable(specutils.ExePath)
+}
+
+// DirForExecutable resolves sidecars for the given runsc executable.
+func DirForExecutable(executable string) (string, error) {
 	if dir := os.Getenv(sidecarBinariesDirEnv); dir != "" {
 		return dir, nil
 	}
-	dir := filepath.Join(filepath.Dir(specutils.ExePath), binDirName)
+	dir := filepath.Join(filepath.Dir(executable), binDirName)
 	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
 		return dir, nil
 	}
-	exe, err := filepath.EvalSymlinks(specutils.ExePath)
+	exe, err := filepath.EvalSymlinks(executable)
 	if err != nil {
-		return "", fmt.Errorf("cannot resolve path to runsc binary %q: %w", specutils.ExePath, err)
+		return "", fmt.Errorf("cannot resolve path to runsc binary %q: %w", executable, err)
 	}
 	return filepath.Join(filepath.Dir(exe), binDirName), nil
 }

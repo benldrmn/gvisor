@@ -180,7 +180,8 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 		// lookup in our host page tables for this translation.
 		if precommit {
 			s := b.ToSlice()
-			for i := 0; i < len(s); i += hostarch.PageSize {
+			pageSize := int(hostarch.PageSize)
+			for i := 0; i < len(s); i += pageSize {
 				_ = s[i] // Touch to commit.
 			}
 		}
@@ -248,6 +249,11 @@ func (as *addressSpace) PreFork() {}
 
 // PostFork implements platform.AddressSpace.PostFork.
 func (as *addressSpace) PostFork() {}
+
+// PrepareForPtrace implements platform.AddressSpace.PrepareForPtrace.
+func (as *addressSpace) PrepareForPtrace(ctx context.Context, mm platform.MemoryManager) error {
+	return nil
+}
 
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS.
 func (as *addressSpace) UserModifiedGS(ctx context.Context, mm platform.MemoryManager) error {

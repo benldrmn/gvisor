@@ -23,21 +23,31 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	compute "google.golang.org/api/compute/v1"
+	monitoring "google.golang.org/api/monitoring/v3"
+	yaml "gopkg.in/yaml.v3"
 	"gvisor.dev/gvisor/pkg/cleanup"
 )
 
 const (
+	publishMetricsInterval         = 10 * time.Second
 	clearCacheInterval             = 4 * time.Hour
 	buildkiteCleanupJobsInterval   = 3 * time.Second
 	buildkiteReplenishJobsInterval = 10 * time.Second
+	trustedAuthorsRefreshInterval  = 10 * time.Minute
+	deleteUntimedInstancesInterval = time.Minute
+
+	// trustedAuthorsRefreshTimeout bounds refreshing the trusted authors.
+	trustedAuthorsRefreshTimeout = time.Minute
 
 	// buildkiteListMaxJobs is how many scheduled jobs are considered per
 	// queue on each refresh.
@@ -67,13 +77,16 @@ type server struct {
 	rc *RateLimitController
 	// artifactTokenController is safe for concurrent use.
 	artifactTokenController *BucketTokenController
+	// gh is safe for concurrent use.
+	gh *githubClient
 
 	// pool is safe for concurrent use.
 	pool *JobPool
 
 	// The following fields are immutable.
-	cfg        config
-	computeSvc *compute.Service
+	cfg           config
+	computeSvc    *compute.Service
+	monitoringSvc *monitoring.Service
 }
 
 func newServer(ctx context.Context) *server {
@@ -103,14 +116,14 @@ func newServer(ctx context.Context) *server {
 		log.Fatalf("Failed to create compute client: %v", err)
 	}
 
-	// GitHub client
-	ghClient := newGitHubClient(ghToken)
-
-	// Create the Buildkite stack
-	stack, err := NewStack(ctx, cfg.stackKey, bkToken, ghClient, cfg.queues)
+	// Cloud Monitoring client
+	monitoringSvc, err := monitoring.NewService(ctx)
 	if err != nil {
-		log.Fatalf("Failed to create Buildkite stack: %v", err)
+		log.Fatalf("Failed to create monitoring client: %v", err)
 	}
+
+	// GitHub client
+	ghClient := newGitHubClient(ghToken, cfg.githubRepo)
 
 	// Create the instance timeout controller
 	tc, err := NewTimeoutController(ctx, computeSvc, cfg.project, cfg.agentServiceAccount)
@@ -130,14 +143,37 @@ func newServer(ctx context.Context) *server {
 		log.Fatalf("Failed to create artifact token issuer: %v", err)
 	}
 
+	// Fetch the maintainers list. Note that this will also be refreshed
+	// periodically while the server is running.
+	trustedAuthors := maps.Clone(cfg.trustedAuthors)
+	maintainers, err := fetchMaintainers(ctx, &cfg, ghClient)
+	if err != nil {
+		log.Printf("Warning: failed to fetch maintainers: %v; maintainer builds will be treated as untrusted", err)
+	} else {
+		// If successful, include the maintainers as trusted authors
+		maps.Copy(trustedAuthors, maintainers)
+	}
+	log.Printf("Starting with trusted authors set: %v", slices.Collect(maps.Keys(trustedAuthors)))
+
+	// Create the job pool
+	pool := NewJobPool(reservedJobsPerBuild, cfg.queues, trustedAuthors)
+
+	// Create the Buildkite stack
+	stack, err := NewStack(ctx, cfg.stackKey, bkToken, ghClient, cfg.queues)
+	if err != nil {
+		log.Fatalf("Failed to create Buildkite stack: %v", err)
+	}
+
 	return &server{
 		cfg:                     cfg,
 		computeSvc:              computeSvc,
+		monitoringSvc:           monitoringSvc,
 		stack:                   stack,
 		tc:                      tc,
 		rc:                      rc,
 		artifactTokenController: artifactTokenController,
-		pool:                    NewJobPool(reservedJobsPerBuild, cfg.queues, cfg.trustedAuthors),
+		gh:                      ghClient,
+		pool:                    pool,
 	}
 }
 
@@ -173,7 +209,16 @@ func (s *server) handleAgentRequestJob(w http.ResponseWriter, r *http.Request) {
 	// Try to pick a job for the agent
 	jobAssignment, pinAgent := s.pool.assignJob(s.computeSvc, agent)
 	if jobAssignment == nil {
-		// No job currently available for this agent
+		// No job currently available for this agent.
+
+		// Set an idle timeout so it doesn't sit there doing nothing when the build finishes.
+		_, err = s.tc.RegisterTimeout(r.Context(), id, idleTimeout, ShortenTimeout)
+		if err != nil {
+			log.Printf("Failed to register idle timeout for %v: %v", id, err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -275,7 +320,7 @@ func (s *server) handleAgentRequestJob(w http.ResponseWriter, r *http.Request) {
 
 	// Before assigning the job: register a job timeout to kill the agent if it's
 	// not done.
-	err = s.tc.RegisterTimeout(r.Context(), id, timeout)
+	_, err = s.tc.RegisterTimeout(r.Context(), id, timeout, ReplaceTimeout)
 	if err != nil {
 		log.Printf("Failed to register timeout for %v: %v", id, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -317,6 +362,21 @@ func (s *server) runClearCacheTicker() {
 		s.stack.ClearCache()
 	}
 }
+
+func (s *server) runPublishMetricsTicker(ctx context.Context) {
+	ticker := time.Tick(publishMetricsInterval)
+	for {
+		<-ticker
+		counts := s.pool.count()
+		ctx, cancel := context.WithTimeout(ctx, publishMetricsInterval)
+		err := publishReservedJobs(ctx, s.monitoringSvc, s.cfg.project, counts)
+		cancel()
+		if err != nil {
+			log.Printf("Failed to publish metrics: %v", err)
+		}
+	}
+}
+
 func (s *server) runBuildkiteCleanupJobsTicker(ctx context.Context) {
 	ticker := time.Tick(buildkiteCleanupJobsInterval)
 	for {
@@ -342,6 +402,66 @@ func (s *server) runBuildkiteReplenishJobsTicker(ctx context.Context) {
 	}
 }
 
+func (s *server) runTrustedAuthorsTicker(ctx context.Context) {
+	ticker := time.Tick(trustedAuthorsRefreshInterval)
+	for {
+		<-ticker
+		trustedAuthors, err := fetchMaintainers(ctx, &s.cfg, s.gh)
+		if err != nil {
+			log.Printf("Failed to refresh trusted authors: %v", err)
+			continue
+		}
+		maps.Copy(trustedAuthors, s.cfg.trustedAuthors)
+		s.pool.setTrustedAuthors(trustedAuthors)
+		log.Printf("New trusted authors set: %v", slices.Collect(maps.Keys(trustedAuthors)))
+	}
+}
+
+func (s *server) runDeleteUntimedInstancesTicker(ctx context.Context) {
+	ticker := time.Tick(deleteUntimedInstancesInterval)
+	for {
+		<-ticker
+		ctx, cancel := context.WithTimeout(ctx, deleteUntimedInstancesInterval)
+		err := s.tc.DeleteUntimedInstances(ctx, s.cfg.project, s.cfg.agentServiceAccount)
+		cancel()
+		if err != nil {
+			log.Printf("Failed to delete instances without timeouts: %v", err)
+		}
+	}
+}
+
+func fetchMaintainers(ctx context.Context, cfg *config, gh *githubClient) (map[authorID]struct{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, trustedAuthorsRefreshTimeout)
+	defer cancel()
+
+	data, err := gh.fileContents(ctx, cfg.maintainersFile)
+	if err != nil {
+		return nil, err
+	}
+	var file struct {
+		Maintainers []struct {
+			GitHub   string   `yaml:"github"`
+			GitHubID authorID `yaml:"github_id"`
+			Status   string   `yaml:"status"`
+		} `yaml:"maintainers"`
+	}
+	if err := yaml.Unmarshal(data, &file); err != nil {
+		return nil, fmt.Errorf("parsing %q: %w", cfg.maintainersFile, err)
+	}
+	maintainers := make(map[authorID]struct{})
+	for _, m := range file.Maintainers {
+		// Trust builds from ACTIVE and HIATUS maintainers
+		if m.Status != "ACTIVE" && !strings.HasPrefix(m.Status, "HIATUS_SINCE:") {
+			continue
+		}
+		if m.GitHubID == 0 {
+			return nil, fmt.Errorf("maintainer %q has no github_id in %q", m.GitHub, cfg.maintainersFile)
+		}
+		maintainers[m.GitHubID] = struct{}{}
+	}
+	return maintainers, nil
+}
+
 func main() {
 	ctx := context.Background()
 	s := newServer(ctx)
@@ -356,9 +476,12 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 	}
 
+	go s.runPublishMetricsTicker(ctx)
 	go s.runClearCacheTicker()
 	go s.runBuildkiteCleanupJobsTicker(ctx)
 	go s.runBuildkiteReplenishJobsTicker(ctx)
+	go s.runTrustedAuthorsTicker(ctx)
+	go s.runDeleteUntimedInstancesTicker(ctx)
 
 	// When the coordinator VM shuts down, SIGTERM is sent
 	notifyContext, stop := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)

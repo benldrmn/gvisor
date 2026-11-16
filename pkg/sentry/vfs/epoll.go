@@ -237,12 +237,10 @@ func (ep *EpollInstance) Seek(ctx context.Context, offset int64, whence int32) (
 
 // AddInterest implements the semantics of EPOLL_CTL_ADD.
 //
-// Preconditions: A reference must be held on file.
+// Preconditions:
+//   - A reference must be held on file.
+//   - file.Epollable() is true.
 func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event linux.EpollEvent) error {
-	if !file.Epollable() {
-		return linuxerr.EPERM
-	}
-
 	// Check for cyclic polling if necessary.
 	subep, _ := file.impl.(*EpollInstance)
 	if subep != nil {
@@ -279,6 +277,8 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event lin
 	wmask := waiter.EventMaskFromLinux(mask)
 	epi.waiter.Init(epi, wmask)
 	if err := file.EventRegister(&epi.waiter); err != nil {
+		// EventRegister can notify the waiter before returning an error.
+		ep.removeLocked(epi)
 		return err
 	}
 
@@ -326,7 +326,9 @@ func (ep *EpollInstance) mightPollRecursive(ep2 *EpollInstance, remainingRecursi
 
 // ModifyInterest implements the semantics of EPOLL_CTL_MOD.
 //
-// Preconditions: A reference must be held on file.
+// Preconditions:
+//   - A reference must be held on file.
+//   - file.Epollable() is true.
 func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event linux.EpollEvent) error {
 	ep.interestMu.Lock()
 	defer ep.interestMu.Unlock()
@@ -363,7 +365,9 @@ func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event 
 
 // DeleteInterest implements the semantics of EPOLL_CTL_DEL.
 //
-// Preconditions: A reference must be held on file.
+// Preconditions:
+//   - A reference must be held on file.
+//   - file.Epollable() is true.
 func (ep *EpollInstance) DeleteInterest(file *FileDescription, num int32) error {
 	ep.interestMu.Lock()
 	defer ep.interestMu.Unlock()

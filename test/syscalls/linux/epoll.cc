@@ -39,7 +39,6 @@
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/signal_util.h"
-#include "test/util/socket_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -76,6 +75,22 @@ TEST(EpollTest, AllWritable) {
   for (int i = 0; i < kFDsPerEpoll; i++) {
     ASSERT_EQ(result[i].events, EPOLLOUT);
   }
+}
+
+// A restored open device must also accept watches created after restore.
+TEST(EpollTest, WatchOpenRandomDevice) {
+  const FileDescriptor device =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/random", O_RDONLY | O_NONBLOCK));
+  MaybeSave();
+
+  const FileDescriptor epollfd = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+  ASSERT_NO_ERRNO(
+      RegisterEpollFD(epollfd.get(), device.get(), EPOLLIN, kMagicConstant));
+  struct epoll_event event;
+  ASSERT_THAT(RetryEINTR(epoll_wait)(epollfd.get(), &event, 1, 0),
+              SyscallSucceedsWithValue(1));
+  EXPECT_EQ(event.events, EPOLLIN);
+  EXPECT_EQ(event.data.u64, kMagicConstant);
 }
 
 TEST(EpollTest, LastReadable) {
@@ -680,6 +695,56 @@ TEST(EpollTest, RegularFiles) {
   auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path.path(), O_RDONLY));
   EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_ADD, fd.get(), &event),
               SyscallFailsWithErrno(EPERM));
+
+  // EPERM takes precedence over ENOENT for MOD and DEL, and over EINVAL for an
+  // invalid op.
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_MOD, fd.get(), &event),
+              SyscallFailsWithErrno(EPERM));
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_DEL, fd.get(), nullptr),
+              SyscallFailsWithErrno(EPERM));
+  EXPECT_THAT(epoll_ctl(epollfd.get(), -1, fd.get(), &event),
+              SyscallFailsWithErrno(EPERM));
+}
+
+TEST(EpollTest, BadEventPointerCheckedFirst) {
+  auto epollfd = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+  auto path = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path.path(), O_RDONLY));
+
+  // Every op except EPOLL_CTL_DEL reads the event before checking either fd,
+  // so EFAULT takes precedence over EPERM and EBADF.
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_ADD, fd.get(), nullptr),
+              SyscallFailsWithErrno(EFAULT));
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_MOD, fd.get(), nullptr),
+              SyscallFailsWithErrno(EFAULT));
+  EXPECT_THAT(epoll_ctl(epollfd.get(), -1, fd.get(), nullptr),
+              SyscallFailsWithErrno(EFAULT));
+  EXPECT_THAT(epoll_ctl(-1, EPOLL_CTL_ADD, -1, nullptr),
+              SyscallFailsWithErrno(EFAULT));
+
+  // EPOLL_CTL_DEL does not read the event.
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_DEL, fd.get(), nullptr),
+              SyscallFailsWithErrno(EPERM));
+}
+
+TEST(EpollTest, TargetCheckedBeforeEpollType) {
+  auto notepollfd = ASSERT_NO_ERRNO_AND_VALUE(NewEventFD());
+  auto path = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path.path(), O_RDONLY));
+
+  struct epoll_event event;
+  event.events = EPOLLIN;
+  event.data.u64 = kMagicConstant;
+
+  // EBADF for the target fd and EPERM for a target without poll support take
+  // precedence over EINVAL for an epfd that is not an epoll instance.
+  EXPECT_THAT(epoll_ctl(notepollfd.get(), EPOLL_CTL_ADD, -1, &event),
+              SyscallFailsWithErrno(EBADF));
+  EXPECT_THAT(epoll_ctl(notepollfd.get(), EPOLL_CTL_ADD, fd.get(), &event),
+              SyscallFailsWithErrno(EPERM));
+  EXPECT_THAT(
+      epoll_ctl(notepollfd.get(), EPOLL_CTL_ADD, notepollfd.get(), &event),
+      SyscallFailsWithErrno(EINVAL));
 }
 
 // Regression test for b/222369818.

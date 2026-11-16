@@ -1,6 +1,6 @@
 """Nogo rules."""
 
-load("//tools:arch.bzl", "arch_transition")
+load("//tools:arch.bzl", "ARCHITECTURES", "arch_transition")
 load("//tools/bazeldefs:go.bzl", "go_binary_archive", "go_context", "go_embed_libraries", "go_has_source", "go_importpath", "go_rule", "go_source_files", "nogo_extra_proto_deps")
 
 NogoConfigInfo = provider(
@@ -67,15 +67,23 @@ NogoStdlibInfo = provider(
 
 def _nogo_stdlib_impl(ctx):
     # Build the configuration for the stdlib.
-    go_ctx, args, inputs, raw_findings = _nogo_config(ctx, deps = [])
+    args = ctx.actions.args()
+    go_ctx, inputs, raw_findings = _nogo_config(ctx, args, deps = [])
 
     # GOVERSION of std is set by the std go.mod.
-    args.append("-GOVERSION-mod-file=%s" % go_ctx.stdlib_mod.path)
+    args.add("-GOVERSION-mod-file=%s" % go_ctx.stdlib_mod.path)
 
     # Build the analyzer command.
     facts_file = ctx.actions.declare_file(ctx.label.name + ".facts")
     findings_file = ctx.actions.declare_file(ctx.label.name + ".raw_findings")
     stdlib_srcs = go_ctx.stdlib_srcs if type(go_ctx.stdlib_srcs) == "list" else go_ctx.stdlib_srcs.to_list()
+    args.add_all([
+        "bundle",
+        "-findings=%s" % findings_file.path,
+        "-facts=%s" % facts_file.path,
+        "-root=.*?/src/",
+    ])
+    args.add_all(stdlib_srcs)
     ctx.actions.run(
         # For the standard library, we need to include the full set of Go
         # sources in the inputs.
@@ -91,12 +99,7 @@ def _nogo_stdlib_impl(ctx):
         # be enabled without any issues for correctness, but we want to avoid
         # paying the FUSE penalty.
         execution_requirements = {"no-sandbox": "1"},
-        arguments = args + [
-            "bundle",
-            "-findings=%s" % findings_file.path,
-            "-facts=%s" % facts_file.path,
-            "-root=.*?/src/",
-        ] + [f.path for f in stdlib_srcs],
+        arguments = [args],
         toolchain = None,
     )
 
@@ -162,28 +165,29 @@ def _select_objfile(files):
         a_files = x_files
     return a_files[0], x_files[0]
 
-def _nogo_config(ctx, deps, attr = None):
+def _nogo_config(ctx, args, deps, attr = None):
     # Build a configuration for the given set of deps. This is most basic
     # configuration and is used by the stdlib. For a more complete config, the
     # _nogo_package_config function may be used.
     #
-    # Returns (go_ctx, args, inputs, raw_findings).
+    # Returns (go_ctx, inputs, raw_findings).
     nogo_target_info = ctx.attr._target[NogoTargetInfo]
     go_ctx = go_context(ctx, goos = nogo_target_info.goos, goarch = nogo_target_info.goarch, attr = attr)
-    args = go_ctx.nogo_args + [
+    args.add_all(go_ctx.nogo_args)
+    args.add_all([
         "-go=%s" % go_ctx.go.path,
         "-GOOS=%s" % go_ctx.goos,
         "-GOARCH=%s" % go_ctx.goarch,
         "-tags=%s" % (",".join(go_ctx.gotags)),
-    ]
+    ])
     inputs = []
     raw_findings = []
     fact_sets = []
     for dep in deps:
         extras = nogo_extra_proto_deps(dep)
         for importpath, a_file, x_file in extras:
-            args.append("-archive=%s=%s" % (importpath, a_file.path))
-            args.append("-import=%s=%s" % (importpath, x_file.path))
+            args.add("-archive=%s=%s" % (importpath, a_file.path))
+            args.add("-import=%s=%s" % (importpath, x_file.path))
             inputs.append(a_file)
             inputs.append(x_file)
 
@@ -197,8 +201,8 @@ def _nogo_config(ctx, deps, attr = None):
         # Configure where to find the export data and Go archive. Binary
         # dependencies also expose their archive rather than the executable.
         a_file, x_file = _select_objfile(info.binaries)
-        args.append("-archive=%s=%s" % (info.importpath, a_file.path))
-        args.append("-import=%s=%s" % (info.importpath, x_file.path))
+        args.add("-archive=%s=%s" % (info.importpath, a_file.path))
+        args.add("-import=%s=%s" % (info.importpath, x_file.path))
         fact_sets.append(info.transitive_facts)
 
         # Collect all findings; duplicates are resolved at the end.
@@ -211,25 +215,25 @@ def _nogo_config(ctx, deps, attr = None):
     # Export data can expose types and methods from indirect imports. Their
     # facts must be available even without a direct source import.
     for importpath, facts_file in depset(transitive = fact_sets).to_list():
-        args.append("-facts=%s=%s" % (importpath, facts_file.path))
+        args.add("-facts=%s=%s" % (importpath, facts_file.path))
         inputs.append(facts_file)
 
-    return (go_ctx, args, inputs, raw_findings)
+    return (go_ctx, inputs, raw_findings)
 
-def _nogo_package_config(ctx, deps, importpath = None, objfiles = (None, None), attr = None):
+def _nogo_package_config(ctx, args, deps, importpath = None, objfiles = (None, None), attr = None):
     # See _nogo_config. This includes package details.
     #
-    # Returns (go_ctx, args, inputs, raw_findings).
-    go_ctx, args, inputs, raw_findings = _nogo_config(ctx, deps, attr = attr)
+    # Returns (go_ctx, inputs, raw_findings).
+    go_ctx, inputs, raw_findings = _nogo_config(ctx, args, deps, attr = attr)
 
     # GOVERSION of packages are set by the project language version.
-    args.append("-GOVERSION=%s" % go_ctx.lang_version)
+    args.add("-GOVERSION=%s" % go_ctx.lang_version)
 
     # Add the compiled package itself for analyzers that inspect object code.
     target_afile, target_xfile = objfiles
     if target_xfile != None:
-        args.append("-archive=%s=%s" % (importpath, target_afile.path))
-        args.append("-import=%s=%s" % (importpath, target_xfile.path))
+        args.add("-archive=%s=%s" % (importpath, target_afile.path))
+        args.add("-import=%s=%s" % (importpath, target_xfile.path))
         inputs.append(target_afile)
         inputs.append(target_xfile)
 
@@ -238,7 +242,7 @@ def _nogo_package_config(ctx, deps, importpath = None, objfiles = (None, None), 
     stdlib_facts = stdlib_info.facts
     if stdlib_facts:
         inputs.append(stdlib_facts)
-        args.append("-bundle=%s" % stdlib_facts.path)
+        args.add("-bundle=%s" % stdlib_facts.path)
 
     # Flatten all findings from all dependencies.
     #
@@ -247,7 +251,7 @@ def _nogo_package_config(ctx, deps, importpath = None, objfiles = (None, None), 
     # This does not actually add any additional work here, but
     # will simply propagate the full list of files.
     raw_findings = stdlib_info.raw_findings + depset(raw_findings).to_list()
-    return go_ctx, args, inputs, raw_findings
+    return go_ctx, inputs, raw_findings
 
 def _nogo_aspect_impl(target, ctx):
     # If this is a nogo rule itself (and not the shadow of a go_library or
@@ -325,11 +329,19 @@ def _nogo_aspect_impl(target, ctx):
 
     # Use the analyzed rule's transitioned Go configuration, including its build
     # tags, rather than the aspect's own attributes.
-    go_ctx, args, inputs, raw_findings = _nogo_package_config(ctx, deps, importpath = importpath, objfiles = objfiles, attr = ctx.rule.attr)
+    args = ctx.actions.args()
+    go_ctx, inputs, raw_findings = _nogo_package_config(ctx, args, deps, importpath = importpath, objfiles = objfiles, attr = ctx.rule.attr)
 
     # Build the argument file, and the runner.
     facts_file = ctx.actions.declare_file(ctx.label.name + ".facts")
     findings_file = ctx.actions.declare_file(ctx.label.name + ".findings")
+    args.add_all([
+        "check",
+        "-findings=%s" % findings_file.path,
+        "-facts=%s" % facts_file.path,
+        "-package=%s" % importpath,
+    ])
+    args.add_all(srcs)
     ctx.actions.run(
         inputs = inputs + srcs,
         outputs = [findings_file, facts_file],
@@ -340,12 +352,7 @@ def _nogo_aspect_impl(target, ctx):
         progress_message = "Analyzing %s" % target.label,
         # See above.
         execution_requirements = {"no-sandbox": "1"},
-        arguments = args + [
-            "check",
-            "-findings=%s" % findings_file.path,
-            "-facts=%s" % facts_file.path,
-            "-package=%s" % importpath,
-        ] + [src.path for src in srcs],
+        arguments = [args],
         toolchain = None,
     )
 
@@ -395,14 +402,12 @@ nogo_aspect = go_rule(
     },
 )
 
+_TEST_FINDINGS = {arch: "nogo.%s.findings" % arch for arch in ARCHITECTURES}
+
 def _nogo_test_impl(ctx):
     """Check nogo findings."""
 
-    # Build a runner that checks the filtered facts.
-    runner = ctx.actions.declare_file(ctx.label.name)
-    runner_content = ["#!/bin/bash"]
-    runner_footer = list()
-    all_findings = list()
+    reports = {}
 
     # Collect all architecture-targets.
     for (arch, deps) in ctx.split_attr.deps.items():
@@ -414,6 +419,11 @@ def _nogo_test_impl(ctx):
         # Build a step that applies the configuration.
         config_srcs = ctx.attr.config[NogoConfigInfo].srcs
         findings = ctx.actions.declare_file(ctx.label.name + "." + arch + ".findings")
+        args = ctx.actions.args()
+        args.add("filter")
+        args.add_all(config_srcs, format_each = "-config=%s")
+        args.add("-output=%s" % findings.path)
+        args.add_all(raw_findings)
         ctx.actions.run(
             inputs = raw_findings + ctx.files.srcs + config_srcs,
             outputs = [findings],
@@ -421,42 +431,26 @@ def _nogo_test_impl(ctx):
             executable = ctx.files._nogo[0],
             mnemonic = "GoStaticAnalysis",
             progress_message = "Generating %s" % ctx.label,
-            # See above.
-            execution_requirements = {"no-sandbox": "1"},
-            arguments = ["filter"] +
-                        ["-config=%s" % f.path for f in config_srcs] +
-                        ["-output=%s" % findings.path] +
-                        [f.path for f in raw_findings],
+            arguments = [args],
             toolchain = None,
         )
 
-        # Note that this calls the filter binary without any configuration, so
-        # all findings will be included. But this is expected, since we've
-        # already filtered out everything that should not be included. The
-        # runner will always run all tests, and then exit if any have failed.
-        runner_content.append("echo -n %s..." % arch)
-        runner_content.append("%s filter -test -text %s" % (ctx.files._nogo_target[0].short_path, findings.short_path))
-        runner_content.append("rc_%s=$?" % arch)
-        runner_footer.append("if [[ $rc_%s -ne 0 ]]; then exit $rc_%s; fi" % (arch, arch))
-        all_findings.append(findings)
-    runner_content.extend(runner_footer)
-    runner_content.append("")  # Ensure empty line.
-    ctx.actions.write(runner, "\n".join(runner_content), is_executable = True)
+        reports[_TEST_FINDINGS[arch]] = findings
+
+    runner = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.symlink(output = runner, target_file = ctx.executable._nogo_target, is_executable = True)
     return [DefaultInfo(
-        # The runner just executes the filter again, on the
-        # newly generated filtered findings. We still need
-        # the filter tool as part of our runfiles, however.
-        runfiles = ctx.runfiles(files = ctx.files._nogo_target + all_findings),
+        runfiles = ctx.runfiles(
+            files = [ctx.executable._nogo_target],
+            symlinks = reports,
+        ).merge(ctx.attr._nogo_target[DefaultInfo].default_runfiles),
         executable = runner,
     ), OutputGroupInfo(
-        # Propagate the filtered filters, for consumption by
-        # build tooling. Note that the build tooling typically
-        # pays attention to the mnemoic above, so this must be
-        # what is expected by the tooling.
-        nogo_findings = depset(all_findings),
+        # Tricorder consumes the per-architecture outputs of GoStaticAnalysis.
+        nogo_findings = depset(reports.values()),
     )]
 
-nogo_test = rule(
+_nogo_test = rule(
     implementation = _nogo_test_impl,
     attrs = {
         "config": attr.label(
@@ -479,6 +473,7 @@ nogo_test = rule(
         "_nogo_target": attr.label(
             default = "//tools/nogo:nogo",
             cfg = "target",
+            executable = True,
         ),
         "_target": attr.label(
             default = "//tools/nogo:target",
@@ -488,8 +483,20 @@ nogo_test = rule(
     test = True,
 )
 
-def _nogo_aspect_tricorder_impl(target, ctx):
-    if ctx.rule.kind != "nogo_test" or OutputGroupInfo not in target:
+def nogo_test_args(args = []):
+    """Returns the analyzer arguments for checking the per-architecture reports."""
+    return ["filter", "-test", "-text"] + args + _TEST_FINDINGS.values()
+
+def nogo_test(name, args = [], **kwargs):
+    """Checks the already-filtered reports for every architecture."""
+    _nogo_test(
+        name = name,
+        args = nogo_test_args(args),
+        **kwargs
+    )
+
+def _nogo_aspect_tricorder_impl(target, _ctx):
+    if OutputGroupInfo not in target:
         return []
     if not hasattr(target[OutputGroupInfo], "nogo_findings"):
         return []
@@ -508,9 +515,16 @@ def _nogo_facts_render_impl(ctx):
 
     # Rendering dependency facts needs neither an import path nor an archive
     # for the package containing the template.
-    go_ctx, args, inputs, _ = _nogo_package_config(ctx, ctx.attr.deps)
+    args = ctx.actions.args()
+    go_ctx, inputs, _ = _nogo_package_config(ctx, args, ctx.attr.deps)
 
     # Build the runner.
+    args.add_all([
+        "render",
+        "-template=%s" % ctx.files.template[0].path,
+        "-output=%s" % ctx.outputs.output.path,
+    ])
+    args.add_all(ctx.files.srcs)
     ctx.actions.run(
         inputs = inputs + ctx.files.srcs + ctx.files.template,
         outputs = [ctx.outputs.output],
@@ -519,13 +533,7 @@ def _nogo_facts_render_impl(ctx):
         env = go_ctx.env,
         mnemonic = "GoStaticAnalysis",
         progress_message = "Generating %s" % ctx.label,
-        # See above.
-        execution_requirements = {"no-sandbox": "1"},
-        arguments = args + [
-            "render",
-            "-template=%s" % ctx.files.template[0].path,
-            "-output=%s" % ctx.outputs.output.path,
-        ] + [src.path for src in ctx.files.srcs],
+        arguments = [args],
     )
 
     # Return the output.

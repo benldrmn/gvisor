@@ -106,6 +106,10 @@ type Config struct {
 	// DO NOT call it directly, use GetOverlay2() instead.
 	Overlay2 Overlay2 `flag:"overlay2"`
 
+	// TarTimestampResolution is the resolution of modification times in tar
+	// archives of overlay upper layers and filesystem checkpoints.
+	TarTimestampResolution TarTimestampResolution `flag:"tar-timestamp-resolution"`
+
 	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
@@ -119,6 +123,10 @@ type Config struct {
 	// CharacterDevicePolicy controls how character device files on gofer
 	// mounts (the rootfs and bind mounts) are handled.
 	CharacterDevicePolicy CharacterDevicePolicy `flag:"character-device-policy"`
+
+	// InodeNumbers controls how inode numbers of files on gofer mounts are
+	// assigned.
+	InodeNumbers InodeNumbers `flag:"inode-numbers"`
 
 	// HostSettings controls how host settings are handled.
 	HostSettings HostSettingsPolicy `flag:"host-settings"`
@@ -177,6 +185,11 @@ type Config struct {
 	// PCAP is a file to which network packets should be logged in PCAP format.
 	PCAP string `flag:"pcap-log"`
 
+	// Netgofer controls whether and how netgofer is used for networking via UDS.
+	// Note: It is experimental and currently only proxies outbound TCP and UDP
+	// traffic. Active connections cannot be preserved across save/restore.
+	Netgofer NetgoferMode `flag:"netgofer"`
+
 	// NetworkProxyPath, if set, is the path of an external UDS that the
 	// sentry attaches its primary network interface to instead of creating
 	// an AF_PACKET socket.
@@ -218,6 +231,10 @@ type Config struct {
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
 	FinalMetricsLog string `flag:"final-metrics-log"`
+
+	// BootTimesLog is the file to which the startup timeline of the sandbox
+	// (see timing.Timer.Export) is written, as JSON, when the sandbox starts.
+	BootTimesLog string `flag:"boot-times-log"`
 
 	// ProfilingMetrics is a comma separated list of metric names which are
 	// going to be written to the ProfilingMetricsLog file from within the
@@ -434,6 +451,11 @@ type Config struct {
 	// Config was constructed. Nil when the Config was not initialized from a FlagSet.
 	explicitlySet map[string]struct{}
 
+	// cliStateEngine records the --state-engine policy explicitly passed on the
+	// command line when this Config was constructed via NewFromFlags, before any
+	// OCI annotation or bundle overrides run.
+	cliStateEngine *StateEnginePolicy
+
 	// ReproduceNAT, when true, tells runsc to scrape the host network
 	// namespace's NAT iptables and reproduce it inside the sandbox.
 	ReproduceNAT bool `flag:"reproduce-nat"`
@@ -506,6 +528,9 @@ type Config struct {
 	egressAllowIPsBase     string
 	egressBaseCaptured     bool
 
+	// StateEngine selects the state serialization engine used when saving checkpoints.
+	StateEngine StateEnginePolicy `flag:"state-engine"`
+
 	// AllowRootfsTarAnnotation indicates whether the rootfs tar annotation
 	// should be allowed.
 	AllowRootfsTarAnnotation bool `flag:"allow-rootfs-tar-annotation"`
@@ -530,7 +555,7 @@ type Config struct {
 // UseNetworkProxy reports whether the primary sandbox network interface should
 // be attached to a unix domain socket instead of AF_PACKET socket.
 func (c *Config) UseNetworkProxy() bool {
-	return c.NetworkProxyPath != ""
+	return c.Netgofer.Enabled() || c.NetworkProxyPath != ""
 }
 
 // platformDevicePaths is the parsed value of --platform_device_path.
@@ -581,8 +606,8 @@ func (c *Config) PlatformDeviceFor(platform string) string {
 
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
-// Config.Override does not validate, so callers must call Validate once they
-// are done overriding.
+// Config.Override and Config.ApplyBundles do not validate, so callers must call
+// Validate once they are done overriding.
 func (c *Config) Validate() error {
 	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
 	if err != nil {
@@ -628,7 +653,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("egress-allow-domains is set but egress-allow-ips is empty: the DNS resolver's IP must be in egress-allow-ips or no query can leave the sandbox")
 		}
 	}
-	if c.UseNetworkProxy() {
+	if c.NetworkProxyPath != "" {
 		if !filepath.IsAbs(c.NetworkProxyPath) {
 			return fmt.Errorf("network-proxy-path must be an absolute path, got %q", c.NetworkProxyPath)
 		}
@@ -637,6 +662,17 @@ func (c *Config) Validate() error {
 		}
 		if c.XDP.Mode != XDPModeOff {
 			return fmt.Errorf("network-proxy-path flag is incompatible with XDP")
+		}
+	}
+	if c.Netgofer.Enabled() {
+		if c.NetworkProxyPath != "" {
+			return fmt.Errorf("netgofer and network-proxy-path flags cannot both be set")
+		}
+		if c.Network != NetworkSandbox {
+			return fmt.Errorf("netgofer flag is only supported with sandbox networking")
+		}
+		if c.XDP.Mode != XDPModeOff {
+			return fmt.Errorf("netgofer flag is incompatible with XDP")
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
@@ -1343,6 +1379,104 @@ func (p CharacterDevicePolicy) AllowsPassthrough() bool {
 	return p != CharDevEmulatedOnly
 }
 
+// InodeNumbers tells how inode numbers of files on gofer mounts (the rootfs
+// and bind mounts) are assigned.
+type InodeNumbers int
+
+const (
+	// InodeNumbersPassthrough reports host inode numbers as is. Host device
+	// numbers are mapped to sandbox-private device numbers, so files on
+	// different host devices under one mount report different device numbers,
+	// as with Linux overlayfs.
+	InodeNumbersPassthrough InodeNumbers = iota
+
+	// InodeNumbersVirtual assigns sandbox-private sequential inode numbers
+	// and a single device number per mount. This requires the sandbox to
+	// remember the host identity of every file it has ever seen, and to
+	// stat(2) every entry returned by getdents(2).
+	InodeNumbersVirtual
+)
+
+func inodeNumbersPtr(v InodeNumbers) *InodeNumbers {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (n *InodeNumbers) Set(v string) error {
+	switch v {
+	case "passthrough":
+		*n = InodeNumbersPassthrough
+	case "virtual":
+		*n = InodeNumbersVirtual
+	default:
+		return fmt.Errorf("invalid inode numbers mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (n *InodeNumbers) Get() any {
+	return *n
+}
+
+// String implements flag.Value.
+func (n InodeNumbers) String() string {
+	switch n {
+	case InodeNumbersPassthrough:
+		return "passthrough"
+	case InodeNumbersVirtual:
+		return "virtual"
+	default:
+		panic(fmt.Sprintf("Invalid inode numbers mode %d", n))
+	}
+}
+
+// TarTimestampResolution is the resolution of modification times in tar
+// archives of sandbox filesystems.
+type TarTimestampResolution int
+
+const (
+	// TarTimestampSeconds rounds modification times to whole seconds.
+	TarTimestampSeconds TarTimestampResolution = iota
+
+	// TarTimestampNanoseconds keeps nanosecond modification times. Each tar
+	// entry gets a PAX extended header, which adds about 1 KiB per entry.
+	TarTimestampNanoseconds
+)
+
+func tarTimestampResolutionPtr(v TarTimestampResolution) *TarTimestampResolution {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (r *TarTimestampResolution) Set(v string) error {
+	switch v {
+	case "seconds":
+		*r = TarTimestampSeconds
+	case "nanoseconds":
+		*r = TarTimestampNanoseconds
+	default:
+		return fmt.Errorf("invalid tar timestamp resolution %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (r *TarTimestampResolution) Get() any {
+	return *r
+}
+
+// String implements flag.Value.
+func (r TarTimestampResolution) String() string {
+	switch r {
+	case TarTimestampSeconds:
+		return "seconds"
+	case TarTimestampNanoseconds:
+		return "nanoseconds"
+	}
+	panic(fmt.Sprintf("Invalid tar timestamp resolution %d", r))
+}
+
 // OverlayMedium describes how overlay medium is configured.
 type OverlayMedium string
 
@@ -1986,6 +2120,118 @@ func (xd *XDP) Set(input string) error {
 		xd.IfaceName = parts[1]
 	default:
 		return fmt.Errorf("invalid --xdp value: %q", input)
+	}
+	return nil
+}
+
+// StateEnginePolicy selects the state serialization engine used for saving checkpoints.
+type StateEnginePolicy int
+
+// StateEnginePolicy values.
+const (
+	// StateEngineGraph uses the reflection-free graph serialization engine.
+	StateEngineGraph StateEnginePolicy = iota
+
+	// StateEngineWire uses the legacy wire serialization engine.
+	StateEngineWire
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *StateEnginePolicy) Set(v string) error {
+	switch v {
+	case "graph":
+		*p = StateEngineGraph
+	case "wire":
+		*p = StateEngineWire
+	default:
+		return fmt.Errorf("invalid state engine policy %q (must be one of: graph, wire)", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+func (p StateEnginePolicy) Ptr() *StateEnginePolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *StateEnginePolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p StateEnginePolicy) String() string {
+	switch p {
+	case StateEngineGraph:
+		return "graph"
+	case StateEngineWire:
+		return "wire"
+	default:
+		panic(fmt.Sprintf("invalid state engine policy %d", p))
+	}
+}
+
+// NetgoferMode specifies whether and how the netgofer UDS proxy is used.
+type NetgoferMode int
+
+const (
+	// NetgoferModeOff disables the netgofer UDS proxy.
+	NetgoferModeOff NetgoferMode = iota
+
+	// NetgoferModeProxy runs netgofer in user-space Netstack TCP/UDP proxy mode.
+	NetgoferModeProxy
+
+	// NetgoferModeProxyLoopback runs netgofer in user-space Netstack TCP/UDP proxy
+	// mode and allows loopback traffic (e.g. Docker Compose embedded DNS at
+	// 127.0.0.11:53 or local host resolvers) over the UDS proxy link.
+	NetgoferModeProxyLoopback
+)
+
+// Enabled reports whether UDS proxy networking is enabled.
+func (n NetgoferMode) Enabled() bool {
+	return n != NetgoferModeOff
+}
+
+// Ptr returns a pointer to n.
+func (n NetgoferMode) Ptr() *NetgoferMode {
+	return &n
+}
+
+// AllowLoopback reports whether loopback traffic is allowed over the UDS proxy.
+func (n NetgoferMode) AllowLoopback() bool {
+	return n == NetgoferModeProxyLoopback
+}
+
+// Get implements flag.Getter.
+func (n *NetgoferMode) Get() any {
+	return *n
+}
+
+// String implements flag.Getter.
+func (n NetgoferMode) String() string {
+	switch n {
+	case NetgoferModeOff:
+		return "off"
+	case NetgoferModeProxy:
+		return "proxy"
+	case NetgoferModeProxyLoopback:
+		return "proxy-loopback"
+	default:
+		panic(fmt.Sprintf("invalid netgofer mode %d", n))
+	}
+}
+
+// Set implements flag.Getter. Set(String()) should be idempotent.
+func (n *NetgoferMode) Set(v string) error {
+	switch v {
+	case "", "off":
+		*n = NetgoferModeOff
+	case "proxy":
+		*n = NetgoferModeProxy
+	case "proxy-loopback":
+		*n = NetgoferModeProxyLoopback
+	default:
+		return fmt.Errorf("invalid netgofer mode %q (must be one of: off, proxy, proxy-loopback)", v)
 	}
 	return nil
 }

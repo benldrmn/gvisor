@@ -18,9 +18,14 @@
 package cpuid
 
 import (
+	"bytes"
+	"context"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/state"
 )
 
 // makeFatureSet creates a new FeatureSet.
@@ -300,7 +305,8 @@ func TestWriteCPUInfoFamilyEPYC(t *testing.T) {
 	s.Set(in, out)
 
 	var buf strings.Builder
-	s.ToFeatureSet().WriteCPUInfoTo(0, 1, &buf)
+	fs := s.ToFeatureSet()
+	fs.WriteCPUInfoTo(0, 1, fs.CPUFreqMHz(), &buf)
 	got := buf.String()
 	const want = "cpu family\t: 25\n"
 	if !strings.Contains(got, want) {
@@ -330,7 +336,11 @@ func TestNormalizeHidesAMX(t *testing.T) {
 		s.Add(f)
 	}
 	xsave := In{Eax: uint32(xSaveInfo)}
-	s.Set(xsave, Out{Eax: uint32(XSAVEFeatureAVX | XCR0AmxCfgMask | XCR0AmxDataMask)})
+	s.Set(xsave, Out{
+		Eax: uint32(XSAVEFeatureAVX | XCR0AmxCfgMask | XCR0AmxDataMask),
+		Ebx: 2816 + 8192,
+		Ecx: 2816 + 8192,
+	})
 	avx := In{Eax: uint32(xSaveInfo), Ecx: 2}
 	s.Set(avx, Out{Eax: 256, Ebx: 576})
 	s.Set(In{Eax: uint32(xSaveInfo), Ecx: amxTileCfgComponent}, Out{Eax: 64, Ebx: 2752})
@@ -342,8 +352,14 @@ func TestNormalizeHidesAMX(t *testing.T) {
 			t.Errorf("%v is advertised", f)
 		}
 	}
-	if got, want := fs.Query(xsave).Eax, uint32(XSAVEFeatureAVX); got != want {
-		t.Errorf("XCR0 bits: got %#x, want %#x", got, want)
+	hostXsave := HostFeatureSet().Query(xsave)
+	wantXsave := Out{
+		Eax: uint32(XSAVEFeatureAVX),
+		Ebx: max(2816, hostXsave.Ebx),
+		Ecx: max(2816, hostXsave.Ecx),
+	}
+	if got := fs.Query(xsave); got != wantXsave {
+		t.Errorf("CPUID(0xd, 0) = %+v, want %+v", got, wantXsave)
 	}
 	if got, want := fs.Query(avx), (Out{Eax: 256, Ebx: 576}); got != want {
 		t.Errorf("AVX subleaf: got %+v, want %+v", got, want)
@@ -352,6 +368,62 @@ func TestNormalizeHidesAMX(t *testing.T) {
 		if got := fs.Query(In{Eax: uint32(xSaveInfo), Ecx: i}); got != (Out{}) {
 			t.Errorf("AMX subleaf %d: got %+v, want zero", i, got)
 		}
+	}
+}
+
+func TestAMXExtendedStateSize(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		xcr0           uint64
+		xsaveSize      uint32
+		tileDataOffset uint32
+		tileDataSize   uint32
+		wantAMXSize    uint
+		wantTrimmed    uint32
+	}{
+		{
+			name:        "NoAMX",
+			xcr0:        0x2e7,
+			xsaveSize:   0xa80,
+			wantAMXSize: 0,
+			wantTrimmed: 0xa80,
+		},
+		{
+			name:           "BareMetalAMXEnabled",
+			xcr0:           0x2e7 | XCR0AmxCfgMask | XCR0AmxDataMask,
+			xsaveSize:      0x2b00,
+			tileDataOffset: 0xb00,
+			tileDataSize:   0x2000,
+			wantAMXSize:    0x2000,
+			wantTrimmed:    0xb00,
+		},
+		{
+			name:           "VirtualizedXCR0ClearedButXsaveIncludesTileData",
+			xcr0:           0xe7,
+			xsaveSize:      0x2b00,
+			tileDataOffset: 0xb00,
+			tileDataSize:   0x2000,
+			wantAMXSize:    0x2000,
+			wantTrimmed:    0xb00,
+		},
+		{
+			name:           "VirtualizedXCR0ClearedAndXsaveAlreadyTrimmed",
+			xcr0:           0xe7,
+			xsaveSize:      0xa80,
+			tileDataOffset: 0xb00,
+			tileDataSize:   0x2000,
+			wantAMXSize:    0,
+			wantTrimmed:    0xa80,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := amxExtendedStateSize(tc.xcr0, tc.xsaveSize, tc.tileDataOffset, tc.tileDataSize); got != tc.wantAMXSize {
+				t.Errorf("amxExtendedStateSize(%#x, %#x, %#x, %#x) = %#x, want %#x", tc.xcr0, tc.xsaveSize, tc.tileDataOffset, tc.tileDataSize, got, tc.wantAMXSize)
+			}
+			if got := excludeAMXTileData(tc.xsaveSize, tc.tileDataOffset, tc.tileDataSize); got != tc.wantTrimmed {
+				t.Errorf("excludeAMXTileData(%#x, %#x, %#x) = %#x, want %#x", tc.xsaveSize, tc.tileDataOffset, tc.tileDataSize, got, tc.wantTrimmed)
+			}
+		})
 	}
 }
 
@@ -366,5 +438,93 @@ func TestUnsetFSGSBASE(t *testing.T) {
 	out := guestFeatures.Query(In{Eax: 7, Ecx: 0})
 	if out.Ebx&1 != 0 {
 		t.Errorf("UnsetFSGSBASE failed: CPUID.(EAX=7, ECX=0).EBX bit 0 (FSGSBASE) should be 0, got %x", out.Ebx)
+	}
+}
+
+func TestStaticMarshal(t *testing.T) {
+	for _, s := range []Static{
+		{},
+		{In{Eax: 7, Ecx: 1}: Out{Eax: 0xffffffff, Ebx: 1, Ecx: 2, Edx: 3}},
+		HostFeatureSet().ToStatic(),
+	} {
+		b := s.marshal()
+		if len(b) != len(s)*staticEntrySize {
+			t.Errorf("marshal of %d entries is %d bytes, want %d", len(s), len(b), len(s)*staticEntrySize)
+		}
+		got, err := unmarshalStatic(b)
+		if err != nil {
+			t.Fatalf("unmarshalStatic failed: %v", err)
+		}
+		if !maps.Equal(got, s) {
+			t.Errorf("unmarshalStatic(marshal(%v)) = %v", s, got)
+		}
+		if !bytes.Equal(s.marshal(), b) {
+			t.Errorf("marshal is not deterministic")
+		}
+	}
+	if _, err := unmarshalStatic(make([]byte, staticEntrySize+1)); err == nil {
+		t.Errorf("unmarshalStatic accepted a bad length")
+	}
+	if _, err := unmarshalStatic(make([]byte, 2*staticEntrySize)); err == nil {
+		t.Errorf("unmarshalStatic accepted duplicate keys")
+	}
+}
+
+func TestFeatureSetSaveLoad(t *testing.T) {
+	roundTrip := func(t *testing.T, fs FeatureSet) FeatureSet {
+		t.Helper()
+		var buf bytes.Buffer
+		if _, err := state.Save(context.Background(), &buf, &fs); err != nil {
+			t.Fatalf("Save failed: %v", err)
+		}
+		var got FeatureSet
+		if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), &got); err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		return got
+	}
+
+	fs := HostFeatureSet().Fixed()
+	got := roundTrip(t, fs)
+	if !maps.Equal(got.Function.(Static), fs.Function.(Static)) {
+		t.Errorf("loaded function differs: got %v, want %v", got.Function, fs.Function)
+	}
+	if got.hwCap != fs.hwCap {
+		t.Errorf("loaded hwCap differs: got %v, want %v", got.hwCap, fs.hwCap)
+	}
+
+	// Zero FeatureSet preserves nil Function.
+	if zero := roundTrip(t, FeatureSet{}); zero.Function != nil {
+		t.Errorf("zero FeatureSet Function = %v, want nil", zero.Function)
+	}
+
+	// Non-Static HostFeatureSet and unnormalized Static normalize on Save/Load.
+	if nativeGot := roundTrip(t, HostFeatureSet()); !maps.Equal(nativeGot.Function.(Static), fs.Function.(Static)) {
+		t.Errorf("HostFeatureSet round-trip differs from Fixed()")
+	}
+	unnorm := make(Static)
+	unnorm.Add(X86FeatureXSAVE)
+	unnorm.Add(X86FeatureAMX_TILE)
+	if amxGot := roundTrip(t, FeatureSet{Function: unnorm}); amxGot.HasFeature(X86FeatureAMX_TILE) {
+		t.Errorf("AMX feature was not normalized out on Load")
+	}
+}
+
+func TestCheckHostCompatibleIgnoreVirtualization(t *testing.T) {
+	hostFeatures := makeFeatureSet(X86FeatureFPU, X86FeaturePAE)
+
+	for _, virtFeature := range []Feature{X86FeatureVMX, X86FeatureSVM} {
+		savedWithVirt := makeFeatureSet(X86FeatureFPU, X86FeaturePAE, virtFeature)
+		if err := savedWithVirt.checkCompatible(hostFeatures); err != nil {
+			t.Errorf("checkCompatible failed when saved FeatureSet had %v and host did not: %v", virtFeature, err)
+		}
+		if err := hostFeatures.checkCompatible(savedWithVirt); err != nil {
+			t.Errorf("checkCompatible failed when host FeatureSet had %v and saved did not: %v", virtFeature, err)
+		}
+	}
+
+	savedMissingOther := makeFeatureSet(X86FeatureFPU, X86FeaturePAE, X86FeatureAVX)
+	if err := savedMissingOther.checkCompatible(hostFeatures); err == nil {
+		t.Errorf("checkCompatible succeeded when saved FeatureSet had non-ignored missing feature %v, want error", X86FeatureAVX)
 	}
 }

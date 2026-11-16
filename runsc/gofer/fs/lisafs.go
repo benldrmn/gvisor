@@ -44,7 +44,7 @@ import (
 // LINT.IfChange
 
 const (
-	openFlags = unix.O_NOFOLLOW | unix.O_CLOEXEC
+	openFlags = unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NOCTTY
 
 	// UNIX_PATH_MAX as defined in include/uapi/linux/un.h.
 	unixPathMax = 108
@@ -63,6 +63,11 @@ type Config struct {
 	// CharDevicePolicy signals whether the gofer can open host character
 	// devices.
 	CharDevicePolicy config.CharacterDevicePolicy
+
+	// InodeNumbers tells how the client assigns inode numbers. Getdents64
+	// reports the device number of every entry only for virtual inode
+	// numbers, which the client derives from host device and inode numbers.
+	InodeNumbers config.InodeNumbers
 
 	// DonateMountPointFD indicates whether a host FD to the mount point should
 	// be donated to the client on Mount RPC.
@@ -305,8 +310,11 @@ func (fd *controlFDLisa) getParentFD() (int, string, error) {
 	}
 	// As a defense-in-depth measure, do not follow symlinks in the parent's path
 	// to prevent attackers from redirecting the parent to a different location.
+	// Unlike openat(2), openat2(2) fails with EINVAL when O_PATH is combined
+	// with flags other than O_CLOEXEC, O_DIRECTORY and O_NOFOLLOW, so
+	// openFlags (which has O_NOCTTY) can't be used here.
 	parent, err := unix.Openat2(unix.AT_FDCWD, path.Dir(filePath), &unix.OpenHow{
-		Flags:   uint64(openFlags | unix.O_PATH),
+		Flags:   unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW,
 		Resolve: unix.RESOLVE_NO_SYMLINKS,
 	})
 	return parent, path.Base(filePath), err
@@ -819,7 +827,9 @@ func (fd *controlFDLisa) Link(dir lisafs.ControlFDImpl, name string) (*lisafs.Co
 		return nil, lisafs.Statx{}, err
 	}
 	dirFD := dir.(*controlFDLisa)
-	if err := unix.Linkat(oldDirFD, oldName, dirFD.hostFD, name, 0); err != nil {
+	err = unix.Linkat(oldDirFD, oldName, dirFD.hostFD, name, 0)
+	_ = unix.Close(oldDirFD)
+	if err != nil {
 		return nil, lisafs.Statx{}, err
 	}
 	cu := cleanup.Make(func() {
@@ -1354,6 +1364,7 @@ func (fd *openFDLisa) Getdent64(count uint32, seek0 bool, recordDirent func(lisa
 		}
 	}
 
+	virtualInos := fd.ControlFD().FD().Conn().Impl().(*connectionImpl).config.InodeNumbers == config.InodeNumbersVirtual
 	var direntsBuf [8192]byte
 	var bytesRead int
 	for bytesRead < int(count) {
@@ -1384,16 +1395,17 @@ func (fd *openFDLisa) Getdent64(count uint32, seek0 bool, recordDirent func(lisa
 				Name: lisafs.SizedString(name),
 			}
 
-			// The client also wants the device ID, which annoyingly incurs an
-			// additional syscall per dirent.
-			// TODO(gvisor.dev/issue/6665): Get rid of per-dirent stat.
-			stat, err := fsutil.StatAt(fd.hostFD, name)
-			if err != nil {
-				log.Warningf("Getdent64: skipping file %q with failed stat, err: %v", path.Join(fd.ControlFD().FD().Node().FilePath(), name), err)
-				return
+			if virtualInos {
+				// The client also wants the device ID, which incurs an
+				// additional syscall per dirent.
+				stat, err := fsutil.StatAt(fd.hostFD, name)
+				if err != nil {
+					log.Warningf("Getdent64: skipping file %q with failed stat, err: %v", path.Join(fd.ControlFD().FD().Node().FilePath(), name), err)
+					return
+				}
+				dirent.DevMinor = primitive.Uint32(unix.Minor(stat.Dev))
+				dirent.DevMajor = primitive.Uint32(unix.Major(stat.Dev))
 			}
-			dirent.DevMinor = primitive.Uint32(unix.Minor(stat.Dev))
-			dirent.DevMajor = primitive.Uint32(unix.Major(stat.Dev))
 			recordDirent(dirent)
 			bytesRead += int(reclen)
 		})

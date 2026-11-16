@@ -19,11 +19,14 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
@@ -76,27 +79,250 @@ func newTestSystem(t *testing.T, pciTestDir string) *testutil.System {
 }
 
 func TestReadCPUFile(t *testing.T) {
+	for _, tc := range []struct {
+		cores int
+		want  string
+	}{
+		{cores: 1, want: "0\n"},
+		{cores: 2, want: "0-1\n"},
+		{cores: 5, want: "0-4\n"},
+	} {
+		t.Run(fmt.Sprintf("cores=%d", tc.cores), func(t *testing.T) {
+			defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(tc.cores))
+			s := newTestSystem(t, "" /*pciTestDir*/)
+			defer s.Destroy()
+			if got := kernel.KernelFromContext(s.Ctx).ApplicationCores(); got != uint(tc.cores) {
+				t.Fatalf("ApplicationCores() = %d, want %d", got, tc.cores)
+			}
+
+			for _, fname := range []string{"online", "possible", "present"} {
+				p := fmt.Sprintf("devices/system/cpu/%s", fname)
+				got, err := readTestFile(s, p)
+				if err != nil {
+					t.Fatalf("reading %q: %v", p, err)
+				}
+				if diff := cmp.Diff(tc.want, got); diff != "" {
+					t.Errorf("%q returned unexpected data:\n--- want\n+++ got\n%v", p, diff)
+				}
+			}
+		})
+	}
+}
+
+// TestCPUTopologyOneCPU checks the cpu0 topology lists with one CPU, where
+// Linux prints "0" rather than "0-0".
+func TestCPUTopologyOneCPU(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	s := newTestSystem(t, "" /*pciTestDir*/)
 	defer s.Destroy()
-	k := kernel.KernelFromContext(s.Ctx)
-	maxCPUCores := k.ApplicationCores()
-
-	expected := fmt.Sprintf("0-%d\n", maxCPUCores-1)
-
-	for _, fname := range []string{"online", "possible", "present"} {
-		pop := s.PathOpAtRoot(fmt.Sprintf("devices/system/cpu/%s", fname))
-		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+	if got := kernel.KernelFromContext(s.Ctx).ApplicationCores(); got != 1 {
+		t.Fatalf("ApplicationCores() = %d, want 1", got)
+	}
+	names := []string{"cluster_cpus_list", "core_cpus_list", "core_siblings_list", "package_cpus_list", "thread_siblings_list"}
+	if runtime.GOARCH == "amd64" {
+		names = append(names, "die_cpus_list")
+	}
+	for _, name := range names {
+		p := path.Join("devices/system/cpu/cpu0/topology", name)
+		got, err := readTestFile(s, p)
 		if err != nil {
-			t.Fatalf("OpenAt(pop:%+v) = %+v failed: %v", pop, fd, err)
+			t.Fatalf("reading %q: %v", p, err)
 		}
-		defer fd.DecRef(s.Ctx)
-		content, err := s.ReadToEnd(fd)
+		if got != "0\n" {
+			t.Errorf("%q contains %q, want %q", p, got, "0\n")
+		}
+	}
+}
+
+func TestCPUDir(t *testing.T) {
+	// The test kernel has GOMAXPROCS application cores. Make sure that there
+	// are several, so that the per-CPU masks are not all the same.
+	const minCores = 4
+	if prev := runtime.GOMAXPROCS(0); prev < minCores {
+		runtime.GOMAXPROCS(minCores)
+		defer runtime.GOMAXPROCS(prev)
+	}
+	s := newTestSystem(t, "" /*pciTestDir*/)
+	defer s.Destroy()
+	cores := kernel.KernelFromContext(s.Ctx).ApplicationCores()
+	if cores < minCores {
+		t.Fatalf("test kernel has %d cores, want at least %d", cores, minCores)
+	}
+
+	nlink := func(p string) uint32 {
+		t.Helper()
+		stat, err := s.VFS.StatAt(s.Ctx, s.Creds, s.PathOpAtRoot(p), &vfs.StatOptions{Mask: linux.STATX_NLINK})
 		if err != nil {
-			t.Fatalf("Read failed: %v", err)
+			t.Fatalf("StatAt(%s): %v", p, err)
 		}
-		if diff := cmp.Diff(expected, content); diff != "" {
-			t.Fatalf("Read returned unexpected data:\n--- want\n+++ got\n%v", diff)
+		return stat.Nlink
+	}
+	// Directories are populated on first use. Their link count, which
+	// depends on their children, must be right before that.
+	if got, want := nlink("devices/system/cpu"), uint32(2+cores); got != want {
+		t.Errorf("cpu link count: got %d, want %d", got, want)
+	}
+	if got, want := nlink("devices/system/cpu/cpu1"), uint32(3); got != want {
+		t.Errorf("cpu1 link count: got %d, want %d", got, want)
+	}
+
+	want := map[string]testutil.DirentType{
+		"online":   linux.DT_REG,
+		"possible": linux.DT_REG,
+		"present":  linux.DT_REG,
+	}
+	for i := uint(0); i < cores; i++ {
+		want[fmt.Sprintf("cpu%d", i)] = linux.DT_DIR
+	}
+	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("devices/system/cpu")), want)
+
+	// Populate cpu0 while leaving cpu1 unpopulated; rmdir must fail with
+	// ENOTEMPTY whether populated or not.
+	s.ListDirents(s.PathOpAtRoot("devices/system/cpu/cpu0"))
+	for _, p := range []string{"devices/system/cpu/cpu0", "devices/system/cpu/cpu1"} {
+		if err := s.VFS.RmdirAt(s.Ctx, s.Creds, s.PathOpAtRoot(p)); !linuxerr.Equals(linuxerr.ENOTEMPTY, err) {
+			t.Errorf("RmdirAt(%s): got error %v, want ENOTEMPTY", p, err)
 		}
+	}
+
+	// mask returns the expected sysfs CPU mask with the given CPUs set.
+	mask := func(set func(cpu uint) bool) string {
+		var words []string
+		for base := uint(0); base < cores; base += 32 {
+			var w uint32
+			for b := uint(0); b < 32 && base+b < cores; b++ {
+				if set(base + b) {
+					w |= 1 << b
+				}
+			}
+			width := 8
+			if base+32 > cores {
+				width = int(cores-base+3) / 4
+			}
+			words = append([]string{fmt.Sprintf("%0*x", width, w)}, words...)
+		}
+		return strings.Join(words, ",") + "\n"
+	}
+	fullMask := mask(func(uint) bool { return true })
+	fullList := fmt.Sprintf("0-%d\n", cores-1)
+	for i := uint(0); i < cores; i++ {
+		dir := fmt.Sprintf("devices/system/cpu/cpu%d", i)
+		s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot(dir)), map[string]testutil.DirentType{
+			"topology": linux.DT_DIR,
+		})
+		oneMask := mask(func(cpu uint) bool { return cpu == i })
+		oneList := fmt.Sprintf("%d\n", i)
+		files := map[string]string{
+			"cluster_cpus":         oneMask,
+			"cluster_cpus_list":    oneList,
+			"cluster_id":           fmt.Sprintf("%d\n", i),
+			"core_cpus":            oneMask,
+			"core_cpus_list":       oneList,
+			"core_id":              fmt.Sprintf("%d\n", i),
+			"core_siblings":        fullMask,
+			"core_siblings_list":   fullList,
+			"package_cpus":         fullMask,
+			"package_cpus_list":    fullList,
+			"physical_package_id":  "0\n",
+			"thread_siblings":      oneMask,
+			"thread_siblings_list": oneList,
+		}
+		if runtime.GOARCH == "amd64" {
+			files["die_cpus"] = fullMask
+			files["die_cpus_list"] = fullList
+			files["die_id"] = "0\n"
+		}
+		types := make(map[string]testutil.DirentType)
+		for name := range files {
+			types[name] = linux.DT_REG
+		}
+		s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot(path.Join(dir, "topology"))), types)
+		for name, want := range files {
+			p := path.Join(dir, "topology", name)
+			got, err := readTestFile(s, p)
+			if err != nil {
+				t.Fatalf("reading %s: %v", p, err)
+			}
+			if got != want {
+				t.Errorf("%s: got %q, want %q", p, got, want)
+			}
+		}
+	}
+}
+
+func TestNUMATopology(t *testing.T) {
+	s := newTestSystemWithInternalData(t, &sys.InternalData{EnableNUMATopology: true})
+	defer s.Destroy()
+
+	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("/devices/system/node")), map[string]testutil.DirentType{
+		"has_cpu":           linux.DT_REG,
+		"has_memory":        linux.DT_REG,
+		"has_normal_memory": linux.DT_REG,
+		"online":            linux.DT_REG,
+		"possible":          linux.DT_REG,
+		"node0":             linux.DT_DIR,
+	})
+	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("/devices/system/node/node0")), map[string]testutil.DirentType{
+		"cpumap":   linux.DT_REG,
+		"cpulist":  linux.DT_REG,
+		"distance": linux.DT_REG,
+	})
+
+	for p, want := range map[string]string{
+		"/devices/system/node/online":            "0\n",
+		"/devices/system/node/possible":          "0\n",
+		"/devices/system/node/has_cpu":           "0\n",
+		"/devices/system/node/has_memory":        "0\n",
+		"/devices/system/node/has_normal_memory": "0\n",
+		"/devices/system/node/node0/distance":    "10\n",
+	} {
+		got, err := readTestFile(s, p)
+		if err != nil {
+			t.Fatalf("reading %q: %v", p, err)
+		}
+		if got != want {
+			t.Errorf("%q contains %q, want %q", p, got, want)
+		}
+	}
+}
+
+func TestNUMATopologyCPUFormats(t *testing.T) {
+	for _, tc := range []struct {
+		cores       int
+		wantCPUList string
+		wantCPUMap  string
+	}{
+		{cores: 1, wantCPUList: "0\n", wantCPUMap: "1\n"},
+		{cores: 64, wantCPUList: "0-63\n", wantCPUMap: "ffffffff,ffffffff\n"},
+	} {
+		t.Run(fmt.Sprintf("%d cores", tc.cores), func(t *testing.T) {
+			previous := runtime.GOMAXPROCS(tc.cores)
+			defer runtime.GOMAXPROCS(previous)
+
+			s := newTestSystemWithInternalData(t, &sys.InternalData{EnableNUMATopology: true})
+			defer s.Destroy()
+			for p, want := range map[string]string{
+				"/devices/system/node/node0/cpulist": tc.wantCPUList,
+				"/devices/system/node/node0/cpumap":  tc.wantCPUMap,
+			} {
+				got, err := readTestFile(s, p)
+				if err != nil {
+					t.Fatalf("reading %q: %v", p, err)
+				}
+				if got != want {
+					t.Errorf("%q contains %q, want %q", p, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestNUMATopologyDisabled(t *testing.T) {
+	s := newTestSystemWithInternalData(t, &sys.InternalData{})
+	defer s.Destroy()
+
+	if _, err := s.VFS.StatAt(s.Ctx, s.Creds, s.PathOpAtRoot("/devices/system/node"), &vfs.StatOptions{Mask: linux.STATX_TYPE}); !linuxerr.Equals(linuxerr.ENOENT, err) {
+		t.Fatalf("StatAt(/devices/system/node) returned %v, want ENOENT", err)
 	}
 }
 
@@ -506,6 +732,7 @@ func newRDMATestSnapshot() *rdma.Snapshot {
 					StaticAttrs:  map[string]string{"link_layer": "Ethernet\n"},
 					LiveAttrs:    []string{"state"},
 					GIDNames:     []string{"0", "1"},
+					PKeyNames:    []string{"0"},
 					CounterNames: []string{"port_rcv_data"},
 				},
 			},
@@ -516,9 +743,13 @@ func newRDMATestSnapshot() *rdma.Snapshot {
 			}},
 		}},
 		NUMA: &rdma.NUMA{
-			// Two-node host (aggregate ranges "0-1"): the sandbox must
+			// Two CPU nodes and a memory-only node: the sandbox must
 			// advertise a single node covering the sandbox's CPUs.
-			Aggregate: map[string]string{"online": "0-1\n", "possible": "0-1\n"},
+			Aggregate: map[string]string{
+				"online":   "0-2\n",
+				"possible": "0-2\n",
+				"has_cpu":  "0-1\n",
+			},
 		},
 	}
 }
@@ -534,7 +765,10 @@ func readTestFile(s *testutil.System, p string) (string, error) {
 }
 
 func TestRDMASysfs(t *testing.T) {
-	s := newTestSystemWithInternalData(t, &sys.InternalData{RDMASysfs: newRDMATestSnapshot()})
+	s := newTestSystemWithInternalData(t, &sys.InternalData{
+		EnableNUMATopology: true,
+		RDMASysfs:          newRDMATestSnapshot(),
+	})
 	defer s.Destroy()
 
 	const nicLeaf = "/devices/pci0000:07/0000:07:01.0/0000:0c:00.0"
@@ -572,11 +806,15 @@ func TestRDMASysfs(t *testing.T) {
 			"state":      linux.DT_REG,
 			"gids":       linux.DT_DIR,
 			"gid_attrs":  linux.DT_DIR,
+			"pkeys":      linux.DT_DIR,
 			"counters":   linux.DT_DIR,
 		},
 		nicLeaf + "/infiniband/mlx5_0/ports/1/gids": {
 			"0": linux.DT_REG,
 			"1": linux.DT_REG,
+		},
+		nicLeaf + "/infiniband/mlx5_0/ports/1/pkeys": {
+			"0": linux.DT_REG,
 		},
 		nicLeaf + "/infiniband_verbs/uverbs0": {
 			"ibdev":       linux.DT_REG,
@@ -609,8 +847,15 @@ func TestRDMASysfs(t *testing.T) {
 		},
 		"/bus/pci/drivers":           {"mlx5_core": linux.DT_DIR},
 		"/bus/pci/drivers/mlx5_core": {"0000:0c:00.0": linux.DT_LNK},
-		// The two host nodes collapse into a single sandbox node.
-		"/devices/system/node": {"online": linux.DT_REG, "possible": linux.DT_REG, "node0": linux.DT_DIR},
+		// The virtual NUMA topology coexists with the RDMA sysfs tree.
+		"/devices/system/node": {
+			"online":            linux.DT_REG,
+			"possible":          linux.DT_REG,
+			"has_cpu":           linux.DT_REG,
+			"has_memory":        linux.DT_REG,
+			"has_normal_memory": linux.DT_REG,
+			"node0":             linux.DT_DIR,
+		},
 		"/devices/system/node/node0": {
 			"cpumap":   linux.DT_REG,
 			"cpulist":  linux.DT_REG,
@@ -622,9 +867,15 @@ func TestRDMASysfs(t *testing.T) {
 	}
 
 	// The advertised NUMA view is a single node covering the sandbox's CPUs.
-	wantCPUList := "0\n"
+	// The NIC, on the second of two host nodes with CPUs, is local to the
+	// second half of them.
+	wantCPUList, wantNICCPUList := "0\n", "0\n"
 	if cores := kernel.KernelFromContext(s.Ctx).ApplicationCores(); cores > 1 {
 		wantCPUList = fmt.Sprintf("0-%d\n", cores-1)
+		wantNICCPUList = fmt.Sprintf("%d-%d\n", cores/2, cores-1)
+		if cores == 2 {
+			wantNICCPUList = "1\n"
+		}
 	}
 
 	// Attribute contents, including via a /sys/class symlink (the path
@@ -638,7 +889,7 @@ func TestRDMASysfs(t *testing.T) {
 		"/devices/system/node/node0/cpulist":                   wantCPUList,
 		"/devices/system/node/node0/distance":                  "10\n",
 		nicLeaf + "/numa_node":                                 "0\n",
-		nicLeaf + "/local_cpulist":                             wantCPUList,
+		nicLeaf + "/local_cpulist":                             wantNICCPUList,
 		"/devices/pci10000:e0/10000:e0:06.0/numa_node":         "-1\n",
 		// Raw PCI config space is mirrored byte-faithfully.
 		"/devices/pci0000:07/0000:07:01.0/config": string(rdmaTestPCIConfig),

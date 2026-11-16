@@ -35,6 +35,11 @@ func isWhiteout(stat *linux.Statx) bool {
 	return stat.Mode&linux.S_IFMT == linux.S_IFCHR && stat.RdevMajor == 0 && stat.RdevMinor == 0
 }
 
+// DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
+func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
+	return linuxerr.EOPNOTSUPP
+}
+
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	if fs.opts.UpperRoot.Ok() {
@@ -79,7 +84,8 @@ func putDentrySlice(ds *[]*dentry) {
 //
 // +checklocksreleaseread:fs.renameMu
 func (fs *filesystem) renameMuRUnlockAndCheckDrop(ctx context.Context, dsp **[]*dentry) {
-	fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRUnlock(idx)
 	if *dsp == nil {
 		return
 	}
@@ -94,25 +100,26 @@ func (fs *filesystem) renameMuRUnlockAndCheckDrop(ctx context.Context, dsp **[]*
 		}
 	}
 	if checkAny {
-		fs.renameMu.Lock()
+		fs.renameMu.NestedLock(idx)
 		for _, d := range ds {
 			d.checkDropLocked(ctx)
 		}
-		fs.renameMu.Unlock()
+		fs.renameMu.NestedUnlock(idx)
 	}
 	putDentrySlice(*dsp)
 }
 
 // +checklocksrelease:fs.renameMu
 func (fs *filesystem) renameMuUnlockAndCheckDrop(ctx context.Context, ds **[]*dentry) {
+	idx := fs.renameLockIndex()
 	if *ds == nil {
-		fs.renameMu.Unlock()
+		fs.renameMu.NestedUnlock(idx)
 		return
 	}
 	for _, d := range **ds {
 		d.checkDropLocked(ctx)
 	}
-	fs.renameMu.Unlock()
+	fs.renameMu.NestedUnlock(idx)
 	putDentrySlice(*ds)
 }
 
@@ -455,10 +462,11 @@ func (ll lookupLayer) existsInOverlay() bool {
 //   - fs.renameMu must be locked.
 //   - !rp.Done().
 func (fs *filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, error) {
+	dirIdx := d.dirLockIndex(dirLockD1)
 	for !rp.Final() {
-		d.dirMu.Lock()
+		d.dirMu.NestedLock(dirIdx)
 		next, _, _, err := fs.stepLocked(ctx, rp, d, ds)
-		d.dirMu.Unlock()
+		d.dirMu.NestedUnlock(dirIdx)
 		if err != nil {
 			return nil, err
 		}
@@ -475,10 +483,11 @@ func (fs *filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.Resolving
 // Preconditions: fs.renameMu must be locked.
 func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath, ds **[]*dentry) (*dentry, error) {
 	d := rp.Start().Impl().(*dentry)
+	dirIdx := d.dirLockIndex(dirLockD1)
 	for !rp.Done() {
-		d.dirMu.Lock()
+		d.dirMu.NestedLock(dirIdx)
 		next, _, _, err := fs.stepLocked(ctx, rp, d, ds)
-		d.dirMu.Unlock()
+		d.dirMu.NestedUnlock(dirIdx)
 		if err != nil {
 			return nil, err
 		}
@@ -506,7 +515,7 @@ const (
 //   - For the final path component in rp, !rp.ShouldFollowSymlink().
 func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct createType, create func(parent *dentry, name string, haveUpperWhiteout bool, ds **[]*dentry) error) error {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	parent, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
@@ -528,8 +537,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 		return err
 	}
 
-	parent.dirMu.Lock()
-	defer parent.dirMu.Unlock()
+	dirIdx := parent.dirLockIndex(dirLockD1)
+	parent.dirMu.NestedLock(dirIdx)
+	defer parent.dirMu.NestedUnlock(dirIdx)
 
 	// Determine if a file already exists at name.
 	if _, ok := parent.children[name]; ok {
@@ -597,7 +607,7 @@ func (fs *filesystem) cleanupRecreateWhiteout(ctx context.Context, vfsObj *vfs.V
 // AccessAt implements vfs.Filesystem.Impl.AccessAt.
 func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -625,7 +635,7 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 // BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
 func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -644,7 +654,7 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
 func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetDentryOptions) (*vfs.Dentry, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -665,7 +675,7 @@ func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, op
 // GetParentDentryAt implements vfs.FilesystemImpl.GetParentDentryAt.
 func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPath) (*vfs.Dentry, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	d, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
@@ -813,7 +823,7 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	mustCreate := opts.Flags&(linux.O_CREAT|linux.O_EXCL) == (linux.O_CREAT | linux.O_EXCL)
 
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	unlocked := false
 	unlock := func() {
 		if !unlocked {
@@ -830,6 +840,11 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		}
 		if mustCreate {
 			return nil, linuxerr.EEXIST
+		}
+		// The start is a file if the path ends at the root of a file bind
+		// mount or at a magic link to a file.
+		if rp.MustBeDir() && !start.isDir() {
+			return nil, linuxerr.ENOTDIR
 		}
 		// ensureOpenableLocked may release renameMu, so pin the dentry first.
 		start.IncRef()
@@ -856,10 +871,11 @@ afterTrailingSymlink:
 		return nil, linuxerr.EISDIR
 	}
 	// Determine whether or not we need to create a file.
-	parent.dirMu.Lock()
+	dirIdx := parent.dirLockIndex(dirLockD1)
+	parent.dirMu.NestedLock(dirIdx)
 	child, topLookupLayer, followedSymlink, err := fs.stepLocked(ctx, rp, parent, &ds)
 	if followedSymlink {
-		parent.dirMu.Unlock()
+		parent.dirMu.NestedUnlock(dirIdx)
 		if mustCreate {
 			// EEXIST must be returned if an existing symlink is opened with O_EXCL.
 			return nil, linuxerr.EEXIST
@@ -874,10 +890,10 @@ afterTrailingSymlink:
 	}
 	if linuxerr.Equals(linuxerr.ENOENT, err) && mayCreate {
 		fd, err := fs.createAndOpenLocked(ctx, rp, parent, &opts, &ds, topLookupLayer == lookupLayerUpperWhiteout)
-		parent.dirMu.Unlock()
+		parent.dirMu.NestedUnlock(dirIdx)
 		return fd, err
 	}
-	parent.dirMu.Unlock()
+	parent.dirMu.NestedUnlock(dirIdx)
 	if err != nil {
 		return nil, err
 	}
@@ -1078,7 +1094,7 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 // ReadlinkAt implements vfs.FilesystemImpl.ReadlinkAt.
 func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (string, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -1095,7 +1111,7 @@ func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (st
 func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldParentVD vfs.VirtualDentry, oldName string, opts vfs.RenameOptions) error {
 	// Resolve newParent first to verify that it's on this Mount.
 	var ds *[]*dentry
-	fs.renameMu.Lock()
+	fs.renameMu.NestedLock(fs.renameLockIndex())
 	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
 	// could result in this filesystem being released which acquires fs.mu.
 	var toDecRef []refs.RefCounter
@@ -1147,8 +1163,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	// We need a dentry representing the renamed file since, if it's a
 	// directory, we need to check for write permission on it.
-	oldParent.dirMu.Lock()
-	defer oldParent.dirMu.Unlock()
+	oldDirIdx := oldParent.dirLockIndex(dirLockD1)
+	oldParent.dirMu.NestedLock(oldDirIdx)
+	defer oldParent.dirMu.NestedUnlock(oldDirIdx)
 	renamed, _, err := fs.getChildLocked(ctx, oldParent, oldName, &ds)
 	if err != nil {
 		return err
@@ -1175,8 +1192,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
 			return err
 		}
-		newParent.dirMu.NestedLock(dirLockNew)
-		defer newParent.dirMu.NestedUnlock(dirLockNew)
+		newDirIdx := newParent.dirLockIndex(dirLockD1New)
+		newParent.dirMu.NestedLock(newDirIdx)
+		defer newParent.dirMu.NestedUnlock(newDirIdx)
 	}
 	if oldParent.vfsd.IsDead() || newParent.vfsd.IsDead() {
 		return linuxerr.ENOENT
@@ -1225,8 +1243,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			if genericIsAncestorDentry(fs, replaced, renamed) {
 				return linuxerr.ENOTEMPTY
 			}
-			replaced.dirMu.NestedLock(dirLockReplaced)
-			defer replaced.dirMu.NestedUnlock(dirLockReplaced)
+			replacedDirIdx := replaced.dirLockIndex(dirLockD1Replaced)
+			replaced.dirMu.NestedLock(replacedDirIdx)
+			defer replaced.dirMu.NestedUnlock(replacedDirIdx)
 			whiteouts, err = replaced.collectWhiteoutsForRmdirLocked(ctx)
 			if err != nil {
 				return err
@@ -1269,9 +1288,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			return err
 		}
 		if replaced.isDir() {
-			replaced.dirMu.NestedLock(dirLockReplaced)
+			replacedDirIdx := replaced.dirLockIndex(dirLockD1Replaced)
+			replaced.dirMu.NestedLock(replacedDirIdx)
 			err := replaced.copyUpDescendantsLocked(ctx, &ds)
-			replaced.dirMu.NestedUnlock(dirLockReplaced)
+			replaced.dirMu.NestedUnlock(replacedDirIdx)
 			if err != nil {
 				return err
 			}
@@ -1358,7 +1378,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		Start: oldParent.upperVD,
 		Path:  fspath.Parse(oldName),
 	}
-	if err := vfsObj.RenameAt(ctx, creds, &oldpop, &newpop, &opts); err != nil {
+	// Caller permissions were checked above. Like Linux's ovl_rename(), use
+	// fs.creds here so hidden upper objects (e.g. whiteouts) aren't checked.
+	if err := vfsObj.RenameAt(ctx, fs.creds, &oldpop, &newpop, &opts); err != nil {
 		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 		cleanupRecreateWhiteouts()
 		return err
@@ -1457,7 +1479,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 // RmdirAt implements vfs.FilesystemImpl.RmdirAt.
 func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
 	// could result in this filesystem being released which acquires fs.mu.
 	var toDecRef []refs.RefCounter
@@ -1489,8 +1511,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
-	parent.dirMu.Lock()
-	defer parent.dirMu.Unlock()
+	parentDirIdx := parent.dirLockIndex(dirLockD1)
+	parent.dirMu.NestedLock(parentDirIdx)
+	defer parent.dirMu.NestedUnlock(parentDirIdx)
 
 	// Ensure that parent is copied-up before potentially holding child.copyMu
 	// below.
@@ -1510,8 +1533,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
 		return err
 	}
-	child.dirMu.NestedLock(dirLockChild)
-	defer child.dirMu.NestedUnlock(dirLockChild)
+	childDirIdx := child.dirLockIndex(dirLockD1Child)
+	child.dirMu.NestedLock(childDirIdx)
+	defer child.dirMu.NestedUnlock(childDirIdx)
 	whiteouts, err := child.collectWhiteoutsForRmdirLocked(ctx)
 	if err != nil {
 		return err
@@ -1608,7 +1632,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 // SetStatAt implements vfs.FilesystemImpl.SetStatAt.
 func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
@@ -1669,12 +1693,31 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 	// Changes to d's attributes are serialized by d.copyMu.
 	d.copyMu.Lock()
 	defer d.copyMu.Unlock()
-	if err := d.fs.vfsfs.VirtualFilesystem().SetStatAt(ctx, d.fs.creds, &vfs.PathOperation{
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	upperPop := vfs.PathOperation{
 		Root:  d.upperVD,
 		Start: d.upperVD,
-	}, &opts); err != nil {
+	}
+	if err := vfsObj.SetStatAt(ctx, d.fs.creds, &upperPop, &opts); err != nil {
 		return err
 	}
+
+	// Changing owners or truncating may clear one or both of the setuid and
+	// setgid bits, so we may have to update opts before setting d.mode.
+	hadSetid := d.mode.Load()&(linux.S_ISUID|linux.S_ISGID) != 0
+	setsMode := opts.Stat.Mask&linux.STATX_MODE != 0
+	mayClearSetid := opts.Stat.Mask&(linux.STATX_UID|linux.STATX_GID|linux.STATX_SIZE) != 0
+	if (hadSetid || setsMode) && mayClearSetid {
+		stat, err := vfsObj.StatAt(ctx, d.fs.creds, &upperPop, &vfs.StatOptions{
+			Mask: linux.STATX_MODE,
+		})
+		if err != nil {
+			return err
+		}
+		opts.Stat.Mode = stat.Mode
+		opts.Stat.Mask |= linux.STATX_MODE
+	}
+
 	d.updateAfterSetStatLocked(&opts)
 	return nil
 }
@@ -1686,7 +1729,7 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		d = rp.Start().Impl().(*dentry)
 	} else {
 		var ds *[]*dentry
-		fs.renameMu.RLock()
+		fs.renameMu.NestedRLock(fs.renameLockIndex())
 		defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 		var err error
 		d, err = fs.resolveLocked(ctx, rp, &ds)
@@ -1722,7 +1765,7 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 // StatFSAt implements vfs.FilesystemImpl.StatFSAt.
 func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	_, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -1759,7 +1802,7 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 // UnlinkAt implements vfs.FilesystemImpl.UnlinkAt.
 func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	// We need to DecRef outside of fs.renameMu because forgetting a dead
 	// mountpoint could result in this filesystem being released which acquires
 	// fs.renameMu.
@@ -1789,8 +1832,9 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
-	parent.dirMu.Lock()
-	defer parent.dirMu.Unlock()
+	dirIdx := parent.dirLockIndex(dirLockD1)
+	parent.dirMu.NestedLock(dirIdx)
+	defer parent.dirMu.NestedUnlock(dirIdx)
 
 	if rp.MustBeDir() {
 		// The trailing slash makes this fail regardless, but the error depends
@@ -1889,7 +1933,7 @@ func (fs *filesystem) isOverlayXattr(name string) bool {
 // ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
 func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -1921,7 +1965,7 @@ func (fs *filesystem) listXattr(ctx context.Context, d *dentry, size uint64) ([]
 // GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
 func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -1958,7 +2002,7 @@ func (fs *filesystem) getXattr(ctx context.Context, d *dentry, creds *auth.Crede
 // SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
 func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
@@ -2015,7 +2059,7 @@ func (fs *filesystem) setXattrLocked(ctx context.Context, d *dentry, mnt *vfs.Mo
 // RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
 func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
@@ -2068,7 +2112,7 @@ func (fs *filesystem) removeXattrLocked(ctx context.Context, d *dentry, mnt *vfs
 // GetPosixACLAt implements vfs.FilesystemImpl.GetPosixACLAt.
 func (fs *filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType) (*vfs.PosixACL, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
@@ -2091,7 +2135,7 @@ func (fs *filesystem) getPosixACLLocked(ctx context.Context, d *dentry, t vfs.AC
 // SetPosixACLAt implements vfs.FilesystemImpl.SetPosixACLAt.
 func (fs *filesystem) SetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
 	var ds *[]*dentry
-	fs.renameMu.RLock()
+	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {

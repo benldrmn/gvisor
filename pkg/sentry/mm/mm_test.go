@@ -16,8 +16,10 @@ package mm
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
@@ -32,6 +34,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -153,6 +157,51 @@ func TestDataASUpdates(t *testing.T) {
 	realDataAS = mm.realDataAS()
 	if got := mm.VirtualDataSize(); got != realDataAS {
 		t.Fatalf("dataAS believes %v bytes are mapped; %v bytes are actually mapped", got, realDataAS)
+	}
+}
+
+// TestMRemapCopyOntoSource checks mremap(addr, 0, n, MREMAP_MAYMOVE |
+// MREMAP_FIXED, addr): unmapping the destination removes the source vma, so
+// MRemap must fail with EFAULT. Linux returns EFAULT here for shared mappings;
+// for private mappings it returns EINVAL from mm/mremap.c:check_prep_vma().
+func TestMRemapCopyOntoSource(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		oldSize uint64
+	}{
+		{
+			name:    "zero",
+			oldSize: 0,
+		},
+		{
+			// Rounds up to 0, as in Linux.
+			name:    "rounds up to zero",
+			oldSize: 0xfffffffffffff001,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			mm := testMemoryManager(ctx, t)
+			defer mm.DecUsers(ctx)
+
+			addr, err := mm.MMap(ctx, memmap.MMapOpts{
+				Length:   pageSize,
+				Private:  true,
+				Perms:    hostarch.ReadWrite,
+				MaxPerms: hostarch.AnyAccess,
+			})
+			if err != nil {
+				t.Fatalf("MMap got err %v want nil", err)
+			}
+
+			newAddr, err := mm.MRemap(ctx, addr, test.oldSize, pageSize, MRemapOpts{
+				Move:    MRemapMustMove,
+				NewAddr: addr,
+			})
+			if !linuxerr.Equals(linuxerr.EFAULT, err) {
+				t.Errorf("MRemap got (%#x, %v), want (_, EFAULT)", newAddr, err)
+			}
+		})
 	}
 }
 
@@ -1079,4 +1128,258 @@ func TestSealedMapping(t *testing.T) {
 	}
 	defer mm2.DecUsers(ctx)
 	wantError(t, linuxerr.EPERM, "child MUnmap(sealed)", mm2.MUnmap(ctx, sealedAddr, pageSize))
+}
+
+// gatedReaderAt blocks reads past offset from until `gate` is closed.
+type gatedReaderAt struct {
+	io.ReaderAt
+	from int64
+	gate chan struct{}
+}
+
+// ReadAt implements `io.ReaderAt.ReadAt`.
+func (g *gatedReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) > g.from {
+		<-g.gate
+	}
+	return g.ReaderAt.ReadAt(p, off)
+}
+
+func newTestMemoryFile(t *testing.T) *pgalloc.MemoryFile {
+	memfd, err := memutil.CreateMemFD("mm-test-memory", 0)
+	if err != nil {
+		t.Fatalf("CreateMemFD: got err %v, want nil", err)
+	}
+	memfile := os.NewFile(uintptr(memfd), "mm-test-memory")
+	mf, err := pgalloc.NewMemoryFile(memfile, pgalloc.MemoryFileOpts{
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		memfile.Close()
+		t.Fatalf("NewMemoryFile: got err %v, want nil", err)
+	}
+	t.Cleanup(mf.Destroy)
+	return mf
+}
+
+// TestIODuringAsyncPageLoad tests that I/O to part of a pma whose pages are
+// being loaded asynchronously does not wait for the rest of the pma to load.
+func TestIODuringAsyncPageLoad(t *testing.T) {
+	const (
+		size  = 2 * asyncLoadMapUnit
+		gated = asyncLoadMapUnit
+	)
+	ctx := contexttest.Context(t)
+
+	src := newTestMemoryFile(t)
+	fr, err := src.Allocate(size, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate got err %v want nil", err)
+	}
+	if _, err := unix.Pwrite(src.FD(), bytes.Repeat([]byte{1}, size), int64(fr.Start)); err != nil {
+		t.Fatalf("Pwrite got err %v want nil", err)
+	}
+	var metadata, pages bytes.Buffer
+	saveDone := make(chan error, 1)
+	apfs, err := pgalloc.StartAsyncPagesFileSave(stateio.NewIOWriter(&pages, 1<<20, 1, 1), func(err error) { saveDone <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave got err %v want nil", err)
+	}
+	if err := src.SaveTo(ctx, &metadata, &pgalloc.SaveOpts{PagesFile: apfs}); err != nil {
+		t.Fatalf("SaveTo got err %v want nil", err)
+	}
+	apfs.MemoryFilesDone()
+	if err := <-saveDone; err != nil {
+		t.Fatalf("async page save got err %v want nil", err)
+	}
+
+	mf := newTestMemoryFile(t)
+	gate := make(chan struct{})
+	loadDone := make(chan error, 1)
+	apfl, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(&gatedReaderAt{bytes.NewReader(pages.Bytes()), gated, gate}, 1<<20, 1, 2), func(err error) { loadDone <- err }, nil, pgalloc.AsyncPagesFileLoadOpts{})
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad got err %v want nil", err)
+	}
+	if err := mf.LoadFrom(ctx, &metadata, &pgalloc.LoadOpts{PagesFile: apfl}); err != nil {
+		t.Fatalf("LoadFrom got err %v want nil", err)
+	}
+	apfl.MemoryFilesDone()
+
+	// Map the restored pages with a single pma.
+	mm := testMemoryManager(ctx, t)
+	mm.mf = mf // mm has no mappings yet.
+	defer mm.DecUsers(ctx)
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   size,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+	ar := hostarch.AddrRange{addr, addr + size}
+	mm.activeMu.Lock()
+	mm.pmas.Insert(mm.pmas.FindGap(ar.Start), ar, pma{
+		file:           mf,
+		off:            fr.Start,
+		translatePerms: hostarch.AnyAccess,
+		effectivePerms: hostarch.ReadWrite,
+		maxPerms:       hostarch.AnyAccess,
+		private:        true,
+	})
+	mm.addRSSLocked(ar)
+	mm.activeMu.Unlock()
+
+	// I/O to pages past offset gated waits until gate is closed, but should
+	// not block concurrent I/O to other pages.
+	gatedErr := make(chan error, 1)
+	go func() {
+		_, err := mm.CopyIn(ctx, addr+gated+pageSizeAddr, make([]byte, 8), usermem.IOOpts{})
+		gatedErr <- err
+	}()
+	timer := time.AfterFunc(10*time.Second, func() {
+		t.Errorf("CopyIn waited for pages past offset %#x", gated)
+		close(gate)
+	})
+	b := make([]byte, 8)
+	for end := time.Now().Add(100 * time.Millisecond); time.Now().Before(end); {
+		if _, err = mm.CopyIn(ctx, addr+pageSizeAddr, b, usermem.IOOpts{}); err != nil {
+			break
+		}
+	}
+	if timer.Stop() {
+		close(gate)
+	}
+	if err := <-gatedErr; err != nil {
+		t.Errorf("CopyIn past offset %#x got err %v want nil", gated, err)
+	}
+	if err := <-loadDone; err != nil {
+		t.Errorf("async page load got err %v want nil", err)
+	}
+	if err != nil {
+		t.Fatalf("CopyIn got err %v want nil", err)
+	}
+	if want := bytes.Repeat([]byte{1}, len(b)); !bytes.Equal(b, want) {
+		t.Errorf("CopyIn got %v want %v", b, want)
+	}
+}
+
+type bufferedIOFallbackFile struct {
+	*pgalloc.MemoryFile
+}
+
+func (f *bufferedIOFallbackFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	return safemem.BlockSeq{}, memmap.BufferedIOFallbackErr{}
+}
+
+func (f *bufferedIOFallbackFile) BufferReadAt(off uint64, dst []byte) (uint64, error) {
+	ims, err := f.MemoryFile.MapInternal(memmap.FileRange{Start: off, End: off + uint64(len(dst))}, hostarch.Read)
+	if err != nil {
+		return 0, err
+	}
+	return safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(dst)), ims)
+}
+
+func (f *bufferedIOFallbackFile) BufferWriteAt(off uint64, src []byte) (uint64, error) {
+	ims, err := f.MemoryFile.MapInternal(memmap.FileRange{Start: off, End: off + uint64(len(src))}, hostarch.Write)
+	if err != nil {
+		return 0, err
+	}
+	return safemem.CopySeq(ims, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(src)))
+}
+
+type bufferedIOFallbackMappable struct {
+	*SpecialMappable
+	file *bufferedIOFallbackFile
+}
+
+func (m *bufferedIOFallbackMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	ts, err := m.SpecialMappable.Translate(ctx, required, optional, at)
+	for i := range ts {
+		ts[i].File = m.file
+	}
+	return ts, err
+}
+
+// TestEnsurePMAsExistBufferedIOFallback tests that EnsurePMAsExist doesn't
+// modify the contents of a mapping whose memmap.File requires buffered I/O.
+func TestEnsurePMAsExistBufferedIOFallback(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	fr, err := mf.Allocate(pageSize, pgalloc.AllocOpts{})
+	if err != nil {
+		t.Fatalf("failed to allocate memory file range: %v", err)
+	}
+	want := bytes.Repeat([]byte{0xa5}, pageSizeInt)
+	ims, err := mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		t.Fatalf("MapInternal got err %v want nil", err)
+	}
+	if _, err := safemem.CopySeq(ims, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(want))); err != nil {
+		t.Fatalf("failed to fill memory file range: %v", err)
+	}
+
+	mappable := &bufferedIOFallbackMappable{
+		SpecialMappable: NewSpecialMappable("buffered_fallback", mf, fr),
+		file:            &bufferedIOFallbackFile{MemoryFile: mf},
+	}
+	defer mappable.DecRef(ctx)
+
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:          pageSize,
+		MappingIdentity: mappable,
+		Mappable:        mappable,
+		Private:         false,
+		Perms:           hostarch.ReadWrite,
+		MaxPerms:        hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+
+	n, err := mm.EnsurePMAsExist(ctx, addr, int64(pageSize), usermem.IOOpts{})
+	if err != nil || n != int64(pageSize) {
+		t.Fatalf("EnsurePMAsExist(%d) got (%d, %v), want (%d, nil)", pageSize, n, err, pageSize)
+	}
+
+	got := make([]byte, pageSizeInt)
+	ims, err = mf.MapInternal(fr, hostarch.Read)
+	if err != nil {
+		t.Fatalf("MapInternal got err %v want nil", err)
+	}
+	if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), ims); err != nil {
+		t.Fatalf("failed to read memory file range: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("EnsurePMAsExist modified mapped file contents: got %#x..., want %#x...", got[:4], want[:4])
+	}
+}
+
+// TestGetByteSlicePtrZeroed tests that getByteSlicePtr returns zero-filled
+// slices, including when it recycles a slice passed to putByteSlicePtr.
+//
+// sync.Pool doesn't guarantee that Get returns a slice that was just Put (for
+// example, it randomly drops items when the race detector is enabled), so this
+// test may not exercise recycling on every iteration. It never fails spuriously.
+func TestGetByteSlicePtrZeroed(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		dirty := getByteSlicePtr(pageSizeInt)
+		for j := range *dirty {
+			(*dirty)[j] = 0xfe
+		}
+		putByteSlicePtr(dirty)
+
+		s := getByteSlicePtr(pageSizeInt)
+		for j, b := range *s {
+			if b != 0 {
+				putByteSlicePtr(s)
+				t.Fatalf("getByteSlicePtr returned non-zero byte %#x at index %d", b, j)
+			}
+		}
+		putByteSlicePtr(s)
+	}
 }

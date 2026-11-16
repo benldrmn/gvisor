@@ -32,6 +32,21 @@ func (mm *MemoryManager) AddressSpace() platform.AddressSpace {
 	return mm.as
 }
 
+// PrepareForPtrace prepares mm for ptrace access, preserving this state
+// across fork and restore.
+//
+// Preconditions: The caller must hold a user reference on mm.
+func (mm *MemoryManager) PrepareForPtrace(ctx context.Context) error {
+	if err := mm.AddressSpace().PrepareForPtrace(ctx, mm); err != nil {
+		return err
+	}
+
+	mm.activeMu.Lock()
+	mm.syscallPatchingDisabled = true
+	mm.activeMu.Unlock()
+	return nil
+}
+
 // UserModifiedGS notifies the address space that the user has modified the GS
 // register.
 func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
@@ -41,10 +56,16 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 	}
 
 	mm.activeMu.Lock()
-	mm.gsInUse = true
+	mm.syscallPatchingDisabled = true
 	mm.activeMu.Unlock()
 	return nil
 }
+
+// asyncLoadMapUnit bounds the ranges that are mapped at once while async page
+// loading is in progress, in order to avoid calling
+// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal() with
+// unnecessarily large ranges, resulting in unnecessarily long waits.
+const asyncLoadMapUnit = 32 << 20
 
 // mapASLocked maps addresses in ar into mm.as.
 //
@@ -82,11 +103,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		// Impose an arbitrary mapUnit in order to avoid calling
-		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
-		// with unnecessarily large ranges, resulting in unnecessarily long
-		// waits.
-		setMapUnit(32 << 20)
+		setMapUnit(asyncLoadMapUnit)
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {

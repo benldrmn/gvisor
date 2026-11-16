@@ -20,10 +20,12 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
@@ -31,13 +33,35 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
+func TestTarSubsecondMtimeRoundTrip(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mtime := time.Unix(1700000000, 123456789)
+	for _, nanos := range []bool{false, true} {
+		fs := mountFromTarTestOnly(t, ctx, tarWithFile(t, "./file", nil))
+		fs.tarNanosecondTimestamps = nanos
+		fs.root.inode.impl.(*directory).childMap["file"].inode.mtime.Store(mtime.UnixNano())
+		var out bytes.Buffer
+		if err := fs.tarWrite(ctx, &out, tarDefaultWriterCallbacks{}); err != nil {
+			t.Fatalf("tarWrite: %v", err)
+		}
+		want := mtime.Round(time.Second).UnixNano()
+		if nanos {
+			want = mtime.UnixNano()
+		}
+		restored := mountFromTarTestOnly(t, ctx, &out)
+		if got := restored.root.inode.impl.(*directory).childMap["file"].inode.mtime.Load(); got != want {
+			t.Errorf("tarNanosecondTimestamps=%t: mtime = %d, want %d", nanos, got, want)
+		}
+	}
+}
+
 func TestTarXattrRoundTrip(t *testing.T) {
 	want := map[string]string{
 		"user.empty":  "",
 		"user.binary": "\x00\xff\x80\n=",
 		"user.\xff":   "non-UTF8 name",
 	}
-	d := dentry{inode: &inode{impl: &directory{}}}
+	d := dentry{inode: &inode{fs: &filesystem{}, impl: &directory{}}}
 	d.inode.xattrs.SetRawXattrs(want)
 	hdr, err := d.createTarHeader("./", make(map[uint64]string), tarDefaultWriterCallbacks{})
 	if err != nil {
@@ -132,6 +156,26 @@ func mountFromTarTestOnly(t *testing.T, ctx context.Context, src io.Reader) *fil
 	return fs
 }
 
+// newMountFromSourceTarTestOnly mounts a tmpfs with src as its SourceTar and
+// returns the mount namespace or the mount error. Unlike mountFromTarTestOnly,
+// src is passed as is, so GetFilesystem closes it.
+func newMountFromSourceTarTestOnly(ctx context.Context, src io.ReadCloser) (*vfs.MountNamespace, error) {
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		return nil, fmt.Errorf("VFS init: %w", err)
+	}
+	vfsObj.MustRegisterFilesystemType("tmpfs", FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+	})
+	return vfsObj.NewMountNamespace(ctx, auth.CredentialsFromContext(ctx), "", "tmpfs", &vfs.MountOptions{
+		GetFilesystemOptions: vfs.GetFilesystemOptions{
+			InternalData: FilesystemOpts{
+				SourceTar: src,
+			},
+		},
+	}, nil)
+}
+
 // readFileFromTar returns the content of the named regular file in src.
 func readFileFromTar(t *testing.T, src io.Reader, name string) []byte {
 	t.Helper()
@@ -195,6 +239,69 @@ func TestTarRegularFileRoundTrip(t *testing.T) {
 			}
 			if got := readFileFromTar(t, &out, "./file"); !bytes.Equal(got, want) {
 				t.Fatalf("./file content differs after round trip (got %d bytes, want %d)", len(got), len(want))
+			}
+		})
+	}
+}
+
+// tarHeaderHookWriter passes writes through to w, and calls onHeader with the
+// entry name of each ustar header block written to it.
+type tarHeaderHookWriter struct {
+	w        io.Writer
+	onHeader func(name string)
+}
+
+// Write implements io.Writer.Write.
+func (hw *tarHeaderHookWriter) Write(p []byte) (int, error) {
+	// archive/tar.Writer writes each header block with a single Write call.
+	if len(p) == 512 && bytes.HasPrefix(p[257:], []byte("ustar")) {
+		name, _, _ := bytes.Cut(p[:100], []byte{0})
+		hw.onHeader(string(name))
+	}
+	return hw.w.Write(p)
+}
+
+// TestTarRegularFileSizeChange checks that the size of a regular file cannot
+// change between the write of its tar header and the copy of its contents.
+func TestTarRegularFileSizeChange(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		newSize uint64
+	}{
+		{name: "grow", newSize: 3 << 12},
+		{name: "shrink", newSize: 1 << 12},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			want := randomBytes(2 << 12)
+			fs := mountFromTarTestOnly(t, ctx, tarWithFile(t, "./file", want))
+			rf := fs.root.inode.impl.(*directory).childMap["file"].inode.impl.(*regularFile)
+
+			resized := false
+			var out bytes.Buffer
+			dst := &tarHeaderHookWriter{w: &out, onHeader: func(name string) {
+				if name != "./file" {
+					return
+				}
+				// Resize the file as a concurrent write or truncate would. This
+				// is only possible if tarWrite does not hold inode.mu.
+				if !rf.inode.mu.mu.TryLock() {
+					return
+				}
+				defer rf.inode.mu.mu.Unlock()
+				if err := rf.truncateNoTimeUpdateLocked(tc.newSize); err != nil {
+					t.Errorf("truncateNoTimeUpdateLocked(%d): %v", tc.newSize, err)
+				}
+				resized = true
+			}}
+			if err := fs.tarWrite(ctx, dst, tarDefaultWriterCallbacks{}); err != nil {
+				t.Fatalf("tarWrite: %v", err)
+			}
+			if resized {
+				t.Errorf("./file was resized after its tar header was written")
+			}
+			if got := readFileFromTar(t, &out, "./file"); !bytes.Equal(got, want) {
+				t.Errorf("./file content differs after round trip (got %d bytes, want %d)", len(got), len(want))
 			}
 		})
 	}
@@ -275,5 +382,90 @@ func TestFSCheckpointRestoreSizeLimit(t *testing.T) {
 		},
 	}, nil); err == nil {
 		t.Fatalf("NewMountNamespace succeeded, want error")
+	}
+}
+
+// TestSourceTarDiscardsTrailingData checks that a restore reads the data after
+// the end-of-archive marker, which tar writers use for record padding.
+func TestSourceTarDiscardsTrailingData(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tail []byte
+	}{
+		{name: "none"},
+		{name: "zero_padding", tail: make([]byte, 128<<10)},
+		{name: "non_zero_data", tail: bytes.Repeat([]byte{0xff}, 128<<10)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			want := []byte("restored")
+			archive := tarWithFile(t, "./f", want)
+			src := bytes.NewReader(append(archive.Bytes(), tc.tail...))
+			fs := mountFromTarTestOnly(t, ctx, src)
+			if n := src.Len(); n != 0 {
+				t.Errorf("SourceTar has %d unread bytes after restore, want 0", n)
+			}
+
+			var out bytes.Buffer
+			if err := fs.tarWrite(ctx, &out, tarDefaultWriterCallbacks{}); err != nil {
+				t.Fatalf("tarWrite: %v", err)
+			}
+			if got := readFileFromTar(t, &out, "./f"); !bytes.Equal(got, want) {
+				t.Errorf("./f content = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestSourceTarPipeWriterSucceeds checks that a writer streaming an archive
+// with trailing data through a pipe finishes without EPIPE. The tail is larger
+// than the pipe buffer, so the write is still in progress when the restore
+// reaches the end-of-archive marker.
+func TestSourceTarPipeWriterSucceeds(t *testing.T) {
+	ctx := contexttest.Context(t)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	data := append(tarWithFile(t, "./f", []byte("restored")).Bytes(), make([]byte, 256<<10)...)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := w.Write(data)
+		if closeErr := w.Close(); err == nil {
+			err = closeErr
+		}
+		writeErr <- err
+	}()
+
+	mntns, err := newMountFromSourceTarTestOnly(ctx, r)
+	if err != nil {
+		t.Fatalf("NewMountNamespace: %v", err)
+	}
+	mntns.DecRef(ctx)
+	if err := <-writeErr; err != nil {
+		t.Errorf("writing the archive to the pipe: %v, want nil", err)
+	}
+}
+
+// TestSourceTarRestoreFailureSkipsTrailingData checks that a restore that fails
+// after reading the whole archive doesn't read the data after it, so a pipe
+// writer still sees the failure as EPIPE.
+func TestSourceTarRestoreFailureSkipsTrailingData(t *testing.T) {
+	ctx := contexttest.Context(t)
+	// The hard link target is missing, so readFromTar fails after it reads the
+	// end-of-archive marker.
+	archive := tarWithEntries(t, []*tar.Header{{
+		Name:     "./link",
+		Typeflag: tar.TypeLink,
+		Linkname: "./missing",
+		Mode:     0644,
+	}}, [][]byte{nil})
+	const tailLen = 128 << 10
+	src := bytes.NewReader(append(archive.Bytes(), make([]byte, tailLen)...))
+	if _, err := newMountFromSourceTarTestOnly(ctx, io.NopCloser(src)); err == nil {
+		t.Fatalf("NewMountNamespace succeeded, want error")
+	}
+	if n := src.Len(); n != tailLen {
+		t.Errorf("SourceTar has %d unread bytes after the failed restore, want %d", n, tailLen)
 	}
 }

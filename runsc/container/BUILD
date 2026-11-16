@@ -9,6 +9,7 @@ go_library(
     name = "container",
     srcs = [
         "container.go",
+        "devices.go",
         "gofer_to_host_rpc.go",
         "null_netns.go",
         "state_file.go",
@@ -20,10 +21,12 @@ go_library(
     ],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/abi/nvgpu",
         "//pkg/cleanup",
         "//pkg/log",
         "//pkg/sentry/control/controlapi",
         "//pkg/sentry/hostmm",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sighandling",
         "//pkg/sync",
         "//pkg/unet",
@@ -50,6 +53,8 @@ go_test(
         "console_test.go",
         "container_save_restore_test.go",
         "container_test.go",
+        "devices_test.go",
+        "fscheckpoint_cordon_test.go",
         "metric_server_test.go",
         "multi_container_save_restore_test.go",
         "multi_container_test.go",
@@ -116,11 +121,90 @@ go_test(
 )
 
 go_test(
+    name = "destroy_test",
+    srcs = ["destroy_test.go"],
+    embed = [":container"],
+    deps = [
+        "//runsc/boot/sentryapi",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
+)
+
+go_test(
+    name = "fscheckpoint_compat_test",
+    size = "large",
+    srcs = [
+        "container_test.go",
+        "fscheckpoint_compat_test.go",
+        "multi_container_test.go",
+    ],
+    args = [
+        "--test_platforms=%s" % default_platform,
+    ],
+    data = [
+        "//:release",
+        "//test/cmd/test_app",
+    ],
+    embed = [":container"],
+    tags = [
+        "manual",
+        "notap",
+        "requires-kvm",
+    ],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/cleanup",
+        "//pkg/hostos",
+        "//pkg/log",
+        "//pkg/sentry/control/controlapi",
+        "//pkg/sentry/fscheckpoint",
+        "//pkg/sentry/fscheckpoint:fscheckpoint_proto_go_proto",
+        "//pkg/sentry/fsimpl/erofs",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/platform/platformdesc",
+        "//pkg/sentry/state/checkpointfiles",
+        "//pkg/state/statefile",
+        "//pkg/sync",
+        "//pkg/test/testutil",
+        "//runsc/boot/sentryapi",
+        "//runsc/cgroup",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/sandbox",
+        "//runsc/specutils",
+        "@com_github_cenkalti_backoff//:go_default_library",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_google_protobuf//proto:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "gofer_env_test",
+    srcs = ["gofer_env_test.go"],
+    embed = [":container"],
+    deps = ["//runsc/config"],
+)
+
+go_test(
+    name = "gofer_maxprocs_test",
+    srcs = ["gofer_maxprocs_test.go"],
+    embed = [":container"],
+    deps = [
+        "//runsc/cgroup",
+        "//runsc/sandbox",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
+)
+
+go_test(
     name = "modify_test",
     srcs = ["modify_test.go"],
     embed = [":container"],
     deps = [
         "//runsc/sandbox",
+        "//runsc/specutils",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
 )
@@ -138,7 +222,10 @@ go_test(
 go_test(
     name = "lifecycle_benchmark_test",
     size = "large",
-    srcs = ["lifecycle_bench_test.go"],
+    srcs = [
+        "cli_bench_test.go",
+        "lifecycle_bench_test.go",
+    ],
     args = [
         "-test.bench=.",
         "-test.run=^$$",
@@ -163,5 +250,73 @@ go_test(
         "//runsc/flag",
         "//runsc/specutils",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+# Functional test for --boot-times-log.
+go_test(
+    name = "boot_test",
+    size = "medium",
+    srcs = [
+        "boot_bench_test.go",
+        "boot_test.go",
+    ],
+    # Only run the default platform for the tsan test, which should
+    # be compatible. For non-tsan builds, run all platforms.
+    args = select({
+        "//conditions:default": [
+            "--test_platforms=%s" % ",".join([p for (p, tags) in platforms.items() if "manual" not in tags]) or default_platform,
+        ],
+        "//tools:gotsan": [
+            "--test_platforms=%s" % default_platform,
+        ],
+    }),
+    data = [
+        "//:release",
+        "//test/cmd/test_app",
+    ],
+    embed = [":container"],
+    tags = ["requires-kvm"],
+    deps = [
+        "//pkg/log",
+        "//pkg/test/testutil",
+        "//pkg/timing",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
+)
+
+# Raw sandbox boot benchmarks.
+go_test(
+    name = "boot_benchmark_test",
+    size = "large",
+    srcs = ["boot_bench_test.go"],
+    args = [
+        "-test.bench=.",
+        "-test.run=^$$",
+        "-test.benchtime=30x",  # A fixed iteration count.
+        "-test.v",
+        "--test_platforms=kvm,systrap",
+    ],
+    data = [
+        "//:release",
+        "//test/cmd/test_app",
+    ],
+    embed = [":container"],
+    tags = [
+        "manual",
+        "notap",
+        "requires-kvm",
+    ],
+    deps = [
+        "//pkg/log",
+        "//pkg/test/testutil",
+        "//pkg/timing",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
 )

@@ -69,6 +69,73 @@ image_outputs(
     image_name = "basic/fsstress",
 )
 
+image_manifest(
+    name = "nginx",
+    base = "@test_nginx",
+    tags = ["manual"],
+)
+
+image_outputs(
+    name = "nginx",
+    image = ":nginx",
+    image_name = "basic/nginx",
+)
+
+image_manifest(
+    name = "python",
+    base = "@test_python",
+    entrypoint = [
+        "python",
+        "-m",
+        "http.server",
+        "8080",
+    ],
+    tags = ["manual"],
+)
+
+image_outputs(
+    name = "python",
+    image = ":python",
+    image_name = "basic/python",
+)
+
+image_manifest(
+    name = "redis",
+    base = "@test_redis",
+    tags = ["manual"],
+)
+
+image_outputs(
+    name = "redis",
+    image = ":redis",
+    image_name = "basic/redis",
+)
+
+image_outputs(
+    name = "benchmark_redis",
+    image = ":redis",
+    image_name = "benchmarks/redis",
+)
+
+# Exercise containerd's resolver mounts through a symlink in the image.
+image_layer(
+    name = "symlink_resolv_layer",
+    symlinks = {"/etc/resolv.conf": "../tmp/resolv.conf"},
+)
+
+image_manifest(
+    name = "symlink_resolv",
+    base = "@test_busybox",
+    layers = [":symlink_resolv_layer"],
+    tags = ["manual"],
+)
+
+image_outputs(
+    name = "symlink_resolv",
+    image = ":symlink_resolv",
+    image_name = "basic/symlink-resolv",
+)
+
 # The integration test checks that mounting /tmp preserves image contents.
 image_layer(
     name = "tmpfile_layer",

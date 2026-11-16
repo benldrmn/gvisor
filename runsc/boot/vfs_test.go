@@ -20,6 +20,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 )
@@ -100,6 +101,56 @@ func TestGetMountAccessType(t *testing.T) {
 	}
 }
 
+func TestNUMATopologyBootGate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec *specs.Spec
+		conf *config.Config
+		want bool
+	}{
+		{
+			name: "disabled",
+			spec: &specs.Spec{},
+			conf: &config.Config{},
+		},
+		{
+			name: "NVIDIA device",
+			spec: &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{{Path: "/dev/nvidiactl"}}}},
+			conf: &config.Config{},
+			want: true,
+		},
+		{
+			name: "RDMA enabled",
+			spec: &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{{Path: "/dev/infiniband/uverbs0"}}}},
+			conf: &config.Config{RDMAProxy: true},
+			want: true,
+		},
+		{
+			name: "RDMA proxy without device",
+			spec: &specs.Spec{},
+			conf: &config.Config{RDMAProxy: true},
+		},
+		{
+			name: "NVProxy enabled",
+			spec: &specs.Spec{},
+			conf: &config.Config{NVProxy: true},
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mountInfo{mount: &specs.Mount{Type: sys.Name}}
+			_, opts, err := getMountNameAndOptions(tc.spec, tc.conf, m, "", "", "", nil, nil)
+			if err != nil {
+				t.Fatalf("getMountNameAndOptions failed: %v", err)
+			}
+			got := opts.GetFilesystemOptions.InternalData.(*sys.InternalData).EnableNUMATopology
+			if got != tc.want {
+				t.Errorf("EnableNUMATopology = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestGoferMountDataDirectFS(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
@@ -138,6 +189,16 @@ func TestGoferMountDataDirectFS(t *testing.T) {
 				t.Errorf("directfs option present = %t, want %t (opts=%v)", gotEnabled, tc.wantEnabled, opts)
 			}
 		})
+	}
+}
+
+func TestGoferMountDataInodeNumbers(t *testing.T) {
+	for _, mode := range []config.InodeNumbers{config.InodeNumbersPassthrough, config.InodeNumbersVirtual} {
+		conf := &config.Config{InodeNumbers: mode}
+		opts := goferMountData(7, config.FileAccessExclusive, conf, false /* suppressDirectFS */)
+		if got, want := slices.Contains(opts, "virtual_inode_numbers"), mode == config.InodeNumbersVirtual; got != want {
+			t.Errorf("--inode-numbers=%v: virtual_inode_numbers option present = %t, want %t (opts=%v)", mode, got, want, opts)
+		}
 	}
 }
 

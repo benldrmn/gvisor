@@ -207,12 +207,15 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "pagesize_amd64_test.go",
+        "pagesize_arm64_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "save_restore_test.go",
     ],
     embed = [":pgalloc"],
     deps = [
+        "//pkg/errors/linuxerr",
         "//pkg/hostarch",
         "//pkg/memutil",
         "//pkg/sentry/memmap",

@@ -25,15 +25,18 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 const (
@@ -60,10 +63,12 @@ type InternalData struct {
 	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
 	// accelerators.
 	EnableTPUProxyPaths bool
+	// EnableNUMATopology exposes one virtual NUMA node containing every
+	// application CPU.
+	EnableNUMATopology bool
 	// RDMASysfs, when non-nil, is the host sysfs snapshot from which the
 	// RDMA device topology (/sys/devices/pci..., /sys/class/infiniband*,
-	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices,
-	// /sys/devices/system/node) is constructed.
+	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices) is constructed.
 	RDMASysfs *rdma.Snapshot
 	// TestSysfsPathPrefix is a prefix for the sysfs paths. It is useful for
 	// unit testing.
@@ -78,6 +83,7 @@ type filesystem struct {
 
 	devMinor            uint32
 	enableTPUProxyPaths bool
+	enableNUMATopology  bool
 	testSysfsPathPrefix string
 	// productName is the value of devices/virtual/dmi/id/product_name. If
 	// empty, the DMI directories are not created.
@@ -210,9 +216,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			for name, sub := range rdmaDirs.busPCIDrivers {
 				pciDrivers[name] = sub
 			}
-			if rdmaDirs.node != nil {
-				systemSub["node"] = rdmaDirs.node
-			}
+		}
+		fs.enableNUMATopology = idata.EnableNUMATopology
+		if fs.enableNUMATopology {
+			systemSub["node"] = fs.buildNUMATopology(ctx, creds, k.ApplicationCores())
 		}
 	}
 	if len(pciDevices) > 0 || len(pciDrivers) > 0 {
@@ -268,89 +275,98 @@ func (fs *filesystem) addDMIDirs(ctx context.Context, creds *auth.Credentials, c
 	})
 }
 
+// cpuDir returns the inode for /sys/devices/system/cpu.
 func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
-	k := kernel.KernelFromContext(ctx)
-	maxCPUCores := k.ApplicationCores()
-	children := map[string]kernfs.Inode{
-		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
-		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
-		"present":  fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
-	}
-	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
-	// socket and each CPU is a distinct core.
-	fullMask := fullCPUMask(maxCPUCores) + "\n"
-	for i := uint(0); i < maxCPUCores; i++ {
-		oneMask := oneCPUMask(i, maxCPUCores) + "\n"
-		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"topology": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"core_cpus":       fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
-				"core_siblings":   fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
-				"package_cpus":    fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
-				"thread_siblings": fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
-			}),
-		})
-	}
-	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+	cores := kernel.KernelFromContext(ctx).ApplicationCores()
+	return fs.newLazyCPURootDir(ctx, creds, cores)
 }
 
-// fullCPUMask returns a "hex format ASCII string", consistent with Linux's
-// include/linux/cpumask.h:cpumap_print_to_pagebuf(list=false) =>
-// lib/bitmap.c:bitmap_print_to_pagebuf(list=false), representing a CPU bitmask
-// in which all `cores` CPUs are set.
+// fullCPUMask returns the cpuMask in which all `cores` CPUs are set.
 func fullCPUMask(cores uint) string {
-	var (
-		b   strings.Builder
-		sep string
-	)
-	if rem := cores % 32; rem != 0 {
-		cores -= rem
-		fmt.Fprintf(&b, "%x", (uint32(1)<<rem)-1)
-		sep = ","
-	}
-	for cores != 0 {
-		cores -= 32
-		fmt.Fprintf(&b, "%sffffffff", sep)
-		sep = ","
-	}
-	return b.String()
+	return cpuMask(0, cores, cores)
 }
 
-// oneCPUMask returns a "hex format ASCII string", consistent with Linux's
-// include/linux/cpumask.h:cpumap_print_to_pagebuf(list=false) =>
-// lib/bitmap.c:bitmap_print_to_pagebuf(list=false), representing a CPU bitmask
-// for `cores` CPUs in which only CPU `i` is set.
+// oneCPUMask returns the cpuMask for `cores` CPUs in which only CPU `i` is set.
 //
 // Preconditions: i < cores.
 func oneCPUMask(i, cores uint) string {
+	return cpuMask(i, i+1, cores)
+}
+
+// cpuMask returns a "hex format ASCII string", consistent with Linux's
+// include/linux/cpumask.h:cpumap_print_to_pagebuf(list=false) =>
+// lib/bitmap.c:bitmap_print_to_pagebuf(list=false), representing a CPU bitmask
+// for `cores` CPUs in which CPUs [first, end) are set.
+//
+// Preconditions: first < end <= cores.
+func cpuMask(first, end, cores uint) string {
 	var (
 		b   strings.Builder
 		sep string
 	)
-	word := func() (w uint32) {
-		if cores <= i {
-			w = uint32(1) << (i - cores)
+	// word returns the bits of CPUs [base, base+32).
+	word := func(base uint) (w uint32) {
+		for i := max(first, base); i < min(end, base+32); i++ {
+			w |= uint32(1) << (i - base)
 		}
 		return
 	}
 	if rem := cores % 32; rem != 0 {
 		cores -= rem
 		chars := (rem + 3) / 4 // 4 bits per hex character
-		fmt.Fprintf(&b, "%0*x", chars, word())
+		fmt.Fprintf(&b, "%0*x", chars, word(cores))
 		sep = ","
 	}
 	for cores != 0 {
 		cores -= 32
-		fmt.Fprintf(&b, "%s%08x", sep, word())
+		fmt.Fprintf(&b, "%s%08x", sep, word(cores))
 		sep = ","
 	}
 	return b.String()
+}
+
+// cpuListString formats CPUs [first, end) in the kernel's "%*pbl" cpulist
+// format (lib/vsprintf.c:bitmap_list_string()), as used by
+// drivers/base/cpu.c:show_cpus_attr() and the drivers/base/topology.c *_list
+// files.
+//
+// Preconditions: first < end.
+func cpuListString(first, end uint) string {
+	if end-first == 1 {
+		return fmt.Sprintf("%d\n", first)
+	}
+	return fmt.Sprintf("%d-%d\n", first, end-1)
+}
+
+// buildNUMATopology synthesizes the /sys/devices/system/node subtree. gVisor's
+// memory model has a single NUMA node containing every application CPU.
+func (fs *filesystem) buildNUMATopology(ctx context.Context, creds *auth.Credentials, cores uint) kernfs.Inode {
+	entries := map[string]kernfs.Inode{}
+	// The aggregate files (online, possible, has_cpu, ...) are all
+	// node-range lists; the single node 0 covers them all.
+	for _, name := range []string{"online", "possible", "has_cpu", "has_memory", "has_normal_memory"} {
+		entries[name] = fs.newStaticFile(ctx, creds, defaultSysMode, "0\n")
+	}
+	entries["node0"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"cpumap":  fs.newStaticFile(ctx, creds, defaultSysMode, fullCPUMask(cores)+"\n"),
+		"cpulist": fs.newStaticFile(ctx, creds, defaultSysMode, cpuListString(0, cores)),
+		// The only node's distance to itself (LOCAL_DISTANCE).
+		"distance": fs.newStaticFile(ctx, creds, defaultSysMode, "10\n"),
+	})
+	return fs.newDir(ctx, creds, defaultSysDirMode, entries)
 }
 
 func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) map[string]kernfs.Inode {
 	// Set up /sys/kernel/debug/kcov. Technically, debugfs should be
 	// mounted at debug/, but for our purposes, it is sufficient to keep it
 	// in sys.
-	children := make(map[string]kernfs.Inode)
+	children := map[string]kernfs.Inode{
+		"mm": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"transparent_hugepage": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"hpage_pmd_size": fs.newStaticFile(ctx, creds, defaultSysMode, fmt.Sprintf("%d\n", hostarch.HugePageSize)),
+			}),
+		}),
+	}
 	if coverage.KcovSupported() {
 		log.Debugf("Set up /sys/kernel/debug/kcov")
 		children["debug"] = fs.newDir(ctx, creds, linux.FileMode(0700), map[string]kernfs.Inode{
@@ -476,6 +492,178 @@ func (d *dir) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, err
 	return vfs.GenericStatFS(linux.SYSFS_MAGIC), nil
 }
 
+// cpuRootDir is the value of lazyDir.cpu for /sys/devices/system/cpu.
+const cpuRootDir = -1
+
+// lazyDir is a directory in /sys/devices/system/cpu whose children are created
+// on first use.
+//
+// Most workloads never access the per-CPU directories in
+// /sys/devices/system/cpu. Creating them lazily keeps unused inodes out of
+// memory and out of checkpoints: directories that were never populated are
+// saved empty, and are populated after restore if needed.
+//
+// +stateify savable
+type lazyDir struct {
+	dir
+
+	fs    *filesystem
+	creds *auth.Credentials
+	cores uint
+
+	// cpu is the CPU index for /sys/devices/system/cpu/cpuN, or cpuRootDir
+	// for /sys/devices/system/cpu itself. Immutable.
+	cpu int
+
+	// populateMu serializes populate calls.
+	populateMu sync.Mutex `state:"nosave"`
+
+	// populated is true once the children of the directory have been
+	// created.
+	populated atomicbitops.Bool
+}
+
+var _ kernfs.Inode = (*lazyDir)(nil)
+
+// newLazyCPURootDir returns the lazyDir for /sys/devices/system/cpu.
+func (fs *filesystem) newLazyCPURootDir(ctx context.Context, creds *auth.Credentials, cores uint) *lazyDir {
+	d := fs.newLazyDir(ctx, creds, cores, cpuRootDir)
+	// Apps read these files often. Create these files now,
+	// so that lookups of these files do not create the
+	// cpuN directories.
+	d.OrderedChildren.Populate(map[string]kernfs.Inode{
+		"online":   fs.newCPUFile(ctx, creds, cores, defaultSysMode),
+		"possible": fs.newCPUFile(ctx, creds, cores, defaultSysMode),
+		"present":  fs.newCPUFile(ctx, creds, cores, defaultSysMode),
+	})
+	return d
+}
+
+// newLazyCPUDir returns the lazyDir for /sys/devices/system/cpu/cpuN.
+func (fs *filesystem) newLazyCPUDir(ctx context.Context, creds *auth.Credentials, cores, cpu uint) *lazyDir {
+	return fs.newLazyDir(ctx, creds, cores, int(cpu))
+}
+
+func (fs *filesystem) newLazyDir(ctx context.Context, creds *auth.Credentials, cores uint, cpu int) *lazyDir {
+	d := &lazyDir{
+		fs:    fs,
+		creds: creds,
+		cores: cores,
+		cpu:   cpu,
+	}
+	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|defaultSysDirMode)
+	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	d.InitRefs()
+	// Set the link count of the populated directory now, so that Stat does
+	// not need to populate d.
+	d.IncLinks(d.subdirs())
+	return d
+}
+
+// subdirs returns the number of subdirectories that populate creates. That
+// is either one cpuN directory per core in /sys/devices/system/cpu, or the
+// single topology directory in each cpuN directory.
+func (d *lazyDir) subdirs() uint32 {
+	if d.cpu == cpuRootDir {
+		return uint32(d.cores)
+	}
+	return 1
+}
+
+// children returns the children of d that populate creates.
+func (d *lazyDir) children(ctx context.Context) map[string]kernfs.Inode {
+	if d.cpu == cpuRootDir {
+		children := make(map[string]kernfs.Inode, d.cores)
+		for i := uint(0); i < d.cores; i++ {
+			children["cpu"+strconv.FormatUint(uint64(i), 10)] = d.fs.newLazyCPUDir(ctx, d.creds, d.cores, i)
+		}
+		return children
+	}
+	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
+	// socket and die and each CPU is a distinct core with its own cluster.
+	cpu := uint(d.cpu)
+	fullMask := fullCPUMask(d.cores) + "\n"
+	fullList := cpuListString(0, d.cores)
+	oneMask := oneCPUMask(cpu, d.cores) + "\n"
+	oneList := fmt.Sprintf("%d\n", cpu)
+	topology := map[string]kernfs.Inode{
+		"cluster_cpus":         d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
+		"cluster_cpus_list":    d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneList),
+		"cluster_id":           d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fmt.Sprintf("%d\n", cpu)),
+		"core_cpus":            d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
+		"core_cpus_list":       d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneList),
+		"core_id":              d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fmt.Sprintf("%d\n", cpu)),
+		"core_siblings":        d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask),
+		"core_siblings_list":   d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullList),
+		"package_cpus":         d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask),
+		"package_cpus_list":    d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullList),
+		"physical_package_id":  d.fs.newStaticFile(ctx, d.creds, defaultSysMode, "0\n"),
+		"thread_siblings":      d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
+		"thread_siblings_list": d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneList),
+	}
+	if topologyHasDie {
+		topology["die_cpus"] = d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask)
+		topology["die_cpus_list"] = d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullList)
+		topology["die_id"] = d.fs.newStaticFile(ctx, d.creds, defaultSysMode, "0\n")
+	}
+	return map[string]kernfs.Inode{
+		"topology": d.fs.newDir(ctx, d.creds, defaultSysDirMode, topology),
+	}
+}
+
+// populate creates the children of d, unless that has already been done.
+func (d *lazyDir) populate(ctx context.Context) {
+	if d.populated.Load() {
+		return
+	}
+	d.populateMu.Lock()
+	defer d.populateMu.Unlock()
+	if d.populated.Load() {
+		return
+	}
+	if links, want := d.OrderedChildren.Populate(d.children(ctx)), d.subdirs(); links != want {
+		panic(fmt.Sprintf("lazyDir(cpu=%d) populated %d subdirectories, want %d", d.cpu, links, want))
+	}
+	d.populated.Store(true)
+}
+
+// Lookup implements kernfs.Inode.Lookup.
+func (d *lazyDir) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
+	// Only populate the cpuN directories when they are accessed directly,
+	// not on access of the general cpu directory.
+	if d.cpu != cpuRootDir || isCPUDirName(name) {
+		d.populate(ctx)
+	}
+	return d.dir.Lookup(ctx, name)
+}
+
+// isCPUDirName returns true if name is of the form "cpuN".
+func isCPUDirName(name string) bool {
+	const prefix = "cpu"
+	if len(name) <= len(prefix) || name[:len(prefix)] != prefix {
+		return false
+	}
+	for i := len(prefix); i < len(name); i++ {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// Open implements kernfs.Inode.Open.
+func (d *lazyDir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	// Populate before GenericDirectoryFD reads d.OrderedChildren.
+	d.populate(ctx)
+	return d.dir.Open(ctx, rp, kd, opts)
+}
+
+// HasChildren implements kernfs.Inode.HasChildren.
+func (d *lazyDir) HasChildren() bool {
+	// lazyDir.children never returns an empty map.
+	return !d.populated.Load() || d.dir.HasChildren()
+}
+
 // cgroupDir implements kernfs.Inode.
 //
 // +stateify savable
@@ -486,6 +674,11 @@ type cgroupDir struct {
 // StatFS implements kernfs.Inode.StatFS.
 func (d *cgroupDir) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, error) {
 	return vfs.GenericStatFS(linux.TMPFS_MAGIC), nil
+}
+
+// IsEmptyDir implements kernfs.emptyDirInode.IsEmptyDir.
+func (*cgroupDir) IsEmptyDir() bool {
+	return true
 }
 
 // cpuFile implements kernfs.Inode.
@@ -500,7 +693,7 @@ type cpuFile struct {
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (c *cpuFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	fmt.Fprintf(buf, "0-%d\n", c.maxCores-1)
+	buf.WriteString(cpuListString(0, c.maxCores))
 	return nil
 }
 

@@ -402,6 +402,10 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 	if args.Spec.Linux == nil {
 		args.Spec.Linux = &specs.Linux{}
 	}
+	// The sandbox cgroup's device rules depend on the modules this loads.
+	if err := nvProxyPreGoferHostSetup(args.Spec, conf); err != nil {
+		return nil, err
+	}
 	// Don't force the use of cgroups in tests because they lack permission to do so.
 	if args.Spec.Linux.CgroupsPath == "" && !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
 		args.Spec.Linux.CgroupsPath = "/" + args.ID
@@ -443,10 +447,23 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 	if err != nil {
 		return parentCgroup, fmt.Errorf("error creating pod mount hints: %w", err)
 	}
-	if err := nvProxyPreGoferHostSetup(args.Spec, conf); err != nil {
-		return parentCgroup, err
+	var nvidiaDriverVersion string
+	if specutils.NVProxyEnabled(args.Spec, conf) {
+		// runsc may join the sandbox cgroup below, which denies the NVIDIA
+		// devices to a container without GPUs.
+		if nvidiaDriverVersion, err = sandbox.NVProxyDriverVersion(conf); err != nil {
+			return parentCgroup, fmt.Errorf("failed to get Nvidia driver version: %w", err)
+		}
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
+		// setupCgroupForRoot confined a cgroup v1 sandbox cgroup; a systemd one
+		// exists only now that it is joined.
+		if cgroup.IsOnlyV2() {
+			if err := allowDevices(conf, containerCgroup, args.Spec); err != nil {
+				return err
+			}
+		}
+
 		specFile, err := specutils.CopySpec(args.Spec)
 		if err != nil {
 			return fmt.Errorf("cannot copy spec file: %w", err)
@@ -461,7 +478,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			mountsFile      *os.File
 		)
 		if !args.NoRootContainer {
-			ioFiles, goferFilestores, devIOFile, mountsFile, err = c.createGoferProcess(conf, specFile, mountHints, args.Attached, cloneIntoCgroupFD)
+			ioFiles, goferFilestores, devIOFile, mountsFile, err = c.createGoferProcess(conf, specFile, mountHints, args.Attached, cloneIntoCgroupFD, containerCgroup, cpuLimits)
 			if err != nil {
 				return fmt.Errorf("cannot create gofer process: %w", err)
 			}
@@ -491,6 +508,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			FSRestoreImagePaths: args.FSRestoreImagePaths,
 			FSRestoreDirect:     args.FSRestoreDirect,
 			NoRootContainer:     args.NoRootContainer,
+			NvidiaDriverVersion: nvidiaDriverVersion,
 		}
 		sand, err := sandbox.New(conf, sandArgs)
 		if err != nil {
@@ -608,18 +626,40 @@ func (c *Container) startLocked(conf *config.Config, action string, startRoot fu
 	var err error
 	if specutils.IsRootContainer(c.Spec) {
 		err = startRoot(conf, c.Spec)
+		if err == nil {
+			// Save container state right after startRoot succeeds so that NetgoferPid
+			// and any other runtime updates are persisted to state.json. This ensures
+			// a subsequent `runsc delete` can find and terminate netgofer even if
+			// poststart hooks or subsequent steps fail.
+			if err = c.saveLocked(); err != nil {
+				if c.Sandbox != nil {
+					c.Sandbox.StopNetgofer()
+				}
+				return err
+			}
+		}
 	} else {
 		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
 		subStarted := false
+		// c.Sandbox is a copy taken when this subcontainer was created, and
+		// Update only changes the root container's state.
+		cpuLimits := c.Sandbox.CPULimits
+		if root, loadErr := Load(c.Saver.RootDir, FullID{SandboxID: c.Sandbox.ID, ContainerID: c.Sandbox.ID}, LoadOpts{Exact: true, SkipCheck: true, ReadOnly: true}); loadErr == nil {
+			cpuLimits = root.Sandbox.CPULimits
+		}
 		err = cgroup.RunInCgroup(c.Sandbox.CgroupJSON.Cgroup, func(cloneIntoCgroupFD *os.File) error {
+			if err := allowDevices(conf, c.Sandbox.CgroupJSON.Cgroup, c.Spec); err != nil {
+				return err
+			}
+
 			// Create the gofer process.
 			specFile, err := specutils.CopySpec(c.Spec)
 			if err != nil {
 				return fmt.Errorf("cannot copy spec file: %w", err)
 			}
 			defer specFile.Close()
-			goferFiles, goferFilestores, devIOFile, mountsFile, err := c.createGoferProcess(conf, specFile, c.Sandbox.MountHints, false /* attached */, cloneIntoCgroupFD)
+			goferFiles, goferFilestores, devIOFile, mountsFile, err := c.createGoferProcess(conf, specFile, c.Sandbox.MountHints, false /* attached */, cloneIntoCgroupFD, c.Sandbox.CgroupJSON.Cgroup, cpuLimits)
 			if err != nil {
 				return err
 			}
@@ -664,6 +704,9 @@ func (c *Container) startLocked(conf *config.Config, action string, startRoot fu
 		}
 	}
 	if err != nil {
+		if specutils.IsRootContainer(c.Spec) && c.Sandbox != nil {
+			c.Sandbox.StopNetgofer()
+		}
 		// Errors reported by the sandbox mean that it was up at *some* point,
 		// even if it exited since.
 		var remoteErr urpc.RemoteError
@@ -688,6 +731,9 @@ func (c *Container) startLocked(conf *config.Config, action string, startRoot fu
 	// stop the container, and continue the lifecycle at step 12" - OCI spec.
 	if c.Spec.Hooks != nil {
 		if err := specutils.ExecuteHooks(c.Spec.Hooks.Poststart, c.State()); err != nil {
+			if specutils.IsRootContainer(c.Spec) && c.Sandbox != nil {
+				c.Sandbox.StopNetgofer()
+			}
 			return err
 		}
 	}
@@ -1144,7 +1190,7 @@ func (c *Container) Destroy() error {
 			}
 		}
 		filestorePath := sentryapi.SelfFilestorePath(mountSrc, c.sandboxID())
-		if err := os.Remove(filestorePath); err != nil {
+		if err := os.Remove(filestorePath); err != nil && !os.IsNotExist(err) {
 			err = fmt.Errorf("failed to delete filestore file %q: %v", filestorePath, err)
 			log.Warningf("%v", err)
 			errs = append(errs, err.Error())
@@ -1507,6 +1553,11 @@ func (c *Container) reloadLocked() error {
 		c.Status = saved.Status
 	}
 	c.Spec = saved.Spec
+	if c.GoferMountConfs == nil {
+		c.GoferPid.Store(saved.GoferPid.Load())
+		c.GoferPidIdentity = saved.GoferPidIdentity
+		c.GoferMountConfs = saved.GoferMountConfs
+	}
 	if c.Sandbox != nil && saved.Sandbox != nil {
 		c.Sandbox.Creating = saved.Sandbox.Creating
 		c.Sandbox.CPULimits = saved.Sandbox.CPULimits
@@ -1639,12 +1690,88 @@ func createLisafsSocketPair(sandEnds *[]*os.File, donations *donation.Agency) er
 	return nil
 }
 
+// goferMaxProcs caps the gofer's GOMAXPROCS. One gofer process serves all of a
+// container's mounts (up to 4 flipcall channels plus 1 socket handler per
+// active lisafs mount, and none steady-state under directfs).
+const goferMaxProcs = 8
+
+// goferGOMAXPROCS returns the GOMAXPROCS value for a gofer running in `cg`.
+// It always honors the CPU quota, regardless of --cpu-num-from-quota, which
+// only affects the application.
+func goferGOMAXPROCS(cg cgroup.Cgroup, limits *sandbox.CPULimits) int {
+	return goferGOMAXPROCSWithSelf(cg, limits, cgroup.NewSelf)
+}
+
+func goferGOMAXPROCSWithSelf(cg cgroup.Cgroup, limits *sandbox.CPULimits, selfCg func() (cgroup.Cgroup, error)) int {
+	if cg != nil {
+		n, err := sandbox.CalculateCPUNum(cg, limits, true /* cpuNumFromQuota */)
+		if err != nil {
+			log.Warningf("Failed to calculate gofer CPU count from cgroup, using %d: %v", n, err)
+		}
+		return max(1, min(n, goferMaxProcs))
+	}
+
+	// Without a container cgroup, the gofer stays in runsc's own cgroup. If it
+	// can't be loaded, size the gofer from the host CPUs.
+	self, err := selfCg()
+	if err != nil {
+		log.Debugf("Failed to load current cgroup for gofer CPU count, using host CPUs: %v", err)
+		self = nil
+	}
+	n, err := sandbox.CalculateCPUNum(self, limits, true /* cpuNumFromQuota */)
+	if err != nil {
+		log.Debugf("Failed to calculate gofer CPU count from current cgroup, using %d: %v", n, err)
+	}
+	return max(1, min(n, goferMaxProcs))
+}
+
+// goferEnv returns the environment of the gofer process, given environ, the
+// environment of this process.
+func goferEnv(conf *config.Config, environ []string, gomaxprocs int) []string {
+	env := make([]string, 0, len(environ)+2)
+	var existingGoDebug string
+	hasGoDebug := false
+	for _, e := range environ {
+		// Don't forward GOMAXPROCS defaults that apply to this process (in
+		// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
+		// v1.service.newCommand()).
+		if strings.HasPrefix(e, "GOMAXPROCS=") {
+			continue
+		}
+		if val, ok := strings.CutPrefix(e, "GODEBUG="); ok {
+			// Go only reads the first GODEBUG variable in the environment.
+			if !hasGoDebug {
+				existingGoDebug = val
+				hasGoDebug = true
+			}
+			continue
+		}
+		env = append(env, e)
+	}
+	godebug := "GODEBUG="
+	if !conf.ProfileEnable {
+		// Heap profiles can only be collected from the gofer with --profile.
+		// Without it, don't sample heap allocations: each sampled allocation
+		// site costs a stack unwind and a profiling bucket that is never freed.
+		// Later GODEBUG settings take precedence over earlier ones, so put
+		// memprofilerate=0 first to let an inherited setting override it.
+		godebug += "memprofilerate=0,"
+	}
+	if existingGoDebug != "" {
+		godebug += existingGoDebug + ","
+	}
+	// Put containermaxprocs=0,updatemaxprocs=0 last so inherited GODEBUG
+	// cannot re-enable Go's cgroup CPU reader/poller inside the chroot.
+	godebug += "containermaxprocs=0,updatemaxprocs=0"
+	return append(env, godebug, "GOMAXPROCS="+strconv.Itoa(gomaxprocs))
+}
+
 // createGoferProcess returns an IO file list and a mounts file on success.
 // The IO file list consists of image files and/or socket files to connect to
 // a gofer endpoint for the mount points using Gofers. The mounts file is the
 // file to read list of mounts after they have been resolved (direct paths,
 // no symlinks), and will be nil if there is no cleaning required for mounts.
-func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, mountHints *sentryapi.PodMountHints, attached bool, cloneIntoCgroupFD *os.File) ([]*os.File, []*os.File, *os.File, *os.File, error) {
+func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, mountHints *sentryapi.PodMountHints, attached bool, cloneIntoCgroupFD *os.File, cg cgroup.Cgroup, cpuLimits *sandbox.CPULimits) ([]*os.File, []*os.File, *os.File, *os.File, error) {
 	rootfsHint, err := sentryapi.NewRootfsHint(c.Spec)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("error creating rootfs hint: %w", err)
@@ -1729,10 +1856,7 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 
 	// Start with the general config flags.
 	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
-	// Don't forward GOMAXPROCS defaults that apply to this process (in
-	// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
-	// v1.service.newCommand()).
-	cmd.Env = slices.DeleteFunc(os.Environ(), func(env string) bool { return strings.HasPrefix(env, "GOMAXPROCS=") })
+	cmd.Env = goferEnv(conf, os.Environ(), goferGOMAXPROCS(cg, cpuLimits))
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		// Detach from session. Otherwise, signals sent to the foreground process
 		// will also be forwarded by this process, resulting in duplicate signals.
@@ -2411,6 +2535,15 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec, cp
 	if parentCgroup == nil || err != nil {
 		return nil, nil, err
 	}
+	if !cgroup.IsOnlyV2() {
+		// A cgroup v1 devices controller cannot stop allowing all devices once
+		// it has children, so confine the sandbox cgroup before the root
+		// container's cgroup is created under it.
+		if err := allowDevices(conf, parentCgroup, spec); err != nil {
+			_ = parentCgroup.Uninstall()
+			return nil, nil, err
+		}
+	}
 
 	subCgroup, err := c.setupCgroupForSubcontainer(conf, spec)
 	if err != nil {
@@ -2452,11 +2585,11 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 }
 
 // handleCgroupInstallErr maps an error from a cgroup install operation. In
-// rootless mode, EACCES/EROFS mean we lack permission to configure cgroups,
-// which is non-fatal: it logs and returns nil so the caller proceeds without a
-// cgroup. All other errors are wrapped with what.
+// rootless mode, permission errors and EROFS mean we lack permission to
+// configure cgroups, which is non-fatal: it logs and returns nil so the caller
+// proceeds without a cgroup. All other errors are wrapped with what.
 func handleCgroupInstallErr(conf *config.Config, what string, err error) error {
-	if (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless {
+	if (errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS)) && conf.Rootless {
 		log.Warningf("Skipping %s configuration in rootless mode: %v", what, err)
 		return nil
 	}
@@ -2715,7 +2848,7 @@ func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
 		"--load-kmods",
 		"configure",
 		fmt.Sprintf("--ldconfig=@%s", ldconfigPath),
-		"--no-cgroups", // runsc doesn't configure device cgroups yet
+		"--no-cgroups", // runsc configures the sandbox's device cgroup itself.
 		fmt.Sprintf("--pid=%d", goferPid),
 		fmt.Sprintf("--device=%s", devices),
 	}

@@ -1270,13 +1270,20 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 		}
 
 		info := linux.TCPInfo{
-			State:       uint8(v.State),
-			RTO:         uint32(v.RTO / time.Microsecond),
-			RTT:         uint32(v.RTT / time.Microsecond),
-			RTTVar:      uint32(v.RTTVar / time.Microsecond),
-			SndSsthresh: v.SndSsthresh,
-			SndCwnd:     v.SndCwnd,
-			SndMss:      v.SndMss,
+			State:        uint8(v.State),
+			RTO:          uint32(v.RTO / time.Microsecond),
+			RTT:          uint32(v.RTT / time.Microsecond),
+			RTTVar:       uint32(v.RTTVar / time.Microsecond),
+			SndSsthresh:  v.SndSsthresh,
+			SndCwnd:      v.SndCwnd,
+			SndMss:       v.SndMss,
+			TotalRetrans: v.TotalRetrans,
+		}
+		if v.Timestamps {
+			info.Options |= linux.TCPI_OPT_TIMESTAMPS
+		}
+		if v.SACKPermitted {
+			info.Options |= linux.TCPI_OPT_SACK
 		}
 		switch v.CcState {
 		case tcpip.RTORecovery:
@@ -3331,9 +3338,8 @@ func (s *sock) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDe
 	// Don't overwrite any data we received.
 	dst = dst.DropFirst(n)
 
-	// We'll have to block. Register for notifications and keep trying to
-	// send all the data.
-	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	// A connected UDP socket can receive an ICMP error without receiving data.
+	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventErr)
 	s.EventRegister(&e)
 	defer s.EventUnregister(&e)
 
@@ -3785,6 +3791,9 @@ func nicStateFlagsToLinux(f stack.NICStateFlags) uint32 {
 	}
 	if f.Loopback {
 		rv |= linux.IFF_LOOPBACK
+	}
+	if f.Multicast {
+		rv |= linux.IFF_MULTICAST
 	}
 	return rv
 }

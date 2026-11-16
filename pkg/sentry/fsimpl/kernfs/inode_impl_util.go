@@ -447,9 +447,12 @@ type OrderedChildren struct {
 	// methods that would modify the children return EPERM. Immutable.
 	writable bool
 
-	mu    sync.RWMutex `state:"nosave"`
+	mu sync.RWMutex `state:"nosave"`
+
+	// +checklocks:mu
 	order slotList
-	set   map[string]*slot
+	// +checklocks:mu
+	set map[string]*slot
 }
 
 // orderedChildren implements inodeWithOrderedChildren.orderedChildren.
@@ -460,7 +463,6 @@ func (o *OrderedChildren) orderedChildren() *OrderedChildren {
 // Init initializes an OrderedChildren.
 func (o *OrderedChildren) Init(opts OrderedChildrenOptions) {
 	o.writable = opts.Writable
-	o.set = make(map[string]*slot)
 }
 
 // Destroy clears the children stored in o. It should be called by structs
@@ -490,14 +492,29 @@ func (o *OrderedChildren) Destroy(ctx context.Context) {
 //
 // Postcondition: Caller's references on inodes are transferred to o.
 func (o *OrderedChildren) Populate(children map[string]Inode) uint32 {
+	if len(children) == 0 {
+		return 0
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.set == nil {
+		o.set = make(map[string]*slot, len(children))
+	}
 	var links uint32
 	for name, child := range children {
 		if child.Mode().IsDir() {
 			links++
 		}
-		if err := o.insert(name, child, true); err != nil {
+		if _, ok := o.set[name]; ok {
 			panic(fmt.Sprintf("Collision when attempting to insert child %q (%+v)", name, child))
 		}
+		s := &slot{
+			name:   name,
+			inode:  child,
+			static: true,
+		}
+		o.order.PushBack(s)
+		o.set[name] = s
 	}
 	return links
 }
@@ -565,6 +582,9 @@ func (o *OrderedChildren) Inserter(name string, makeChild func() Inode) (Inode, 
 		inode:  child,
 		static: false,
 	}
+	if o.set == nil {
+		o.set = make(map[string]*slot)
+	}
 	o.order.PushBack(s)
 	o.set[name] = s
 	return child, nil
@@ -586,12 +606,15 @@ func (o *OrderedChildren) insert(name string, child Inode, static bool) error {
 		inode:  child,
 		static: static,
 	}
+	if o.set == nil {
+		o.set = make(map[string]*slot)
+	}
 	o.order.PushBack(s)
 	o.set[name] = s
 	return nil
 }
 
-// Precondition: caller must hold o.mu for writing.
+// +checklocks:o.mu
 func (o *OrderedChildren) removeLocked(name string) {
 	if s, ok := o.set[name]; ok {
 		if s.static {
@@ -620,7 +643,7 @@ func (o *OrderedChildren) RemoveStatic(ctx context.Context, name string) error {
 	return nil
 }
 
-// Precondition: caller must hold o.mu for reading or writing.
+// +checklocksread:o.mu
 func (o *OrderedChildren) checkExistingLocked(name string, child Inode) error {
 	s, ok := o.set[name]
 	if !ok {
@@ -682,11 +705,17 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 	// calls to Rename in accordance with the interface declaration.
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if dst != o {
-		dst.mu.Lock()
-		defer dst.mu.Unlock()
+	if dst == o {
+		return o.renameLocked(oldname, newname, child, o)
 	}
+	dst.mu.Lock()
+	defer dst.mu.Unlock()
+	return o.renameLocked(oldname, newname, child, dst)
+}
 
+// +checklocks:o.mu
+// +checklocks:dst.mu
+func (o *OrderedChildren) renameLocked(oldname, newname string, child Inode, dst *OrderedChildren) error {
 	// Ensure target inode exists in src.
 	if err := o.checkExistingLocked(oldname, child); err != nil {
 		return err
@@ -705,6 +734,9 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 		name:  newname,
 		inode: child,
 	}
+	if dst.set == nil {
+		dst.set = make(map[string]*slot)
+	}
 	dst.order.PushBack(s)
 	dst.set[newname] = s
 
@@ -715,7 +747,7 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 // iterator is valid until the caller releases o.mu. Returns nil if the
 // requested index falls out of bounds.
 //
-// Preconditon: Caller must hold o.mu for reading.
+// +checklocksread:o.mu
 func (o *OrderedChildren) nthLocked(i int64) *slot {
 	for it := o.order.Front(); it != nil && i >= 0; it = it.Next() {
 		if i == 0 {

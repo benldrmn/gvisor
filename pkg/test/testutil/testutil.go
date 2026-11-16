@@ -17,6 +17,7 @@ package testutil
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"debug/elf"
 	"encoding/base32"
@@ -323,9 +324,59 @@ func ConfigForBenchmark(b *testing.B) *config.Config {
 	return conf
 }
 
+// PlatformConfig pairs a sub-test or sub-benchmark name with its sandbox
+// configuration.
+type PlatformConfig struct {
+	Name string
+	Conf *config.Config
+}
+
+// PlatformConfigs returns two sandbox configurations (created via newConf) for
+// each comma-separated platform in platforms: "<platform>" (Overlay2="none")
+// and "<platform>_overlay" (Overlay2="root:self"). It filters out "runc" and
+// "ptrace".
+func PlatformConfigs(tb testing.TB, platforms string, newConf func() *config.Config) []PlatformConfig {
+	tb.Helper()
+	var ps []string
+	for _, p := range strings.Split(platforms, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			ps = append(ps, p)
+		}
+	}
+	ps = slices.DeleteFunc(ps, func(s string) bool {
+		return s == "runc" || s == "ptrace"
+	})
+	if len(ps) == 0 {
+		tb.Skipf("no supported platforms in %q", platforms)
+	}
+
+	var cs []PlatformConfig
+	for _, p := range ps {
+		c := newConf()
+		c.Overlay2.Set("none")
+		c.Platform = p
+		cs = append(cs, PlatformConfig{Name: p, Conf: c})
+	}
+
+	// Overlay versions use "root:self", the runsc default.
+	for _, p := range ps {
+		c := newConf()
+		c.Overlay2.Set("root:self")
+		c.Platform = p
+		cs = append(cs, PlatformConfig{Name: p + "_overlay", Conf: c})
+	}
+	slices.SortFunc(cs, func(a, b PlatformConfig) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+	return cs
+}
+
 // Measure executes fn while the benchmark timer is running. It starts the timer
 // immediately before calling fn, pauses it when fn returns (even if fn panics or
-// fails), and returns the elapsed duration of fn.
+// fails), and returns the elapsed duration of fn. The benchmark framework uses
+// the timer to report the average duration of fn as ns/op. The framework does
+// not keep each duration, so Measure returns it for percentiles (see
+// ReportPercentiles).
 func Measure(b *testing.B, fn func()) time.Duration {
 	b.StartTimer()
 	start := time.Now()

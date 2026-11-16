@@ -208,6 +208,7 @@ type ExpectedOpts struct {
 	NetNamespaceTarget   string
 	CgoEnabled           bool
 	GoDebug              string
+	CoreTags             bool
 
 	// Cgroup is whether `runsc` put the sandbox in a cgroup.
 	Cgroup bool
@@ -250,7 +251,15 @@ func Expected(opts ExpectedOpts) *Posture {
 		FDs:        expectedFDs(opts),
 		Attrs:      expectedAttrs(opts, applyCaps, newUserNS),
 		Threads:    Threads{Uniform: true},
+		CoreTag:    expectedCoreTag(opts),
 	}
+}
+
+func expectedCoreTag(opts ExpectedOpts) string {
+	if opts.CoreTags {
+		return CoreTagOwn
+	}
+	return CoreTagNone
 }
 
 func expectedCreds(applyCaps bool) Credentials {
@@ -401,6 +410,13 @@ func expectedAttrs(opts ExpectedOpts, applyCaps, newUserNS bool) Attrs {
 		memlock = LimitUnlimited
 	}
 
+	// runsc confines the cgroup it creates; a sandbox it leaves in the
+	// reference process's cgroup inherits its device access.
+	deviceCgroup := DeviceCgroupSameAsRef
+	if opts.Cgroup {
+		deviceCgroup = DeviceCgroupConfined
+	}
+
 	uidMap, gidMap := MapSameAsRef, MapSameAsRef
 	if newUserNS {
 		if applyCaps {
@@ -421,6 +437,7 @@ func expectedAttrs(opts ExpectedOpts, applyCaps, newUserNS bool) Attrs {
 		UIDMap:             uidMap,
 		GIDMap:             gidMap,
 		ProcFileOwner:      OwnerSameAsProcess,
+		DeviceCgroup:       deviceCgroup,
 	}
 }
 

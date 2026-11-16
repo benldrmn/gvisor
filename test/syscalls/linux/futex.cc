@@ -17,6 +17,7 @@
 #include <linux/futex.h>
 #include <linux/types.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -34,15 +35,17 @@
 #include <ctime>
 #include <iterator>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/memory/memory.h"
+#include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/fs_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
 #include "test/util/posix_error.h"
@@ -132,6 +135,21 @@ int futex_wake_op(bool priv, std::atomic<int>* uaddr1, std::atomic<int>* uaddr2,
     op |= FUTEX_PRIVATE_FLAG;
   }
   return syscall(SYS_futex, uaddr1, op, nwake1, nwake2, uaddr2, sub_op);
+}
+
+// Retries until a waiter is woken, so sub_op must not change *uaddr2.
+int futex_wake_op_until_woken(bool priv, std::atomic<int>* uaddr1,
+                              std::atomic<int>* uaddr2, uint32_t sub_op) {
+  absl::Time const deadline = absl::Now() + kIneffectiveWakeTimeout;
+  int ret;
+  do {
+    ret = futex_wake_op(priv, uaddr1, uaddr2, 0, 1, sub_op);
+    if (ret != 0) {
+      return ret;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  } while (absl::Now() < deadline);
+  return ret;
 }
 
 int futex_lock_pi(bool priv, std::atomic<int>* uaddr) {
@@ -470,6 +488,43 @@ TEST_P(PrivateAndSharedFutexTest, WakeOpCondFailure) {
   EXPECT_EQ(b, kInitialValue + 2);
 }
 
+TEST_P(PrivateAndSharedFutexTest, WakeOpCondNegativeCmparg) {
+  constexpr int kValue = -1;
+  std::atomic<int> a(0);
+  std::atomic<int> b(kValue);
+
+  DisableSave ds;
+  ScopedThread thread_b([&] {
+    EXPECT_THAT(futex_wait(IsPrivate(), &b, kValue, kIneffectiveWakeTimeout),
+                SyscallSucceeds());
+  });
+
+  EXPECT_THAT(
+      futex_wake_op_until_woken(IsPrivate(), &a, &b,
+                                FUTEX_OP(FUTEX_OP_ADD, 0, FUTEX_OP_CMP_EQ, -1)),
+      SyscallSucceedsWithValue(1));
+  EXPECT_EQ(b, kValue);
+}
+
+TEST_P(PrivateAndSharedFutexTest, WakeOpCondSignedCompare) {
+  constexpr int kValue = static_cast<int>(0x80000001);
+  std::atomic<int> a(0);
+  std::atomic<int> b(kValue);
+
+  DisableSave ds;
+  ScopedThread thread_b([&] {
+    EXPECT_THAT(futex_wait(IsPrivate(), &b, kValue, kIneffectiveWakeTimeout),
+                SyscallSucceeds());
+  });
+
+  EXPECT_THAT(
+      futex_wake_op_until_woken(
+          IsPrivate(), &a, &b,
+          FUTEX_OP(FUTEX_OP_OR | FUTEX_OP_OPARG_SHIFT, 31, FUTEX_OP_CMP_LT, 0)),
+      SyscallSucceedsWithValue(1));
+  EXPECT_EQ(b, kValue);
+}
+
 TEST_P(PrivateAndSharedFutexTest, NoWakeInterprocessPrivateAnon) {
   auto const mapping = ASSERT_NO_ERRNO_AND_VALUE(
       MmapAnon(kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE));
@@ -597,6 +652,22 @@ TEST(PrivateFutexTest, WakeOp0Xor) {
   EXPECT_EQ(a, 0b0110);
 }
 
+TEST(PrivateFutexTest, WakeOpNegativeOparg) {
+  std::atomic<int> a(1);
+  int futex_op = FUTEX_OP(FUTEX_OP_ADD, -1, 0, 0);
+  EXPECT_THAT(futex_wake_op(true, nullptr, &a, 0, 0, futex_op),
+              SyscallSucceedsWithValue(0));
+  EXPECT_EQ(a, 0);
+}
+
+TEST(PrivateFutexTest, WakeOpShiftMasked) {
+  std::atomic<int> a(0);
+  int futex_op = FUTEX_OP(FUTEX_OP_SET | FUTEX_OP_OPARG_SHIFT, 33, 0, 0);
+  EXPECT_THAT(futex_wake_op(true, nullptr, &a, 0, 0, futex_op),
+              SyscallSucceedsWithValue(0));
+  EXPECT_EQ(a, 2);
+}
+
 TEST(SharedFutexTest, WakeInterprocessSharedAnon) {
   auto const mapping = ASSERT_NO_ERRNO_AND_VALUE(
       MmapAnon(kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED));
@@ -694,6 +765,8 @@ TEST_P(PrivateAndSharedFutexTest, PIConcurrency) {
 }
 
 TEST_P(PrivateAndSharedFutexTest, PIWaiters) {
+  DisableSave ds;
+
   std::atomic<int> a(0);
   const bool is_priv = IsPrivate();
 
@@ -701,16 +774,27 @@ TEST_P(PrivateAndSharedFutexTest, PIWaiters) {
   EXPECT_EQ(a.load(), gettid());
 
   ScopedThread th([is_priv, &a] {
+    // The mask from a previous ordinary wait must not select a PI waiter.
+    EXPECT_THAT(futex_wait_bitset(is_priv, &a, 0, 1),
+                SyscallFailsWithErrno(EAGAIN));
     ASSERT_THAT(futex_lock_pi(is_priv, &a), SyscallSucceeds());
+    EXPECT_EQ(a.load() & FUTEX_TID_MASK, gettid());
     ASSERT_THAT(futex_unlock_pi(is_priv, &a), SyscallSucceeds());
   });
 
-  // Wait until the thread blocks on the futex, setting the waiters bit.
-  auto start = absl::Now();
-  while (a.load() != (int)(gettid() | FUTEX_WAITERS)) {
-    ASSERT_LT(absl::Now() - start, absl::Seconds(5));
-    absl::SleepFor(absl::Milliseconds(100));
+  const int contended = gettid() | FUTEX_WAITERS;
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (a.load() != contended && absl::Now() < deadline) {
+    sched_yield();
   }
+  EXPECT_EQ(a.load(), contended);
+  // Requeue to the same address so that even an erroneous requeue leaves
+  // the waiter available for the subsequent handoff.
+  EXPECT_THAT(syscall(SYS_futex, &a, FUTEX_REQUEUE | PrivateFlag(), 0, 1, &a),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(futex_wake_bitset(is_priv, &a, 1, 2),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(futex_wake(is_priv, &a, 1), SyscallFailsWithErrno(EINVAL));
   ASSERT_THAT(futex_unlock_pi(is_priv, &a), SyscallSucceeds());
 }
 
@@ -728,6 +812,57 @@ TEST_P(PrivateAndSharedFutexTest, PITryLock) {
   th.Join();
 
   ASSERT_THAT(futex_unlock_pi(IsPrivate(), &a), SyscallSucceeds());
+}
+
+TEST_P(PrivateAndSharedFutexTest, PIWithOrdinaryWaiter) {
+  DisableSave ds;
+
+  const int owner = gettid();
+  const bool priv = IsPrivate();
+  const int flags = PrivateFlag();
+  std::atomic<int> word(owner);
+  std::atomic<pid_t> waiter_tid(0);
+  ScopedThread waiter([&] {
+    // This thread used a PI lock before its ordinary wait. It must not
+    // become the owner of word just because its wait is first in the queue.
+    std::atomic<int> other(0);
+    ASSERT_THAT(syscall(SYS_futex, &other, FUTEX_LOCK_PI | flags, 0, nullptr),
+                SyscallSucceeds());
+    ASSERT_THAT(futex_unlock_pi(priv, &other), SyscallSucceeds());
+    waiter_tid.store(gettid());
+    EXPECT_THAT(futex_wait(priv, &word, owner, absl::Seconds(10)),
+                SyscallSucceedsWithValue(0));
+  });
+
+  // An ordinary wait does not set FUTEX_WAITERS. After publishing its TID,
+  // the thread can only sleep in FUTEX_WAIT.
+  bool sleeping = false;
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (!sleeping && absl::Now() < deadline) {
+    const pid_t tid = waiter_tid.load();
+    if (tid != 0) {
+      auto contents =
+          GetContents(absl::StrCat("/proc/self/task/", tid, "/stat"));
+      if (contents.ok()) {
+        const std::string& stat = contents.ValueOrDie();
+        const size_t end = stat.rfind(')');
+        sleeping = end != std::string::npos && end + 2 < stat.size() &&
+                   stat[end + 2] == 'S';
+      }
+    }
+    sched_yield();
+  }
+  EXPECT_TRUE(sleeping);
+  EXPECT_THAT(syscall(SYS_futex, &word, FUTEX_REQUEUE | flags, 0, 1, &word),
+              SyscallSucceeds());
+  ScopedThread([&] {
+    EXPECT_THAT(futex_trylock_pi(priv, &word), SyscallFailsWithErrno(EINVAL));
+  }).Join();
+  EXPECT_THAT(syscall(SYS_futex, &word, FUTEX_UNLOCK_PI | flags),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_EQ(word.load(), owner);
+  EXPECT_THAT(futex_wake(priv, &word, 1), SyscallSucceedsWithValue(1));
+  EXPECT_THAT(futex_unlock_pi(priv, &word), SyscallSucceeds());
 }
 
 TEST_P(PrivateAndSharedFutexTest, PITryLockConcurrency) {

@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -393,12 +394,130 @@ func TestCheckpointRestore(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreClocks verifies that CLOCK_MONOTONIC does not count the
+// time that the sandbox spends checkpointed, so that a sleep pending at
+// checkpoint time keeps the time it had left, while CLOCK_REALTIME and
+// CLOCK_BOOTTIME do count it.
+func TestCheckpointRestoreClocks(t *testing.T) {
+	const (
+		sleepDuration        = 4 * time.Second
+		checkpointedDuration = 8 * time.Second
+	)
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+	// Skip overlay because test requires writing to host file.
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding dir: %q, %v", dir, err)
+			}
+			beforePath := filepath.Join(dir, "before")
+			afterPath := filepath.Join(dir, "after")
+
+			// Record the clocks around a sleep(1), which glibc implements
+			// with a relative CLOCK_REALTIME clock_nanosleep(2). Rename the
+			// files into place so that they are never read partially
+			// written.
+			script := fmt.Sprintf("%[1]s clocks > %[2]s.tmp && mv %[2]s.tmp %[2]s && sleep %[4]d && %[1]s clocks > %[3]s.tmp && mv %[3]s.tmp %[3]s",
+				app, beforePath, afterPath, int(sleepDuration.Seconds()))
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileExist(beforePath); err != nil {
+				t.Fatalf("error waiting for %q: %v", beforePath, err)
+			}
+			if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			if _, err := os.Stat(afterPath); err == nil {
+				t.Fatalf("sleep finished before checkpoint")
+			}
+			cont.Destroy()
+
+			time.Sleep(checkpointedDuration)
+
+			cont2, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+			if err := waitForFileExist(afterPath); err != nil {
+				t.Fatalf("error waiting for %q: %v", afterPath, err)
+			}
+
+			readClocks := func(path string) (realtime, monotonic, boottime time.Duration) {
+				b, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("error reading %q: %v", path, err)
+				}
+				if _, err := fmt.Sscan(string(b), &realtime, &monotonic, &boottime); err != nil {
+					t.Fatalf("error parsing %q from %q: %v", b, path, err)
+				}
+				return realtime, monotonic, boottime
+			}
+			realtime1, monotonic1, boottime1 := readClocks(beforePath)
+			realtime2, monotonic2, boottime2 := readClocks(afterPath)
+			realtime := realtime2 - realtime1
+			monotonic := monotonic2 - monotonic1
+			boottime := boottime2 - boottime1
+			t.Logf("Elapsed time: CLOCK_REALTIME %v, CLOCK_MONOTONIC %v, CLOCK_BOOTTIME %v", realtime, monotonic, boottime)
+
+			// The sleep resumed with the time it had left: it neither
+			// expired on restore, nor counted the time spent checkpointed.
+			if monotonic < sleepDuration || monotonic >= checkpointedDuration {
+				t.Errorf("CLOCK_MONOTONIC advanced by %v during the sleep, want in [%v, %v)", monotonic, sleepDuration, checkpointedDuration)
+			}
+			// The difference also includes the time between the checkpoint
+			// and restore requests and the actual checkpoint and restore.
+			if got := realtime - monotonic; got < checkpointedDuration {
+				t.Errorf("CLOCK_REALTIME advanced by %v more than CLOCK_MONOTONIC, want at least %v", got, checkpointedDuration)
+			}
+			if got := boottime - monotonic; got < checkpointedDuration {
+				t.Errorf("CLOCK_BOOTTIME advanced by %v more than CLOCK_MONOTONIC, want at least %v", got, checkpointedDuration)
+			}
+			if diff := boottime - realtime; diff < -time.Second || diff > time.Second {
+				t.Errorf("CLOCK_BOOTTIME advanced by %v, want within 1s of CLOCK_REALTIME's %v", boottime, realtime)
+			}
+		})
+	}
+}
+
 // TestCheckpointCPUFeaturesMetadata verifies that the checkpoint metadata
 // records the sandbox's CPU features, matching the CPUID FeatureSet saved in
 // the state file.
 func TestCheckpointCPUFeaturesMetadata(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
 		t.Run(name, func(t *testing.T) {
+			// Use the wire engine because this test decodes cpuid.FeatureSet
+			// directly in-process without linking all Sentry state types.
+			conf.StateEngine = config.StateEngineWire
 			spec, _ := sleepSpecConf(t)
 			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 			if err != nil {
@@ -1060,6 +1179,85 @@ func TestCheckpointRestoreCreateMountPoint(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreInodeNumbers checks that files on a bind mount keep
+// their device and inode numbers across checkpoint/restore.
+func TestCheckpointRestoreInodeNumbers(t *testing.T) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+	src := filepath.Join(dir, "src")
+	if err := os.Mkdir(src, 0777); err != nil {
+		t.Fatalf("os.Mkdir() failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "file"), nil, 0666); err != nil {
+		t.Fatalf("os.WriteFile() failed: %v", err)
+	}
+	dst := filepath.Join(dir, "mnt")
+	file := filepath.Join(dst, "file")
+
+	spec, conf := sleepSpecConf(t)
+	// Keep the file open so that its dentry is checkpointed.
+	spec.Process.Args = []string{"/bin/sh", "-c", "exec 3<" + file + "; exec sleep 1000"}
+	spec.Mounts = append(spec.Mounts, specs.Mount{Destination: dst, Source: src, Type: "bind"})
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if err := waitForProcessCount(cont, 1); err != nil {
+		t.Fatal(err)
+	}
+	before, err := executeCombinedOutput(conf, cont, nil, "/usr/bin/stat", "-c", "%d %i", file)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+
+	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelDefault}); err != nil {
+		t.Fatalf("error checkpointing container to file: %v", err)
+	}
+
+	// Destroy the original container to restore it in place.
+	cont.Destroy()
+	cont = nil
+
+	cont2, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont2.Destroy()
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+
+	after, err := executeCombinedOutput(conf, cont2, nil, "/usr/bin/stat", "-c", "%d %i", file)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("device and inode numbers changed across restore: before %q, after %q", before, after)
+	}
+}
+
 // TestCheckpointRestoreEROFS does the checkpoint/restore test on each platform using
 // an EROFS image as the rootfs.
 func TestCheckpointRestoreEROFS(t *testing.T) {
@@ -1172,6 +1370,49 @@ func TestCheckpointResume(t *testing.T) {
 			cont.Destroy()
 		})
 	}
+}
+
+// TestUsageDiskBackedOverlay checks that data in a disk backed overlay is not
+// reported as memory usage, before or after a checkpoint and restore.
+func TestUsageDiskBackedOverlay(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	conf := overlayTestConfig(t)
+
+	const size = 64 << 20
+	file := filepath.Join(testutil.TmpDir(), "usage-overlay")
+	done := file + ".done"
+	script := fmt.Sprintf("dd if=/dev/urandom of=%q bs=1M count=%d && echo ok > %q; while true; do sleep 1; done", file, size>>20, done)
+	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+	bundleDir := setupBundle(t, conf, spec)
+	cont := startContainer(t, conf, spec, bundleDir, nil)
+	waitForGuestFiles(t, conf, cont, done)
+
+	checkUsage := func(cont *Container, when string) {
+		t.Helper()
+		m, err := cont.Sandbox.Usage(true /* Full */)
+		if err != nil {
+			t.Fatalf("error getting usage %s: %v", when, err)
+		}
+		if m.Tmpfs >= size {
+			t.Errorf("overlay data reported as tmpfs memory %s: got Tmpfs = %d, want < %d", when, m.Tmpfs, size)
+		}
+	}
+	checkUsage(cont, "before checkpoint")
+
+	dir := makeTempDir(t, "checkpoint")
+	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	cont2 := newContainer(t, conf, spec, bundleDir, func(args *Args) {
+		args.CheckpointDirPath = dir
+	})
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+	waitForGuestFiles(t, conf, cont2, file)
+	checkUsage(cont2, "after restore")
 }
 
 func TestSplitFSCheckpointRestore(t *testing.T) {
@@ -2370,6 +2611,357 @@ func TestCheckpointRestoreAdjustedTSC(t *testing.T) {
 			}
 			const offsetCycles = 10_000_000_000 // ~4s
 			runAdjustedTSCTest(t, conf, 30 /* count */, offsetCycles)
+		})
+	}
+}
+
+type workloadHopSpec struct {
+	saveEngine       config.StateEnginePolicy
+	restoreEngine    config.StateEnginePolicy
+	compression      statefile.CompressionLevel
+	inspectStatefile bool
+}
+
+// workloadRootfsDir is the directory that runActiveWorkloadChain has the
+// workload exercise in an overlay root filesystem. It must not exist on the
+// host.
+const workloadRootfsDir = "/gvisor-state-workload-rootfs"
+
+// runActiveWorkloadChain runs the state-workload test app through the given
+// checkpoint/restore hops. Besides a tmpfs mount and a host bind mount, the
+// workload exercises the root filesystem if overlay (an --overlay2 value)
+// overlays it.
+func runActiveWorkloadChain(t *testing.T, conf *config.Config, overlay string, initEngine config.StateEnginePolicy, hops []workloadHopSpec) {
+	t.Helper()
+	rootOverlay := strings.HasPrefix(overlay, "root:")
+	if rootOverlay {
+		if _, err := os.Stat(workloadRootfsDir); !os.IsNotExist(err) {
+			t.Fatalf("%s must not exist on the host: stat error %v", workloadRootfsDir, err)
+		}
+	}
+
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-active-workload")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding dir: %q, %v", dir, err)
+	}
+
+	controlDir := filepath.Join(dir, "control")
+	if err := os.MkdirAll(controlDir, 0777); err != nil {
+		t.Fatalf("os.MkdirAll(controlDir) failed: %v", err)
+	}
+	if err := os.Chmod(controlDir, 0777); err != nil {
+		t.Fatalf("error chmoding controlDir: %v", err)
+	}
+
+	// hostDir is bind mounted into the container at hostMountPoint. The mount
+	// point must already exist since the root filesystem is the host's.
+	hostDir := filepath.Join(dir, "hostbind-src")
+	hostMountPoint := filepath.Join(dir, "hostbind-mnt")
+	for _, d := range []string{hostDir, hostMountPoint} {
+		if err := os.MkdirAll(d, 0777); err != nil {
+			t.Fatalf("os.MkdirAll(%q) failed: %v", d, err)
+		}
+		if err := os.Chmod(d, 0777); err != nil {
+			t.Fatalf("error chmoding %q: %v", d, err)
+		}
+	}
+
+	readWorkloadLog := func() string {
+		data, err := os.ReadFile(filepath.Join(controlDir, "workload.log"))
+		if err != nil {
+			return fmt.Sprintf("<unable to read workload.log: %v>", err)
+		}
+		return string(data)
+	}
+
+	args := []string{
+		app,
+		"state-workload",
+		"--control-dir=" + controlDir,
+		"--scratch-dir=/scratch",
+		"--host-dir=" + hostMountPoint,
+		fmt.Sprintf("--hops=%d", len(hops)),
+	}
+	if rootOverlay {
+		args = append(args, "--rootfs-dir="+workloadRootfsDir)
+	}
+	spec := testutil.NewSpecWithArgs(args...)
+	// A read-only root is never overlaid; make it writable so that writes go
+	// to the overlay's upper layer.
+	spec.Root.Readonly = !rootOverlay
+	spec.Mounts = append(spec.Mounts,
+		specs.Mount{
+			Destination: "/scratch",
+			Type:        "tmpfs",
+		},
+		specs.Mount{
+			Destination: hostMountPoint,
+			Source:      hostDir,
+			Type:        "bind",
+		},
+	)
+
+	baseConf := *conf
+	if err := baseConf.Overlay2.Set(overlay); err != nil {
+		t.Fatalf("Overlay2.Set(%q): %v", overlay, err)
+	}
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, &baseConf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	startConf := baseConf
+	startConf.StateEngine = initEngine
+	curCont, err := New(&startConf, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating initial container: %v", err)
+	}
+	defer func() {
+		if curCont != nil {
+			curCont.Destroy()
+		}
+	}()
+	if err := curCont.Start(&startConf); err != nil {
+		t.Fatalf("error starting initial container: %v", err)
+	}
+
+	for hopIdx, hop := range hops {
+		readyPath := filepath.Join(controlDir, fmt.Sprintf("phase%d.ready", hopIdx))
+		if err := testutil.Poll(func() error {
+			if logData := readWorkloadLog(); strings.Contains(logData, "FAIL:") {
+				return fmt.Errorf("workload reported failure:\n%s", logData)
+			}
+			_, err := os.Stat(readyPath)
+			return err
+		}, 30*time.Second); err != nil {
+			t.Fatalf("hop %d timed out waiting for %s: %v\nworkload log:\n%s", hopIdx, readyPath, err, readWorkloadLog())
+		}
+
+		ckptDir := filepath.Join(dir, fmt.Sprintf("ckpt-%d", hopIdx))
+		if err := os.MkdirAll(ckptDir, 0777); err != nil {
+			t.Fatalf("hop %d MkdirAll(%s): %v", hopIdx, ckptDir, err)
+		}
+		if err := os.Chmod(ckptDir, 0777); err != nil {
+			t.Fatalf("hop %d Chmod(%s): %v", hopIdx, ckptDir, err)
+		}
+
+		saveConf := baseConf
+		saveConf.StateEngine = hop.saveEngine
+		if err := curCont.Checkpoint(&saveConf, ckptDir, sandbox.CheckpointOpts{Compression: hop.compression}); err != nil {
+			t.Fatalf("hop %d Checkpoint (engine=%s): %v\nworkload log:\n%s", hopIdx, hop.saveEngine, err, readWorkloadLog())
+		}
+		curCont.Destroy()
+		curCont = nil
+
+		imgPath := filepath.Join(ckptDir, checkpointfiles.StateFileName)
+		if out, err := exec.Command(specutils.ExePath, "statefile", "-list", imgPath).CombinedOutput(); err != nil {
+			t.Fatalf("hop %d statefile -list failed: %v\n%s", hopIdx, err, out)
+		} else if !strings.Contains(string(out), sentryapi.CPUFeaturesKey) {
+			t.Errorf("hop %d statefile -list output %q missing %q", hopIdx, out, sentryapi.CPUFeaturesKey)
+		}
+
+		if hop.inspectStatefile {
+			dumpPath := filepath.Join(ckptDir, "statefile-dump.txt")
+			if out, err := exec.Command(specutils.ExePath, "statefile", "-output="+dumpPath, imgPath).CombinedOutput(); err != nil {
+				t.Fatalf("hop %d statefile dump failed: %v\n%s%s", hopIdx, err, out, preserveStatefile(t, hopIdx, imgPath))
+			}
+			dumpBytes, err := os.ReadFile(dumpPath)
+			if err != nil {
+				t.Fatalf("hop %d ReadFile(%s): %v", hopIdx, dumpPath, err)
+			}
+			dump := string(dumpBytes)
+			wantRoot := "g1r0 = kernel.Kernel{"
+			if hop.saveEngine == config.StateEngineWire {
+				wantRoot = ".Kernel]{"
+			}
+			for _, wantSub := range []string{
+				wantRoot,
+				"EventFileDescription",
+				"TimerFileDescription",
+				"regularFileFD",
+				"endpoint",
+			} {
+				if !strings.Contains(dump, wantSub) {
+					t.Errorf("hop %d statefile dump (len=%d) missing expected substring %q", hopIdx, len(dump), wantSub)
+				}
+			}
+
+			htmlPath := filepath.Join(ckptDir, "statefile-dump.html")
+			if out, err := exec.Command(specutils.ExePath, "statefile", "-html", "-output="+htmlPath, imgPath).CombinedOutput(); err != nil {
+				t.Fatalf("hop %d statefile -html dump failed: %v\n%s", hopIdx, err, out)
+			}
+		}
+
+		restoreConf := baseConf
+		restoreConf.StateEngine = hop.restoreEngine
+		nextCont, err := New(&restoreConf, Args{
+			ID:        testutil.RandomContainerID(),
+			Spec:      spec,
+			BundleDir: bundleDir,
+		})
+		if err != nil {
+			t.Fatalf("hop %d error creating restored container: %v", hopIdx, err)
+		}
+		curCont = nextCont
+
+		if err := curCont.Restore(&restoreConf, ckptDir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			t.Fatalf("hop %d Restore (saveEngine=%s, restoreEngine=%s): %v\nworkload log:\n%s", hopIdx, hop.saveEngine, hop.restoreEngine, err, readWorkloadLog())
+		}
+
+		goPath := filepath.Join(controlDir, fmt.Sprintf("phase%d.go", hopIdx+1))
+		if err := os.WriteFile(goPath, []byte("go\n"), 0666); err != nil {
+			t.Fatalf("hop %d WriteFile(%s): %v", hopIdx, goPath, err)
+		}
+	}
+
+	ws, err := curCont.Wait()
+	if err != nil {
+		t.Fatalf("Wait on final restored container failed: %v\nworkload log:\n%s", err, readWorkloadLog())
+	}
+	logOutput := readWorkloadLog()
+	if ws.ExitStatus() != 0 {
+		t.Fatalf("final restored container exited with status %v (exit=%d):\n%s", ws, ws.ExitStatus(), logOutput)
+	}
+	if _, err := os.Stat(filepath.Join(controlDir, "done.ok")); err != nil {
+		t.Fatalf("missing done.ok marker after container exit: %v\nworkload log:\n%s", err, logOutput)
+	}
+
+	// Writes to the host bind mount, made both before and after each restore,
+	// must have reached the host.
+	probeDir := filepath.Join(hostDir, "fsprobe")
+	var wantLog strings.Builder
+	wantLog.WriteString("fsprobe:hostbind\n")
+	for hop := range hops {
+		fmt.Fprintf(&wantLog, "hop=%d\nverified=%d\n", hop, hop)
+	}
+	if got, err := os.ReadFile(filepath.Join(probeDir, "log")); err != nil || string(got) != wantLog.String() {
+		t.Errorf("host bind mount log = (%q, %v), want %q", got, err, wantLog.String())
+	}
+	last := len(hops) - 1
+	for _, name := range []string{
+		fmt.Sprintf("renamed-%d", last),
+		fmt.Sprintf("dir-%d/f", last),
+		fmt.Sprintf("fresh-%d", last),
+	} {
+		if _, err := os.Stat(filepath.Join(probeDir, name)); err != nil {
+			t.Errorf("host bind mount file %q missing on host: %v", name, err)
+		}
+	}
+	if last > 0 {
+		if _, err := os.Stat(filepath.Join(probeDir, fmt.Sprintf("renamed-%d", last-1))); !os.IsNotExist(err) {
+			t.Errorf("host bind mount rename source still exists on host: stat error %v", err)
+		}
+	}
+	// Writes to the overlay root must not have reached the host.
+	if rootOverlay {
+		if _, err := os.Stat(workloadRootfsDir); !os.IsNotExist(err) {
+			t.Errorf("overlay root write leaked to host %s: stat error %v", workloadRootfsDir, err)
+		}
+	}
+}
+
+// preserveStatefile copies the statefile at imgPath to the test's undeclared
+// outputs directory, if any, so that failures to inspect it can be debugged.
+// It returns a message describing where the copy is, or why there is none.
+func preserveStatefile(t *testing.T, hopIdx int, imgPath string) string {
+	outDir := os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR")
+	if outDir == "" {
+		return ""
+	}
+	data, err := os.ReadFile(imgPath)
+	if err != nil {
+		return fmt.Sprintf("\n(failed to read statefile for preservation: %v)", err)
+	}
+	dst := filepath.Join(outDir, fmt.Sprintf("%s-hop%d-%s", strings.ReplaceAll(t.Name(), "/", "_"), hopIdx, checkpointfiles.StateFileName))
+	if err := os.WriteFile(dst, data, 0644); err != nil {
+		return fmt.Sprintf("\n(failed to preserve statefile: %v)", err)
+	}
+	return fmt.Sprintf("\nstatefile preserved as undeclared output %s", filepath.Base(dst))
+}
+
+// TestCheckpointRestoreActiveWorkload exercises chained multi-hop checkpoint
+// and restore of a realistic multi-subsystem container workload (child worker
+// process in separate PGID, shared memfd MAP_SHARED, private & file-backed
+// mmaps, open/unlinked tmpfs files, seek offsets, advisory locks, xattrs,
+// symlinks, custom signal handlers, loopback TCP/UDP with in-flight unread
+// buffers, Unix sockets with in-flight SCM_RIGHTS FDs, and epoll over
+// pipe/eventfd/timerfd), plus end-to-end `runsc statefile` graph formatting.
+// Open, mapped, renamed, and unlinked files are exercised in a tmpfs mount, a
+// host bind mount, and, with a root overlay, the root filesystem.
+func TestCheckpointRestoreActiveWorkload(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, overlay := range []string{"none", "root:memory"} {
+			t.Run(name+"/overlay="+overlay, func(t *testing.T) {
+				runActiveWorkloadChain(t, conf, overlay, config.StateEngineGraph, []workloadHopSpec{
+					{
+						saveEngine:    config.StateEngineGraph,
+						restoreEngine: config.StateEngineGraph,
+						compression:   statefile.CompressionLevelFlateBestSpeed,
+					},
+					{
+						saveEngine:       config.StateEngineGraph,
+						restoreEngine:    config.StateEngineGraph,
+						compression:      statefile.CompressionLevelNone,
+						inspectStatefile: true,
+					},
+				})
+			})
+		}
+	}
+}
+
+// TestCheckpointRestoreCrossEngineChained verifies cross-engine compatibility
+// across chained checkpoints (`wire -> graph -> wire` and `graph -> wire -> graph`)
+// on a live multi-subsystem container workload, ensuring state.Load auto-detects
+// stream format and restored Sentry object graphs re-serialize cleanly under
+// either engine. The root filesystem is overlaid so that overlay state also
+// crosses engines.
+func TestCheckpointRestoreCrossEngineChained(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			t.Run("wire_to_graph_to_wire", func(t *testing.T) {
+				runActiveWorkloadChain(t, conf, "root:memory", config.StateEngineWire, []workloadHopSpec{
+					{
+						saveEngine:       config.StateEngineWire,
+						restoreEngine:    config.StateEngineGraph,
+						compression:      statefile.CompressionLevelFlateBestSpeed,
+						inspectStatefile: true,
+					},
+					{
+						saveEngine:    config.StateEngineGraph,
+						restoreEngine: config.StateEngineWire,
+						compression:   statefile.CompressionLevelNone,
+					},
+				})
+			})
+			t.Run("graph_to_wire_to_graph", func(t *testing.T) {
+				runActiveWorkloadChain(t, conf, "root:memory", config.StateEngineGraph, []workloadHopSpec{
+					{
+						saveEngine:    config.StateEngineGraph,
+						restoreEngine: config.StateEngineWire,
+						compression:   statefile.CompressionLevelNone,
+					},
+					{
+						saveEngine:    config.StateEngineWire,
+						restoreEngine: config.StateEngineGraph,
+						compression:   statefile.CompressionLevelFlateBestSpeed,
+					},
+				})
+			})
 		})
 	}
 }

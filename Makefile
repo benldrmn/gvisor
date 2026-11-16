@@ -266,7 +266,7 @@ nogo-tests:
 #
 # FIXME(gvisor.dev/issue/10045): Need to fix broken tests.
 unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/trace/...)
+	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/runner/... test/trace/...)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
@@ -471,6 +471,8 @@ sandbox-posture-tests: load-basic_alpine $(RUNTIME_BIN)
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-nodirectfs-hostnet --directfs=false --network=host $(POSTURE_TEST_ARGS) $(ARGS))
 	@$(call install_runtime,$(RUNTIME)-posture-kvm,--platform=kvm)
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-kvm --platform=kvm $(POSTURE_TEST_ARGS) $(ARGS))
+	@$(call install_runtime,$(RUNTIME)-posture-coretags,--enable-core-tags)
+	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-coretags --enable-core-tags $(POSTURE_TEST_ARGS) $(ARGS))
 .PHONY: sandbox-posture-tests
 
 root-tests: load-basic_alpine $(RUNTIME_BIN)
@@ -493,6 +495,8 @@ docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime_noreload,$(RUNTIME)-host-uds,--host-uds=all) # Used by TestHostSocketConnect.
 	@$(call install_runtime_noreload,$(RUNTIME)-overlay,--overlay2=all:self) # Used by TestOverlay*.
 	@$(call install_runtime_noreload,$(RUNTIME)-net-uds,--network-proxy-path=$(NET_PROXY_SOCKET)) # Used by TestExternalUDSProxy*.
+	@$(call install_runtime_noreload,$(RUNTIME)-netgofer-proxy,--netgofer=proxy) # Used by TestNetgoferProxy*.
+	@$(call install_runtime_noreload,$(RUNTIME)-netgofer-proxy-loopback,--netgofer=proxy-loopback) # Used by TestNetgoferProxy*.
 	@$(call install_runtime,$(RUNTIME)-cgroupv2,--in-sandbox-cgroup=v2) # Used by TestSystemd* and TestPIDFDSelftests.
 	@$(call test_runtime_cached,$(RUNTIME),-- $(INTEGRATION_TARGETS) //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test //test/e2e:uds_proxy_test)
 .PHONY: docker-tests
@@ -677,16 +681,15 @@ run_benchmark = \
 	fi; \
 	exit $$exit_code)
 
-# $(1) is the platform name.
-# TODO: b/567563387 - consider not using --runtime here to describe the platform
-# in the BigQuery parser for these non-docker tests.
-run_platform_benchmark = \
+# $(1) is the runtime name reported to BigQuery, and $(2) holds extra arguments
+# for the benchmark binary.
+run_nodocker_benchmark = \
 	($(call header,BENCHMARK $(1)); \
 	set -euo pipefail; \
 	export T=$$(mktemp --tmpdir logs.$(1).XXXXXX); \
 	trap 'rm -rf "$$T"' EXIT; \
 	exit_code=0; \
-	$(call sudo,$(BENCHMARKS_TARGETS),--test_platforms=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T || exit_code=$$?; \
+	$(call sudo,$(BENCHMARKS_TARGETS),$(2) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T || exit_code=$$?; \
 	if test "$(BENCHMARKS_UPLOAD)" = "true"; then \
 	  upload_ret=0; \
 	  $(call run,tools/parsers:parser,parse --debug --file=$$T --runtime=$(1) --suite_name=$(BENCHMARKS_SUITE) --project=$(BENCHMARKS_PROJECT) --dataset=$(BENCHMARKS_DATASET) --table=$(BENCHMARKS_TABLE) --official=$(BENCHMARKS_OFFICIAL)) || upload_ret=$$?; \
@@ -695,6 +698,11 @@ run_platform_benchmark = \
 	  fi; \
 	fi; \
 	exit $$exit_code)
+
+# $(1) is the platform name.
+# TODO: b/567563387 - consider not using --runtime here to describe the platform
+# in the BigQuery parser for these non-docker tests.
+run_platform_benchmark = $(call run_nodocker_benchmark,$(1),--test_platforms=$(1))
 
 # TODO: b/529809802 - Enable benchmarks for slimvm.
 benchmark-platforms: load-benchmarks $(RUNTIME_BIN) ## Runs benchmarks for runc and all (selected) platforms.
@@ -737,6 +745,10 @@ benchmark-platforms-nodocker: $(RUNTIME_BIN) ## Runs non-Docker benchmarks for a
 	exit $$exit_code
 .PHONY: benchmark-platforms-nodocker
 
+benchmark-nodocker: ## Runs non-Docker benchmarks once, without selecting a platform.
+	@$(call run_nodocker_benchmark,runsc)
+.PHONY: benchmark-nodocker
+
 run-benchmark: load-benchmarks ## Runs single benchmark and optionally sends data to BigQuery.
 	@$(call run_benchmark,$(RUNTIME))
 .PHONY: run-benchmark
@@ -774,7 +786,8 @@ benchmark-refresh-pgo: load-benchmarks $(RUNTIME_BIN) ## Refresh profiles of all
 		echo 'Must specify BENCHMARKS_PLATFORMS.' >&2; \
 		exit 1; \
 	else \
-		PGO_RUNTIME_KEY="$$( $(call run,tools/profiletool,runtime-info) )"; \
+		PGO_PROFILETOOL="$$( $(call build,tools/profiletool) )"; \
+		PGO_RUNTIME_KEY="$$( "$${PGO_PROFILETOOL}" runtime-info )"; \
 		export PGO_RUNTIME_KEY; \
 		PGO_LAST_PKG_COMMIT_HASH="$$(git log --max-count=1 --format='%H' -- pkg)"; \
 		export PGO_LAST_PKG_COMMIT_HASH; \
@@ -795,25 +808,28 @@ benchmark-refresh-pgo: load-benchmarks $(RUNTIME_BIN) ## Refresh profiles of all
 				export PGO_PROFILE_OLD; \
 				PGO_PROFILE_NEW="$${PLATFORM_TMPDIR}/$${PGO_BENCHMARK_BASENAME}.pgo.pprof.pb.gz"; \
 				export PGO_PROFILE_NEW; \
-				if [[ -f "$${PGO_PROFILE_OLD_COMMIT_HASH}" ]] && [[ "$$(cat "$${PGO_PROFILE_OLD_COMMIT_HASH}")" == "$${PGO_LAST_PKG_COMMIT_HASH}" ]]; then \
-					echo "Skipping refresh for $${PGO_PROFILE_OLD}: profile is already up-to-date." >&2; \
-					continue; \
-				fi; \
-				if [[ -f "$${PGO_PROFILE_OLD}" ]] && [[ "$$(stat -c %Y $${PGO_PROFILE_OLD})" -gt "$$(date +%s -d '$(BENCHMARKS_PGO_REFRESH_MIN_DAYS_SINCE_LAST_UPDATE) days ago')" ]]; then \
-					echo "Skipping refresh for $${PGO_PROFILE_OLD}: profile is less than $(BENCHMARKS_PGO_REFRESH_MIN_DAYS_SINCE_LAST_UPDATE) days old." >&2; \
-					continue; \
+				if [[ -f "$${PGO_PROFILE_OLD}" ]]; then \
+					if [[ -f "$${PGO_PROFILE_OLD_COMMIT_HASH}" ]] && [[ "$$(cat "$${PGO_PROFILE_OLD_COMMIT_HASH}")" == "$${PGO_LAST_PKG_COMMIT_HASH}" ]]; then \
+						echo "Skipping refresh for $${PGO_PROFILE_OLD}: profile is already up-to-date." >&2; \
+						continue; \
+					fi; \
+					PGO_PROFILE_TIME="$$( "$${PGO_PROFILETOOL}" timestamp "$${PGO_PROFILE_OLD}" )"; \
+					if [[ "$${PGO_PROFILE_TIME}" -gt "$$(date +%s -d '$(BENCHMARKS_PGO_REFRESH_MIN_DAYS_SINCE_LAST_UPDATE) days ago')" ]]; then \
+						echo "Skipping refresh for $${PGO_PROFILE_OLD}: profile is less than $(BENCHMARKS_PGO_REFRESH_MIN_DAYS_SINCE_LAST_UPDATE) days old." >&2; \
+						continue; \
+					fi; \
 				fi; \
 				mkdir -p "$$(dirname "$${PGO_PROFILE_OLD}")"; \
 				mkdir -p "$${PLATFORM_TMPDIR}/$${PGO_BENCHMARK_BASENAME}"; \
 				$(call install_runtime,$${PLATFORM}_$${PGO_RUNTIME_KEY}_pgo_$${PGO_BENCHMARK_BASENAME},--platform $${PLATFORM} --profile --profile-gc-interval=3s --profile-cpu="$${PLATFORM_TMPDIR}/$${PGO_BENCHMARK_BASENAME}/$${PGO_BENCHMARK_BASENAME}.%YYYY%-%MM%-%DD%_%HH%-%II%-%SS%-%NN%.pgo.pprof.pb.gz"); \
 				$(call sudo,$${PGO_BENCHMARK_TARGET},-runtime=$${PLATFORM}_$${PGO_RUNTIME_KEY}_pgo_$${PGO_BENCHMARK_BASENAME} -pgo-benchmarks=true $(BENCHMARKS_ARGS_PGO)); \
-				$(call run,tools/profiletool,merge --out="$${PGO_PROFILE_NEW}" "$${PLATFORM_TMPDIR}/$${PGO_BENCHMARK_BASENAME}"); \
+				"$${PGO_PROFILETOOL}" merge --out="$${PGO_PROFILE_NEW}" "$${PLATFORM_TMPDIR}/$${PGO_BENCHMARK_BASENAME}"; \
 				rm -rf --one-file-system "$${PLATFORM_TMPDIR}/$${PGO_BENCHMARK_BASENAME}"; \
 				if [[ ! -f "$${PGO_PROFILE_OLD}" ]]; then \
 					cp "$${PGO_PROFILE_NEW}" "$${PGO_PROFILE_OLD}"; \
 					echo "$${PGO_LAST_PKG_COMMIT_HASH}" > "$${PGO_PROFILE_OLD_COMMIT_HASH}"; \
 					echo "--- PGO: Added new profile for $${PGO_BENCHMARK_BASENAME} on $${PGO_RUNTIME_KEY} $${PLATFORM}" >&2; \
-				elif $(call run,tools/profiletool,check-similar --threshold=$(BENCHMARKS_PGO_REFRESH_THRESHOLD) "$${PGO_PROFILE_OLD}" "$${PGO_PROFILE_NEW}"); then \
+				elif "$${PGO_PROFILETOOL}" check-similar --threshold=$(BENCHMARKS_PGO_REFRESH_THRESHOLD) "$${PGO_PROFILE_OLD}" "$${PGO_PROFILE_NEW}"; then \
 					echo "--- PGO: Profile for $${PGO_BENCHMARK_BASENAME} on $${PGO_RUNTIME_KEY} $${PLATFORM} is already up-to-date." >&2; \
 				else \
 					cp "$${PGO_PROFILE_NEW}" "$${PGO_PROFILE_OLD}"; \
@@ -829,6 +845,26 @@ benchmark-refresh-pgo: load-benchmarks $(RUNTIME_BIN) ## Refresh profiles of all
 seccomp-sentry-filters:  # Dumps seccomp-bpf program for the Sentry binary.
 	@$(call run,//runsc/boot/filter/dumpfilter,$(ARGS))
 .PHONY: seccomp-sentry-filters
+
+##
+## Compatibility testing.
+##
+FSCHECKPOINT_CORPUS_DIR ?= $(CURDIR)/.fscheckpoint_corpus/compatibility_testing
+
+fscheckpoint-corpus-generate: $(RUNTIME_BIN) ## Generate a fscheckpoint compatibility corpus snapshot.
+	@set -e; \
+	CORPUS_OUT="$${FSCHECKPOINT_GENERATE_CORPUS_DIR:-$(CURDIR)/compatibility_testing}"; \
+	HEAD_HASH="$$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"; \
+	TIMESTAMP="$$(date +%Y%m%d-%H%M%S)"; \
+	OUT_DIR="$${CORPUS_OUT}/$${TIMESTAMP}_$${HEAD_HASH}"; \
+	mkdir -p "$${OUT_DIR}"; \
+	$(call sudo,//runsc/container:fscheckpoint_compat_test,-test.v -test.run=TestFSCheckpointCorpusGenerate -fscheckpoint-generate-dir="$${OUT_DIR}" $(if $(FSCHECKPOINT_RUNSC_BIN),-fscheckpoint-runsc-bin="$(FSCHECKPOINT_RUNSC_BIN)")); \
+	echo "Generated fscheckpoint corpus snapshot at $${OUT_DIR}"
+.PHONY: fscheckpoint-corpus-generate
+
+fscheckpoint-compat-tests: ## Run fscheckpoint backward compatibility tests against corpus.
+	@$(call test,--sandbox_add_mount_pair=$(FSCHECKPOINT_CORPUS_DIR) --test_env=FSCHECKPOINT_CORPUS_DIR=$(FSCHECKPOINT_CORPUS_DIR) //runsc/container:fscheckpoint_compat_test -- -test.v -test.run=TestFSCheckpointCompatibility)
+.PHONY: fscheckpoint-compat-tests
 
 ##
 ## Website & documentation helpers.
@@ -1023,14 +1059,16 @@ tag: ## Stages a release tag; the release pipeline publishes it once the artifac
 ##   These run source-level formatting and lint checks.
 ##   Deep Go analysis is owned by gVisor nogo.
 ##
+
+lint_sh = $(call wrapper,tools/lint.sh --bazel="$(BAZEL)" --bazel-options="$(BASE_OPTIONS) $(BAZEL_OPTIONS)" $(1))
 lint: ensure-bazel-server ## Runs the source linters.
-	@$(call wrapper,tools/lint.sh)
+	@$(call lint_sh)
 .PHONY: lint
 
 lint-fix: ensure-bazel-server ## Reformats sources in place.
-	@$(call wrapper,tools/lint.sh --fix)
+	@$(call lint_sh,--fix)
 .PHONY: lint-fix
 
-lint-cc: ensure-bazel-server ## Runs clang-tidy over the C++ sources; needs bazel for compile_commands.json.
-	@$(call wrapper,tools/lint.sh clang-tidy)
+lint-cc: ensure-bazel-server ## Runs clang-tidy over the C++ sources.
+	@$(call lint_sh,clang-tidy)
 .PHONY: lint-cc

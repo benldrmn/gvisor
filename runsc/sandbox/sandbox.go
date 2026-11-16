@@ -174,6 +174,9 @@ type Sandbox struct {
 	// Zero if unknown.
 	PidIdentity uint64 `json:"pidIdentity,omitempty"`
 
+	// NetgoferPid is the PID of the netgofer running alongside the sandbox.
+	NetgoferPid Pid `json:"netgoferPid"`
+
 	// UID is the user ID in the parent namespace that the sandbox is running as.
 	UID int `json:"uid"`
 	// GID is the group ID in the parent namespace that the sandbox is running as.
@@ -247,6 +250,16 @@ type Sandbox struct {
 	// will have it as a child process.
 	child bool `nojson:"true"`
 
+	// netgoferMu protects NetgoferPid, netgoferIsChild, and netgoferStopped.
+	netgoferMu sync.Mutex `nojson:"true"`
+
+	// netgoferIsChild is set if the netgofer process is a child of the current process.
+	netgoferIsChild bool `nojson:"true"`
+
+	// netgoferStopped is closed when a child netgofer process has been reaped by
+	// reapNetgoferBackground.
+	netgoferStopped chan struct{} `nojson:"true"`
+
 	// statusMu protects status.
 	statusMu sync.Mutex `nojson:"true"`
 
@@ -254,6 +267,8 @@ type Sandbox struct {
 	// child==true and the sandbox was waited on. This field allows for multiple
 	// threads to wait on sandbox and get the exit code, since Linux will return
 	// WaitStatus to one of the waiters only.
+	//
+	// +checklocks:statusMu
 	status unix.WaitStatus `nojson:"true"`
 
 	// Checkpointed will be true when the sandbox has been checkpointed.
@@ -288,6 +303,10 @@ type Args struct {
 
 	// Spec is the OCI spec that describes the container.
 	Spec *specs.Spec
+
+	// NvidiaDriverVersion is the NVIDIA driver ABI version for nvproxy, or
+	// empty if nvproxy is disabled.
+	NvidiaDriverVersion string
 
 	// BundleDir is the directory containing the container bundle.
 	BundleDir string
@@ -476,7 +495,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 		return err
 	}
 	// Configure the network.
-	if err := setupNetwork(conn, pid, conf, disableIPv6, false); err != nil {
+	if err := s.setupNetwork(conn, pid, spec, conf, disableIPv6, false); err != nil {
 		return fmt.Errorf("setting up network: %w", err)
 	}
 
@@ -487,6 +506,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 
 	// Send a message to the sandbox control server to start the root container.
 	if err := conn.Call(sentryapi.ContMgrRootContainerStart, &s.ID, nil); err != nil {
+		s.stopNetgofer()
 		return fmt.Errorf("starting root container: %w", err)
 	}
 	s.RegisteredMetrics = registeredMetrics
@@ -664,10 +684,13 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		}
 		// Scrape the host network to get the network config and store it in the
 		// loader. The kernel will restore loaded network stack with this config.
-		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
+		if err := s.setupNetwork(conn, s.Pid.Load(), spec, conf, disableIPv6, true); err != nil {
 			return fmt.Errorf("setting up network: %w", err)
 		}
 	} else {
+		if conf.Netgofer.Enabled() {
+			log.Warningf("Netgofer proxy is enabled (--netgofer=%s) but custom network args are provided for restore; netgofer will not be started", conf.Netgofer)
+		}
 		// When network args is not nil, set it in the loader which will be used
 		// during restore to configure the loaded stack.
 		log.Debugf("Setting up network args, config: %+v", networkArgs)
@@ -684,6 +707,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	// Restore the container and start the root container.
 	var reply sentryapi.RestoreReply
 	if err := conn.Call(sentryapi.ContMgrRestore, &opt, &reply); err != nil {
+		s.stopNetgofer()
 		if opt.UseCheckpointGofer {
 			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
@@ -1072,6 +1096,33 @@ func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []str
 	return env
 }
 
+// sentryGODEBUG returns the GODEBUG settings for the sandbox process.
+func sentryGODEBUG(conf *config.Config) []string {
+	// The Go runtime keeps its cgroup's CPU limit file open for the lifetime
+	// of the process to keep GOMAXPROCS in sync with the limit. The sentry
+	// sets GOMAXPROCS itself, so do not hold a host FD that it does not need.
+	godebug := []string{"containermaxprocs=0"}
+	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff
+	// isn't set.
+	if conf.Platform == "kvm" || conf.Platform == "slimvm" {
+		godebug = append(godebug, "asyncpreemptoff=1")
+	}
+	if conf.Network == config.NetworkPlugin {
+		godebug = append(godebug, "cgocheck=0")
+	}
+	// Heap profiles can only be collected from the sentry with --profile.
+	// Without it, don't sample heap allocations: each sampled allocation
+	// site costs a stack unwind and a profiling bucket that is never freed,
+	// and the first sample maps the runtime's ~1.4 MB bucket hash table.
+	// This must be set through GODEBUG rather than runtime.MemProfileRate,
+	// because much of the sentry's heap is allocated by package
+	// initializers, before main runs.
+	if !conf.ProfileEnable {
+		godebug = append(godebug, "memprofilerate=0")
+	}
+	return godebug
+}
+
 // sentryExeFD is the FD at which the prewarmer inherits the Sentry binary.
 // Must match `SENTRY_EXE_FD` in `runsc/prewarmer/prewarmer.c`.
 // LINT.IfChange
@@ -1232,6 +1283,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	if err := donations.DonateLogFile("final-metrics-log-fd", conf.FinalMetricsLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, lfOpts); err != nil {
 		return fmt.Errorf("donating final metrics log file: %w", err)
 	}
+	if err := donations.DonateLogFile("boot-times-log-fd", conf.BootTimesLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, lfOpts); err != nil {
+		return fmt.Errorf("donating boot times log file: %w", err)
+	}
 	rootfsTarPath := specutils.RootfsTarUpperPath(args.Spec)
 	if err := donations.DonateLogFile("rootfs-upper-tar-fd", rootfsTarPath, rootfsUpperTarFlags(rootfsTarPath), lfOpts); err != nil {
 		return fmt.Errorf("donating rootfs tar file: %w", err)
@@ -1293,20 +1347,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		donations.DonateAndClose("device-fd", deviceFile.ReleaseToFile("device file"))
 	}
 
-	// The Go runtime keeps its cgroup's CPU limit file open for the lifetime
-	// of the process to keep GOMAXPROCS in sync with the limit. The sentry
-	// sets GOMAXPROCS itself, so do not hold a host FD that it does not need.
-	godebug := []string{"containermaxprocs=0"}
-	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff
-	// isn't set.
-	if conf.Platform == "kvm" || conf.Platform == "slimvm" {
-		godebug = append(godebug, "asyncpreemptoff=1")
-	}
-	if conf.Network == config.NetworkPlugin {
-		godebug = append(godebug, "cgocheck=0")
-	}
 	// Go only reads the first GODEBUG variable in the environment.
-	cmd.Env = append(cmd.Env, "GODEBUG="+strings.Join(godebug, ","))
+	cmd.Env = append(cmd.Env, "GODEBUG="+strings.Join(sentryGODEBUG(conf), ","))
 
 	// nss is the set of namespaces to join or create before starting the sandbox
 	// process. Mount, IPC and UTS namespaces from the host are not used as they
@@ -1321,12 +1363,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		{Type: specs.PIDNamespace},
 	}
 
-	if specutils.NVProxyEnabled(args.Spec, conf) {
-		version, err := getNvproxyDriverVersion(conf)
-		if err != nil {
-			return fmt.Errorf("failed to get Nvidia driver version: %w", err)
-		}
-		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+version)
+	if args.NvidiaDriverVersion != "" {
+		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+args.NvidiaDriverVersion)
 	}
 
 	// Joins the network namespace if network is enabled. the sandbox talks
@@ -1595,6 +1633,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	donation.LogDonations(cmd)
 	log.Debugf("Starting sandbox: %s %v", cmd.Path, cmd.Args)
 	log.Debugf("SysProcAttr: %+v", cmd.SysProcAttr)
+	// Pass the current time so the sandbox process knows when it was spawned.
+	cmd.Env = starttime.SpawnEnviron(cmd.Env)
 	if err := specutils.StartInNS(cmd, nss); err != nil {
 		err := fmt.Errorf("starting sandbox: %v", err)
 		// If the sandbox failed to start, it may be because the binary
@@ -1701,6 +1741,26 @@ func cgroupCPUNum(cg cgroup.Cgroup) int {
 	return cpuNum
 }
 
+// CalculateCPUNum calculates the number of CPUs to configure for a process in
+// a cgroup, bounded by cpuset. If limits is set, it holds the application CPU
+// limit.
+func CalculateCPUNum(cg cgroup.Cgroup, limits *CPULimits, cpuNumFromQuota bool) (int, error) {
+	cgCPUNum := runtime.NumCPU()
+	if cg != nil {
+		if n, err := cg.NumCPU(); err == nil {
+			cgCPUNum = n
+		}
+	}
+	if !cpuNumFromQuota {
+		return cgCPUNum, nil
+	}
+	cpuNum, _, _, err := calculateCPUNum(cg, cgCPUNum, limits, true)
+	if err != nil {
+		return cgCPUNum, err
+	}
+	return cpuNum, nil
+}
+
 // calculateCPUNum calculates the number of CPUs to configure for the sandbox,
 // out of the `cgCPUNum` CPUs that `cg` can run on, along with the cgroup CPU
 // quota and period.
@@ -1710,8 +1770,15 @@ func calculateCPUNum(cg cgroup.Cgroup, cgCPUNum int, limits *CPULimits, cpuNumFr
 	cpuNum := cgCPUNum
 	var cpuQuota, cpuPeriod int64
 	if limits != nil {
-		cpuQuota, cpuPeriod = *limits.App.Quota, int64(*limits.App.Period)
-	} else {
+		if limits.App.Quota != nil {
+			cpuQuota = *limits.App.Quota
+		}
+		if limits.App.Period != nil && *limits.App.Period <= math.MaxInt64 {
+			cpuPeriod = int64(*limits.App.Period)
+		} else if cpuQuota > 0 {
+			cpuPeriod = cgroup.DefaultCPUPeriod
+		}
+	} else if cg != nil {
 		var err error
 		if cpuQuota, err = cg.CPUQuota(); err != nil {
 			return 0, 0, 0, fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
@@ -1904,7 +1971,132 @@ func (s *Sandbox) destroy() error {
 		}
 	}
 
+	s.stopNetgofer()
+
 	return nil
+}
+
+func isNetgoferProcess(pid int, sandboxID string) bool {
+	if pid <= 0 || sandboxID == "" {
+		return false
+	}
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	if len(args) == 0 || args[0] != "runsc-netgofer" {
+		return false
+	}
+	// startProxy() always appends the sandbox ID as the final positional
+	// argument.
+	return args[len(args)-1] == sandboxID
+}
+
+// netgoferGracePeriod is how long stopNetgofer() waits for netgofer to notice
+// that its UDS peer closed and exit on its own, before resorting to SIGKILL.
+const netgoferGracePeriod = 100 * time.Millisecond
+
+// netgoferKillTimeout bounds how long stopNetgofer() waits for netgofer to die
+// after SIGKILL. stopNetgofer() runs on the container deletion path and must
+// not be able to block indefinitely.
+const netgoferKillTimeout = 5 * time.Second
+
+// StopNetgofer stops the netgofer process running alongside the sandbox.
+func (s *Sandbox) StopNetgofer() {
+	s.stopNetgofer()
+}
+
+func (s *Sandbox) stopNetgofer() {
+	s.netgoferMu.Lock()
+	netgoferPid := s.NetgoferPid.Load()
+	if netgoferPid == 0 {
+		s.netgoferMu.Unlock()
+		return
+	}
+	isChild := s.netgoferIsChild
+	stopped := s.netgoferStopped
+	s.netgoferMu.Unlock()
+
+	if isChild && stopped != nil {
+		// Wait briefly for netgofer to exit gracefully (e.g. when the sandbox
+		// process exits and closes its end of the UDS socketpair).
+		select {
+		case <-stopped:
+			return
+		case <-time.After(netgoferGracePeriod):
+		}
+
+		s.netgoferMu.Lock()
+		if pid := s.NetgoferPid.Load(); pid == netgoferPid {
+			log.Debugf("Killing netgofer %q PID %d", s.ID, pid)
+			_ = unix.Kill(pid, unix.SIGKILL)
+		}
+		s.netgoferMu.Unlock()
+		select {
+		case <-stopped:
+		case <-time.After(netgoferKillTimeout):
+			log.Warningf("Timed out waiting for netgofer %q PID %d to be reaped", s.ID, netgoferPid)
+		}
+		return
+	}
+
+	if !isNetgoferProcess(netgoferPid, s.ID) {
+		s.netgoferMu.Lock()
+		if s.NetgoferPid.Load() == netgoferPid {
+			s.NetgoferPid.Store(0)
+		}
+		s.netgoferMu.Unlock()
+		return
+	}
+
+	if err := specutils.WaitForNonChildExit(netgoferPid, 0, netgoferGracePeriod); err != nil {
+		if isNetgoferProcess(netgoferPid, s.ID) {
+			log.Debugf("Killing netgofer %q PID %d", s.ID, netgoferPid)
+			_ = unix.Kill(netgoferPid, unix.SIGKILL)
+			if err := specutils.WaitForNonChildExit(netgoferPid, 0, netgoferKillTimeout); err != nil {
+				log.Warningf("Timed out waiting for netgofer %q PID %d to exit: %v", s.ID, netgoferPid, err)
+			}
+		}
+	}
+	s.netgoferMu.Lock()
+	if s.NetgoferPid.Load() == netgoferPid {
+		s.NetgoferPid.Store(0)
+	}
+	s.netgoferMu.Unlock()
+}
+
+func (s *Sandbox) reapNetgoferBackground(pid int, stopped chan struct{}) {
+	go func() {
+		defer close(stopped)
+		// Wait for the child to exit WITHOUT reaping it from the kernel process
+		// table (WNOWAIT), so the PID cannot be recycled before we clear NetgoferPid.
+		for {
+			err := unix.Waitid(unix.P_PID, pid, &unix.Siginfo{}, unix.WEXITED|unix.WNOWAIT, nil)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			break
+		}
+		s.netgoferMu.Lock()
+		defer s.netgoferMu.Unlock()
+		if s.NetgoferPid.Load() == pid {
+			s.NetgoferPid.Store(0)
+		}
+		var status unix.WaitStatus
+		for {
+			_, err := unix.Wait4(pid, &status, 0, nil)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			if err == nil {
+				log.Infof("Netgofer process (PID=%d) reaped: exit code = %v", pid, status.ExitStatus())
+			} else if !errors.Is(err, unix.ECHILD) {
+				log.Warningf("error reaping netgofer process (PID=%d) from background goroutine: %v", pid, err)
+			}
+			break
+		}
+	}()
 }
 
 // SignalContainer sends the signal to a container in the sandbox. If all is
@@ -1989,6 +2181,10 @@ type CheckpointOpts struct {
 	SaveRestoreExecTimeout     time.Duration
 	SaveRestoreExecContainerID string
 	SplitFSCheckpointPaths     []string
+
+	// StateEngine, when non-nil, overrides the sandbox's boot-time state
+	// serialization engine for this checkpoint.
+	StateEngine *config.StateEnginePolicy
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -2020,6 +2216,15 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 			Timeout:     opts.SaveRestoreExecTimeout,
 			ContainerID: opts.SaveRestoreExecContainerID,
 		},
+	}
+	if opts.StateEngine != nil {
+		useGraph := *opts.StateEngine == config.StateEngineGraph
+		opt.GraphEngine = &useGraph
+	} else if conf != nil {
+		if cliEngine, ok := conf.CLIStateEngine(); ok {
+			useGraph := cliEngine == config.StateEngineGraph
+			opt.GraphEngine = &useGraph
+		}
 	}
 	defer opt.FilePayload.Close()
 	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, bundles, &opt); err != nil {
@@ -2974,9 +3179,9 @@ func deviceFileForPlatform(name, devicePath string) (*fd.FD, error) {
 	return f, nil
 }
 
-// getNvproxyDriverVersion returns the NVIDIA driver ABI version to use by
+// NVProxyDriverVersion returns the NVIDIA driver ABI version to use by
 // nvproxy, or "latest", which the sentry resolves to the newest supported ABI.
-func getNvproxyDriverVersion(conf *config.Config) (string, error) {
+func NVProxyDriverVersion(conf *config.Config) (string, error) {
 	switch conf.NVProxyDriverVersion {
 	case "":
 		return nvconf.HostDriverVersion()
@@ -3200,6 +3405,13 @@ func SetUserMappings(spec *specs.Spec, pid int) error {
 		}
 	}
 	return nil
+}
+
+// DrainDentryCache drains unused dentries in the filesystem selected by path in
+// the container's init process view. It does not disable caching or pause tasks.
+func (s *Sandbox) DrainDentryCache(cid, path string) error {
+	args := sentryapi.DrainDentryCacheArgs{ContainerID: cid, Path: path}
+	return s.call(sentryapi.ContMgrDrainDentryCache, &args, nil)
 }
 
 // Mount mounts a filesystem in a container.

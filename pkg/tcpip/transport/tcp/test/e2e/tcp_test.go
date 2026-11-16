@@ -383,11 +383,11 @@ func TestConnectICMPError(t *testing.T) {
 	defer syn.Release()
 	checker.IPv4(t, syn, checker.TCP(checker.TCPFlags(header.TCPFlagSyn)))
 
-	wep := ep.(interface {
-		LastErrorLocked() tcpip.Error
-	})
-
-	if d := cmp.Diff(&tcpip.ErrHostUnreachable{}, wep.LastErrorLocked()); d != "" {
+	tcpEP := ep.(*tcp.Endpoint)
+	tcpEP.LockUser()
+	softError := tcpEP.LastErrorLocked()
+	tcpEP.UnlockUser()
+	if d := cmp.Diff(&tcpip.ErrHostUnreachable{}, softError); d != "" {
 		t.Errorf("ep.LastErrorLocked() mismatch (-want +got):\n%s", d)
 	}
 
@@ -489,6 +489,30 @@ func TestCloseWithoutConnect(t *testing.T) {
 
 	if got := c.Stack().Stats().TCP.CurrentConnected.Value(); got != 0 {
 		t.Errorf("got stats.TCP.CurrentConnected.Value() = %d, want = 0", got)
+	}
+}
+
+func BenchmarkWildcardBindClose(b *testing.B) {
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+	})
+	defer func() {
+		s.Close()
+		s.Wait()
+	}()
+	var wq waiter.Queue
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ep, err := s.NewEndpoint(tcp.ProtocolNumber, ipv6.ProtocolNumber, &wq)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := ep.Bind(tcpip.FullAddress{Port: 1234}); err != nil {
+			b.Fatal(err)
+		}
+		ep.Close()
 	}
 }
 
@@ -3209,20 +3233,38 @@ func TestSimpleSend(t *testing.T) {
 }
 
 func TestZeroWindowSend(t *testing.T) {
-	c := context.New(t, e2e.DefaultMTU)
+	clock := faketime.NewManualClock()
+	c := context.NewWithOpts(t, context.Options{EnableV4: true, MTU: e2e.DefaultMTU, Clock: clock})
 	defer c.Cleanup()
 
 	c.CreateConnected(context.TestInitialSequenceNumber, 0 /* rcvWnd */, -1 /* epRcvBuf */)
 
 	data := []byte{1, 2, 3}
-	var r bytes.Reader
-	r.Reset(data)
-	if _, err := c.EP.Write(&r, tcpip.WriteOptions{}); err != nil {
-		t.Fatalf("Write failed: %s", err)
+	write := func(p []byte) {
+		t.Helper()
+		if _, err := c.EP.Write(bytes.NewReader(p), tcpip.WriteOptions{}); err != nil {
+			t.Fatalf("Write failed: %s", err)
+		}
 	}
+	var info tcpip.TCPInfoOption
+	if err := c.EP.GetSockOpt(&info); err != nil {
+		t.Fatalf("GetSockOpt(TCPInfoOption): %s", err)
+	}
+	write(data[:1])
+	clock.Advance(info.RTO / 2)
+	write(data[1:])
 
-	// Check if we got a zero-window probe.
-	b := c.GetPacket()
+	// The second write must not move the first probe's deadline.
+	clock.Advance(info.RTO - info.RTO/2 - time.Nanosecond)
+	if b := c.GetPacketNonBlocking(); b != nil {
+		b.Release()
+		t.Fatal("zero-window probe before the original deadline")
+	}
+	clock.Advance(time.Nanosecond)
+	b := c.GetPacketNonBlocking()
+	if b == nil {
+		t.Fatal("no zero-window probe at the original deadline")
+	}
 	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
@@ -3488,27 +3530,23 @@ func TestNonScaledWindowAccept(t *testing.T) {
 }
 
 func TestZeroScaledWindowReceive(t *testing.T) {
-	// This test ensures that the endpoint sends a non-zero window size
-	// advertisement when the scaled window transitions from 0 to non-zero,
-	// but the actual window (not scaled) hasn't gotten to zero.
 	c := context.New(t, e2e.DefaultMTU)
 	defer c.Cleanup()
 
 	// Set the buffer size such that a window scale of 5 will be used.
 	const bufSz = 65535 * 10
 	const ws = uint32(5)
+	const segmentSize = 50000
 	c.CreateConnectedWithRawOptions(context.TestInitialSequenceNumber, 30000, bufSz, []byte{
 		header.TCPOptionWS, 3, 0, header.TCPOptionNOP,
 	})
 
-	// Write chunks of 50000 bytes.
-	remain := 0
 	sent := 0
-	data := make([]byte, 50000)
+	data := make([]byte, segmentSize)
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	// Keep writing till the window drops below len(data).
-	for {
-		c.SendPacket(data, &context.Headers{
+	send := func(n int) int {
+		t.Helper()
+		c.SendPacket(data[:n], &context.Headers{
 			SrcPort: context.TestPort,
 			DstPort: c.Port,
 			Flags:   header.TCPFlagAck,
@@ -3516,7 +3554,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 			AckNum:  c.IRS.Add(1),
 			RcvWnd:  30000,
 		})
-		sent += len(data)
+		sent += n
 		pkt := c.GetPacket()
 		defer pkt.Release()
 		checker.IPv4(t, pkt,
@@ -3528,64 +3566,73 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 				checker.TCPFlags(header.TCPFlagAck),
 			),
 		)
-		// Don't reduce window to zero here.
-		if wnd := int(header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize()); wnd<<ws < len(data) {
-			remain = wnd << ws
-			break
+		return int(header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize()) << ws
+	}
+
+	// Leave one window unit unconsumed. Every ACK must still cover the
+	// bytes the peer was entitled to send under the previous advertisement.
+	const unit = 1 << ws
+	remain := send(segmentSize)
+	for remain > unit {
+		n := min(segmentSize, remain-unit)
+		next := send(n)
+		if left := remain - n; next < left {
+			t.Fatalf("window after sending %d bytes = %d, want at least %d", n, next, left)
+		}
+		remain = next
+	}
+	if got, want := remain, unit; got != want {
+		t.Fatalf("remaining window = %d, want %d", got, want)
+	}
+	// A one-byte ACK advances RCV.NXT by less than one window unit.
+	remain = send(1)
+	if remain < unit-1 {
+		t.Fatalf("window after sending one byte = %d, want at least %d", remain, unit-1)
+	}
+	for remain != 0 {
+		remain = send(min(segmentSize, remain))
+	}
+
+	read := func(size int64) {
+		t.Helper()
+		w := tcpip.LimitedWriter{W: io.Discard, N: size}
+		for w.N != 0 {
+			if _, err := c.EP.Read(&w, tcpip.ReadOptions{}); err != nil {
+				t.Fatalf("Read failed: %s", err)
+			}
 		}
 	}
 
-	// Make the window non-zero, but the scaled window zero.
-	for remain >= 16 {
-		data = data[:remain-15]
-		c.SendPacket(data, &context.Headers{
-			SrcPort: context.TestPort,
-			DstPort: c.Port,
-			Flags:   header.TCPFlagAck,
-			SeqNum:  iss.Add(seqnum.Size(sent)),
-			AckNum:  c.IRS.Add(1),
-			RcvWnd:  30000,
-		})
-		sent += len(data)
-		pkt := c.GetPacket()
-		defer pkt.Release()
-		checker.IPv4(t, pkt,
-			checker.PayloadLen(header.TCPMinimumSize),
-			checker.TCP(
-				checker.DstPort(context.TestPort),
-				checker.TCPSeqNum(uint32(c.IRS)+1),
-				checker.TCPAckNum(uint32(iss)+uint32(sent)),
-				checker.TCPFlags(header.TCPFlagAck),
-			),
-		)
-		// Since the receive buffer is split between window advertisement and
-		// application data buffer the window does not always reflect the space
-		// available and actual space available can be a bit more than what is
-		// advertised in the window.
-		wnd := int(header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize())
-		if wnd == 0 {
-			break
-		}
-		remain = wnd << ws
+	// Releasing one segment leaves the available window below the reopening
+	// threshold. A probe must still see a zero window.
+	read(segmentSize)
+	if pkt := c.GetPacketNonBlocking(); pkt != nil {
+		pkt.Release()
+		t.Fatal("unexpected ACK below the window reopening threshold")
 	}
+	c.SendPacket([]byte{0}, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: c.Port,
+		Flags:   header.TCPFlagAck,
+		SeqNum:  iss.Add(seqnum.Size(sent - 1)),
+		AckNum:  c.IRS.Add(1),
+		RcvWnd:  30000,
+	})
+	probeACK := c.GetPacket()
+	defer probeACK.Release()
+	checker.IPv4(t, probeACK,
+		checker.PayloadLen(header.TCPMinimumSize),
+		checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPSeqNum(uint32(c.IRS)+1),
+			checker.TCPAckNum(uint32(iss)+uint32(sent)),
+			checker.TCPWindow(0),
+			checker.TCPFlags(header.TCPFlagAck),
+		),
+	)
 
-	// Read at least 2MSS of data. An ack should be sent in response to that.
-	// Since buffer space is now split in half between window and application
-	// data we need to read more than 1 MSS(65536) of data for a non-zero window
-	// update to be sent. For 1MSS worth of window to be available we need to
-	// read at least 128KB. Since our segments above were 50KB each it means
-	// we need to read at 3 packets.
-	w := tcpip.LimitedWriter{
-		W: io.Discard,
-		N: e2e.DefaultMTU * 2,
-	}
-	for w.N != 0 {
-		res, err := c.EP.Read(&w, tcpip.ReadOptions{})
-		t.Logf("err=%v res=%#v", err, res)
-		if err != nil {
-			t.Fatalf("Read failed: %s", err)
-		}
-	}
+	// Reading the rest frees enough space to cross the reopening threshold.
+	read(e2e.DefaultMTU*2 - segmentSize)
 
 	v := c.GetPacket()
 	defer v.Release()
@@ -7202,6 +7249,12 @@ func TestListenSynRcvdQueueFull(t *testing.T) {
 	}
 	checker.IPv4(t, b, checker.TCP(tcpCheckers...))
 
+	// Register for the accept notification before completing the
+	// handshake, so that the notification can't be missed.
+	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+
 	// Now complete the previous connection.
 	// Send ACK.
 	c.SendPacket(nil, &context.Headers{
@@ -7214,9 +7267,6 @@ func TestListenSynRcvdQueueFull(t *testing.T) {
 	})
 
 	// Verify if that is delivered to the accept queue.
-	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
-	c.WQ.EventRegister(&we)
-	defer c.WQ.EventUnregister(&we)
 	<-ch
 
 	// Now execute send one more SYN. The stack should not respond as the backlog
@@ -9684,9 +9734,6 @@ func TestSendBufferTuning(t *testing.T) {
 
 func TestTimestampSynCookies(t *testing.T) {
 	clock := faketime.NewManualClock()
-	tsNow := func() uint32 {
-		return uint32(clock.NowMonotonic().Sub(tcpip.MonotonicTime{}).Milliseconds())
-	}
 	// Advance the clock so that NowMonotonic is non-zero.
 	clock.Advance(time.Second)
 	c := context.NewWithOpts(t, context.Options{
@@ -9730,8 +9777,6 @@ func TestTimestampSynCookies(t *testing.T) {
 	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 	initialTSVal := tcpHdr.ParsedOptions().TSVal
-	// derive the tsOffset.
-	tsOffset := initialTSVal - tsNow()
 
 	header.EncodeTSOption(420, initialTSVal, tcpOpts[2:])
 	c.SendPacket(nil, &context.Headers{
@@ -9743,11 +9788,13 @@ func TestTimestampSynCookies(t *testing.T) {
 		AckNum:  c.IRS + 1,
 		TCPOpts: tcpOpts[:],
 	})
-	c.EP, _, err = ep.Accept(nil)
-	// Try to accept the connection.
+	// Register before trying to accept, so that a connection that becomes
+	// ready after the attempt still wakes the wait below.
 	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
 	wq.EventRegister(&we)
 	defer wq.EventUnregister(&we)
+	// Try to accept the connection.
+	c.EP, _, err = ep.Accept(nil)
 	if cmp.Equal(&tcpip.ErrWouldBlock{}, err) {
 		// Wait for connection to be established.
 		select {
@@ -9765,7 +9812,8 @@ func TestTimestampSynCookies(t *testing.T) {
 	}
 
 	// Advance the clock again so that we expect the next TSVal to change.
-	clock.Advance(time.Second)
+	const elapsed = time.Second
+	clock.Advance(elapsed)
 	data := []byte{1, 2, 3}
 	var r bytes.Reader
 	r.Reset(data)
@@ -9773,12 +9821,12 @@ func TestTimestampSynCookies(t *testing.T) {
 		t.Fatalf("Write failed: %s", err)
 	}
 
-	// The endpoint should have a correct TSOffset so that the received TSVal
-	// should match our expectation.
+	// The SYN-ACK may be one tick behind the endpoint clock to encode SACK.
 	p := c.GetPacket()
 	defer p.Release()
-	if got, want := header.TCP(header.IPv4(p.AsSlice()).Payload()).ParsedOptions().TSVal, tsNow()+tsOffset; got != want {
-		t.Fatalf("got TSVal = %d, want %d", got, want)
+	dataTSVal := header.TCP(header.IPv4(p.AsSlice()).Payload()).ParsedOptions().TSVal
+	if got, want := dataTSVal-initialTSVal, uint32(elapsed/time.Millisecond); got != want && got != want+1 {
+		t.Fatalf("timestamp advanced by %d ticks, want %d or %d", got, want, want+1)
 	}
 }
 

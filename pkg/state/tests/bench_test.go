@@ -20,6 +20,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
+	"reflect"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/state"
@@ -54,6 +55,23 @@ func buildSliceObject(n int) any {
 	return &s
 }
 
+// buildAdoptionObject builds a graph in which the encoder reaches the array
+// elements through pointers first. If captured is true, an extra link delays
+// discovery of the array until after its elements have been saved.
+func buildAdoptionObject(n int, captured bool) *benchAdoption {
+	values := make([]benchAdopted, n)
+	pointers := make([]*benchAdopted, n)
+	for i := range values {
+		values[i].Value = int64(i + 1)
+		pointers[i] = &values[i]
+	}
+	parent := &benchAdoptionParent{Values: values}
+	if captured {
+		parent = &benchAdoptionParent{Next: parent}
+	}
+	return &benchAdoption{Pointers: pointers, Parent: parent}
+}
+
 var allObjects = map[string]struct {
 	New func(int) any
 }{
@@ -66,6 +84,53 @@ var allObjects = map[string]struct {
 	"slice": {
 		New: buildSliceObject,
 	},
+	"adopt_uncaptured": {
+		New: func(n int) any { return buildAdoptionObject(n, false) },
+	},
+	"adopt_captured": {
+		New: func(n int) any { return buildAdoptionObject(n, true) },
+	},
+}
+
+func TestAdoptedCaptureStorage(t *testing.T) {
+	for _, captured := range []bool{false, true} {
+		t.Run(fmt.Sprintf("captured=%t", captured), func(t *testing.T) {
+			graph := buildAdoptionObject(3, captured)
+			var saves int
+			for _, child := range graph.Pointers {
+				child.saves = &saves
+			}
+			var encoded bytes.Buffer
+			if _, err := state.Save(t.Context(), &encoded, graph); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := saves, len(graph.Pointers); got != want {
+				t.Fatalf("save hooks = %d, want %d", got, want)
+			}
+			var loaded benchAdoption
+			if _, err := state.Load(t.Context(), &encoded, &loaded); err != nil {
+				t.Fatal(err)
+			}
+			parent := loaded.Parent
+			if captured {
+				parent = parent.Next
+			}
+			if got, want := len(parent.Values), len(graph.Pointers); got != want {
+				t.Fatalf("array length = %d, want %d", got, want)
+			}
+			if got, want := len(loaded.Pointers), len(parent.Values); got != want {
+				t.Fatalf("pointer count = %d, want %d", got, want)
+			}
+			for i, child := range loaded.Pointers {
+				if got, want := child, &parent.Values[i]; got != want {
+					t.Errorf("child %d = %p, want %p", i, got, want)
+				}
+				if got, want := child.Value, int64(i+1); got != want {
+					t.Errorf("child %d value = %d, want %d", i, got, want)
+				}
+			}
+		})
+	}
 }
 
 // gobSave is a version of save using gob (no stats available).
@@ -123,8 +188,12 @@ func BenchmarkDecoding(b *testing.B) {
 					b.Errorf("save failed: %v", err)
 				}
 				b.ReportAllocs()
+				dst := reflect.ValueOf(v).Elem()
 				var r bytes.Reader
 				for b.Loop() {
+					// A restored kernel starts without the saved objects. A populated
+					// destination lets gob reuse the previous pointer chain or slice.
+					dst.SetZero()
 					r.Reset(buf.Bytes())
 					if _, err := algoInfo.Load(context.Background(), &r, v); err != nil {
 						b.Errorf("load failed: %v", err)
@@ -133,4 +202,50 @@ func BenchmarkDecoding(b *testing.B) {
 			})
 		}
 	}
+}
+
+// benchGraphNodes is the number of nodes of the graphs of BenchmarkGraph.
+const benchGraphNodes = 20000
+
+// BenchmarkGraphSave saves a large random graph.
+func BenchmarkGraphSave(b *testing.B) {
+	root := randomGraph(1, graphOptions{nodes: benchGraphNodes, all: true})
+	b.ReportAllocs()
+	var n int
+	for b.Loop() {
+		w := countingWriter{}
+		if _, err := state.Save(context.Background(), &w, root); err != nil {
+			b.Fatalf("save failed: %v", err)
+		}
+		n = w.n
+	}
+	b.ReportMetric(float64(n), "encoded-B")
+}
+
+// BenchmarkGraphLoad loads a large random graph.
+func BenchmarkGraphLoad(b *testing.B) {
+	var buf bytes.Buffer
+	if _, err := state.Save(context.Background(), &buf, randomGraph(1, graphOptions{nodes: benchGraphNodes, all: true})); err != nil {
+		b.Fatalf("save failed: %v", err)
+	}
+	b.ReportAllocs()
+	var r bytes.Reader
+	for b.Loop() {
+		r.Reset(buf.Bytes())
+		var root gRoot
+		if _, err := state.Load(context.Background(), &r, &root); err != nil {
+			b.Fatalf("load failed: %v", err)
+		}
+	}
+}
+
+// countingWriter counts the bytes written to it.
+type countingWriter struct {
+	n int
+}
+
+// Write implements io.Writer.Write.
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.n += len(p)
+	return len(p), nil
 }

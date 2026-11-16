@@ -1,9 +1,16 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_setting")
 load("@rules_python//python:py_test.bzl", "py_test")
 load("//tools:defs.bzl", "bzl_library", "gotsan_flag_values", "gotsan_values")
 
 package(
     default_applicable_licenses = ["//:license"],
     licenses = ["notice"],
+)
+
+bool_setting(
+    name = "export_go_sources",
+    build_setting_default = False,
+    visibility = ["//:sandbox"],
 )
 
 config_setting(
@@ -69,12 +76,15 @@ bzl_library(
     visibility = [
         "//:sandbox",
     ],
+    deps = [":defs_bzl"],
 )
 
 exports_files([
     "benchmark-umbrella-exports.patch",
     "build_cover.sh",
     "go-allow-internal.patch",
+    "llvm-dev-backends.patch",
+    "llvm-linux-header-default.patch",
 ])
 
 py_test(

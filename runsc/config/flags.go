@@ -56,6 +56,7 @@ const (
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagInSandboxCgroup         = "in-sandbox-cgroup"
 	flagNetworkProxyPath        = "network-proxy-path"
+	flagNetgofer                = "netgofer"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -96,6 +97,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Metrics flags.
 	flagSet.String("metric-server", "", "if set, export metrics on this address. This may either be 1) 'addr:port' to export metrics on a specific network interface address, 2) ':port' for exporting metrics on all interfaces, or 3) an absolute path to a Unix Domain Socket. The substring '%RUNTIME_ROOT%' will be replaced by the root directory. This flag must be specified in both `runsc metric-server` and `runsc create`, and their values must match.")
 	flagSet.String("final-metrics-log", "", "if set, write all metric data to this file upon sandbox termination")
+	flagSet.String("boot-times-log", "", "if set, write the startup timeline of the sandbox to this file as JSON when the sandbox starts")
 	flagSet.String("profiling-metrics", "", "comma separated list of metric names which are going to be written to the profiling-metrics-log file from within the sentry in CSV format. profiling-metrics will be snapshotted at a rate specified by profiling-metrics-rate-us. Requires profiling-metrics-log to be set. (DO NOT USE IN PRODUCTION).")
 	flagSet.String("profiling-metrics-log", "", "file name to use for profiling-metrics output; use the special value '-' to write to the user-visible logs. (DO NOT USE IN PRODUCTION)")
 	flagSet.Int("profiling-metrics-rate-us", 1000, "the target rate (in microseconds) at which profiling metrics will be snapshotted.")
@@ -155,9 +157,11 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 		"    'mount' can be 'root' or 'all'\n"+
 		"    'medium' can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created\n"+
 		"    'size' optional parameter overrides default overlay upper layer size\n")
+	flagSet.Var(tarTimestampResolutionPtr(TarTimestampSeconds), "tar-timestamp-resolution", "resolution of modification times in tar archives of overlay upper layers and filesystem checkpoints. 'nanoseconds' adds about 1 KiB per tar entry. Values: seconds|nanoseconds, default: seconds")
 	flagSet.Var(hostUDSPtr(HostUDSNone), flagHostUDS, "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
 	flagSet.Var(hostFifoPtr(HostFifoNone), "host-fifo", "controls permission to access host FIFOs (or named pipes). Values: none|open, default: none")
 	flagSet.Var(charDevicePolicyPtr(CharDevEmulatedOnly), "character-device-policy", "controls how character device files on gofer mounts (rootfs and bind mounts) are handled. 'emulated-only' serves devices implemented by the sentry and fails opens of other devices with ENXIO (default and more secure); 'prefer-emulated' serves sentry-implemented devices from the sentry and opens the rest through the host; 'passthrough' opens all of them through the host. Values: emulated-only|prefer-emulated|passthrough, default: emulated-only")
+	flagSet.Var(inodeNumbersPtr(InodeNumbersPassthrough), "inode-numbers", "controls inode numbers on gofer mounts: 'passthrough' reports host inode numbers; 'virtual' assigns sandbox-private sequential numbers, which costs memory per file seen and a stat(2) per getdents(2) entry. Values: passthrough|virtual, default: passthrough")
 	flagSet.Bool("gvisor-marker-file", false, "enable the presence of the /proc/gvisor/kernel_is_gvisor file that can be used by applications to detect that gVisor is in use")
 	flagSet.String("override-procs", "", "comma-separated list of proc files to override with stubs (e.g. kallsyms)")
 
@@ -172,6 +176,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Flags that control sandbox runtime behavior: network related.
 	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none. Using network inside the sandbox is more secure because it's isolated from the host network.")
 	flagSet.String(flagNetworkProxyPath, "", "EXPERIMENTAL. Path of an external SOCK_SEQPACKET Unix domain socket to attach the sandbox's primary network interface to, instead of an AF_PACKET socket.")
+	flagSet.Var(NetgoferModeOff.Ptr(), flagNetgofer, "EXPERIMENTAL. Mode for using netgofer (off|proxy|proxy-loopback, default: off).")
 	flagSet.Var(goferNetworkNamespacePtr(GoferNetworkNamespaceNull), "gofer-network-namespace", "network namespace for gofers: null (default; an empty namespace shared by all gofers using the same --shared-root, which defaults to --root), new (a new empty namespace per gofer), host (the current namespace), or an absolute path to an existing namespace.")
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")
 	flagSet.Bool("allow-packet-socket-write", false, "allow writes on AF_PACKET sockets. When false, writes on AF_PACKET sockets will fail. When turned on, untrusted workloads may potentially attack the network because of the ability to craft arbitrary packets.")
@@ -195,6 +200,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool(flagAllowConnectedOnSave, false, "Allow network connections to stay established on save.")
 	flagSet.String(flagEgressAllowDomains, "", fmt.Sprintf("comma-separated egress allowlist of domain patterns, e.g. \"docs.github.com,*.github.com\", whose addresses learned from plain UDP DNS the sandbox may reach. The resolver's IP must also be in --egress-allow-ips. At most %d patterns. Setting this or --egress-allow-ips blocks all other egress. Configured on the root container and shared by all containers in the sandbox. Sandbox networking only. See the networking user guide.", egressallowlist.MaxListEntries))
 	flagSet.String(flagEgressAllowIPs, "", fmt.Sprintf("comma-separated egress allowlist of IPs and CIDRs (IPv4/IPv6), e.g. \"8.8.8.8,10.0.0.0/8\", always allowed on any port. At most %d entries after deduplication. Setting this or --egress-allow-domains blocks all other egress. Configured on the root container and shared by all containers in the sandbox. Sandbox networking only. See the networking user guide.", egressallowlist.MaxListEntries))
+	flagSet.Var(StateEngineGraph.Ptr(), "state-engine", "selects the state serialization engine used when saving checkpoints: graph (default) or wire.")
 
 	// Flags that control sandbox runtime behavior: accelerator related.
 	flagSet.Bool("nvproxy", false, "LEGACY: enable support for Nvidia GPUs. GPU support gets automatically enabled if Nvidia devices are present in the OCI spec.")
@@ -360,6 +366,10 @@ func NewFromFlags(flagSet *flag.FlagSet) (*Config, error) {
 			conf.explicitlySet[name] = struct{}{}
 		}
 	}
+	if _, ok := conf.explicitlySet["state-engine"]; ok {
+		v := conf.StateEngine
+		conf.cliStateEngine = &v
+	}
 
 	if len(conf.RootDir) == 0 {
 		// If not set, set default root dir to something (hopefully) user-writeable.
@@ -480,6 +490,8 @@ func (c *Config) isOverrideAllowed(name string, value string) error {
 // It returns an error if a bundle doesn't exist, or if the given
 // bundles have conflicting flag values.
 // Config values which are already specified prior to calling ApplyBundles are overridden.
+// Like Override, it does not validate the resulting Config. Callers must call
+// Validate after applying all bundles and individual flag overrides.
 func (c *Config) ApplyBundles(flagSet *flag.FlagSet, bundleNames ...BundleName) error {
 	// Populate a map from flag name to flag value to bundle name.
 	flagToValueToBundleName := make(map[string]map[string]BundleName)
@@ -544,7 +556,7 @@ func (c *Config) ApplyBundles(flagSet *flag.FlagSet, bundleNames ...BundleName) 
 		}
 	}
 
-	return c.Validate()
+	return nil
 }
 
 func getVal(field reflect.Value) string {
@@ -563,6 +575,26 @@ func getVal(field reflect.Value) string {
 	default:
 		panic("unknown type " + field.Kind().String())
 	}
+}
+
+// IsFlagExplicitlySet reports whether the given flag name was explicitly set on
+// the command line when this Config was created via NewFromFlags.
+func (c *Config) IsFlagExplicitlySet(name string) bool {
+	if c.explicitlySet == nil {
+		return false
+	}
+	_, ok := c.explicitlySet[name]
+	return ok
+}
+
+// CLIStateEngine returns the --state-engine policy explicitly passed on the
+// command line when this Config was created via NewFromFlags, unaffected by
+// subsequent OCI annotation or bundle overrides.
+func (c *Config) CLIStateEngine() (StateEnginePolicy, bool) {
+	if c.cliStateEngine == nil {
+		return 0, false
+	}
+	return *c.cliStateEngine, true
 }
 
 // IsFlagSafeToOverride returns true if the given flag name is in the override

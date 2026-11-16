@@ -16,6 +16,10 @@ package sys
 
 import (
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/sentry/contexttest"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
 func TestFullCPUMask(t *testing.T) {
@@ -71,6 +75,102 @@ func TestOneCPUMask(t *testing.T) {
 	} {
 		if got := oneCPUMask(test.i, test.cores); got != test.want {
 			t.Errorf("oneCPUMask(%d, %d): got %s, want %s", test.i, test.cores, got, test.want)
+		}
+	}
+}
+
+func TestCPUMask(t *testing.T) {
+	for _, test := range []struct {
+		first, end, cores uint
+		want              string
+	}{
+		{0, 2, 4, "3"},
+		{2, 4, 4, "c"},
+		{1, 4, 5, "0e"},
+		{0, 43, 86, "000000,000007ff,ffffffff"},
+		{43, 86, 86, "3fffff,fffff800,00000000"},
+		{32, 64, 65, "0,ffffffff,00000000"},
+	} {
+		if got := cpuMask(test.first, test.end, test.cores); got != test.want {
+			t.Errorf("cpuMask(%d, %d, %d): got %s, want %s", test.first, test.end, test.cores, got, test.want)
+		}
+	}
+}
+
+func TestIsCPUDirName(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want bool
+	}{
+		{"cpu0", true},
+		{"cpu12", true},
+		{"cpu", false},
+		{"cpufreq", false},
+		{"cpuidle", false},
+		{"cpu1a", false},
+		{"online", false},
+		{"xcpu0", false},
+	} {
+		if got := isCPUDirName(test.name); got != test.want {
+			t.Errorf("isCPUDirName(%q): got %t, want %t", test.name, got, test.want)
+		}
+	}
+}
+
+// TestCPUDirLookup checks that /sys/devices/system/cpu only creates the cpuN
+// directories when one of them is looked up.
+func TestCPUDirLookup(t *testing.T) {
+	ctx := contexttest.Context(t)
+	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
+	const cores = 4
+	d := (&filesystem{}).newLazyCPURootDir(ctx, creds, cores)
+	defer d.DecRef(ctx)
+
+	if got, want := d.Links(), uint32(2+cores); got != want {
+		t.Errorf("link count: got %d, want %d", got, want)
+	}
+	for _, name := range []string{"online", "possible", "present"} {
+		inode, err := d.Lookup(ctx, name)
+		if err != nil {
+			t.Fatalf("Lookup(%q): %v", name, err)
+		}
+		inode.DecRef(ctx)
+	}
+	if _, err := d.Lookup(ctx, "cpufreq"); !linuxerr.Equals(linuxerr.ENOENT, err) {
+		t.Errorf("Lookup(cpufreq): got error %v, want ENOENT", err)
+	}
+	if d.populated.Load() {
+		t.Errorf("directory is populated after lookups of non-cpuN names")
+	}
+
+	inode, err := d.Lookup(ctx, "cpu3")
+	if err != nil {
+		t.Fatalf("Lookup(cpu3): %v", err)
+	}
+	inode.DecRef(ctx)
+	if !d.populated.Load() {
+		t.Errorf("directory is not populated after lookup of cpu3")
+	}
+	if _, err := d.Lookup(ctx, "cpu4"); !linuxerr.Equals(linuxerr.ENOENT, err) {
+		t.Errorf("Lookup(cpu4): got error %v, want ENOENT", err)
+	}
+}
+
+func TestCPUListString(t *testing.T) {
+	for _, test := range []struct {
+		first, end uint
+		want       string
+	}{
+		{0, 1, "0\n"},
+		{3, 4, "3\n"},
+		{0, 2, "0-1\n"},
+		{0, 3, "0-2\n"},
+		{2, 4, "2-3\n"},
+		{0, 64, "0-63\n"},
+		{0, 65, "0-64\n"},
+	} {
+		if got := cpuListString(test.first, test.end); got != test.want {
+			t.Errorf("cpuListString(%d, %d): got %q, want %q", test.first, test.end, got, test.want)
 		}
 	}
 }

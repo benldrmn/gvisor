@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -81,21 +82,27 @@ func (s *testConnImpl) SupportedMessages() []lisafs.MID {
 }
 
 func runServerClient(t testing.TB, clientFn func(c *lisafs.Client)) {
+	runServerClientWithImpl(t, handlers[:], &testConnImpl{}, func(c *lisafs.Client, _ lisafs.Inode) {
+		clientFn(c)
+	})
+}
+
+func runServerClientWithImpl(t testing.TB, handlers []lisafs.RPCHandler, impl lisafs.ConnectionImpl, clientFn func(c *lisafs.Client, root lisafs.Inode)) {
 	serverSocket, clientSocket, err := unet.SocketPair(false)
 	if err != nil {
 		t.Fatalf("socketpair got err %v expected nil", err)
 	}
 
 	ts := lisafs.NewServer()
-	ts.SetHandlers(handlers[:])
-	conn, err := ts.CreateConnection(serverSocket, "/" /* mountPath */, lisafs.ConnectionOpts{}, &testConnImpl{})
+	ts.SetHandlers(handlers)
+	conn, err := ts.CreateConnection(serverSocket, "/" /* mountPath */, lisafs.ConnectionOpts{}, impl)
 	if err != nil {
 		t.Fatalf("starting connection failed: %v", err)
 		return
 	}
 	ts.StartConnection(conn)
 
-	c, _, _, err := lisafs.NewClient(clientSocket)
+	c, root, _, err := lisafs.NewClient(clientSocket)
 	if err != nil {
 		t.Fatalf("client creation failed: %v", err)
 	}
@@ -103,7 +110,7 @@ func runServerClient(t testing.TB, clientFn func(c *lisafs.Client)) {
 		t.Fatalf("failed to start channels: %v", err)
 	}
 
-	clientFn(c)
+	clientFn(c, root)
 
 	c.Close() // This should trigger client and server shutdown.
 	ts.Wait()
@@ -189,6 +196,302 @@ func versionHandler(c *lisafs.Connection, comm lisafs.Communicator, payloadLen u
 	respPayloadLen := uint32(sv.SizeBytes())
 	sv.MarshalBytes(comm.PayloadBuf(respPayloadLen))
 	return respPayloadLen, nil
+}
+
+// walkTestConnImpl is a testConnImpl that also supports the Walk and Close
+// messages, so that tests can serve them with custom handlers.
+type walkTestConnImpl struct {
+	testConnImpl
+}
+
+// SupportedMessages implements lisafs.ConnectionImpl.SupportedMessages.
+func (*walkTestConnImpl) SupportedMessages() []lisafs.MID {
+	return []lisafs.MID{
+		lisafs.Mount,
+		lisafs.Channel,
+		lisafs.Walk,
+		lisafs.Close,
+	}
+}
+
+// TestWalkMultipleResponseValidation tests that the client rejects Walk
+// responses that are inconsistent with the requested path components, and
+// closes the control FDs contained in them.
+func TestWalkMultipleResponseValidation(t *testing.T) {
+	names := []string{"a", "b"}
+	for _, tc := range []struct {
+		name      string
+		status    lisafs.WalkStatus
+		numInodes int
+		wantErr   error
+	}{
+		{
+			name:      "success",
+			status:    lisafs.WalkSuccess,
+			numInodes: 2,
+		},
+		{
+			name:      "component does not exist",
+			status:    lisafs.WalkComponentDoesNotExist,
+			numInodes: 1,
+		},
+		{
+			name:      "first component does not exist",
+			status:    lisafs.WalkComponentDoesNotExist,
+			numInodes: 0,
+		},
+		{
+			name:      "component symlink",
+			status:    lisafs.WalkComponentSymlink,
+			numInodes: 1,
+		},
+		{
+			name:      "more inodes than path components",
+			status:    lisafs.WalkSuccess,
+			numInodes: 3,
+			wantErr:   unix.EIO,
+		},
+		{
+			name:      "success with fewer inodes than path components",
+			status:    lisafs.WalkSuccess,
+			numInodes: 1,
+			wantErr:   unix.EIO,
+		},
+		{
+			name:      "component does not exist with all inodes",
+			status:    lisafs.WalkComponentDoesNotExist,
+			numInodes: 2,
+			wantErr:   unix.EIO,
+		},
+		{
+			name:      "component symlink with more inodes than path components",
+			status:    lisafs.WalkComponentSymlink,
+			numInodes: 3,
+			wantErr:   unix.EIO,
+		},
+		{
+			name:      "unknown status",
+			status:    lisafs.WalkComponentSymlink + 1,
+			numInodes: 1,
+			wantErr:   unix.EIO,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inodes := make([]lisafs.Inode, tc.numInodes)
+			for i := range inodes {
+				inodes[i] = lisafs.Inode{
+					ControlFD: lisafs.FDID(100 + i),
+					Stat:      lisafs.Statx{Mode: uint16(linux.S_IFDIR)},
+				}
+			}
+			var (
+				closedMu sync.Mutex
+				closed   = make(map[lisafs.FDID]bool)
+			)
+			walkHandlers := make([]lisafs.RPCHandler, lisafs.Close+1)
+			walkHandlers[lisafs.Error] = lisafs.ErrorHandler
+			walkHandlers[lisafs.Mount] = lisafs.MountHandler
+			walkHandlers[lisafs.Channel] = lisafs.ChannelHandler
+			walkHandlers[lisafs.Walk] = func(c *lisafs.Connection, comm lisafs.Communicator, payloadLen uint32) (uint32, error) {
+				resp := lisafs.WalkResp{Status: tc.status, Inodes: inodes}
+				respPayloadLen := uint32(resp.SizeBytes())
+				resp.MarshalBytes(comm.PayloadBuf(respPayloadLen))
+				return respPayloadLen, nil
+			}
+			walkHandlers[lisafs.Close] = func(c *lisafs.Connection, comm lisafs.Communicator, payloadLen uint32) (uint32, error) {
+				var req lisafs.CloseReq
+				if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
+					return 0, unix.EIO
+				}
+				closedMu.Lock()
+				defer closedMu.Unlock()
+				for _, fd := range req.FDs {
+					closed[fd] = true
+				}
+				return 0, nil
+			}
+
+			runServerClientWithImpl(t, walkHandlers, &walkTestConnImpl{}, func(c *lisafs.Client, root lisafs.Inode) {
+				ctx := context.Background()
+				rootFD := c.NewFD(root.ControlFD)
+				status, gotInodes, err := rootFD.WalkMultiple(ctx, names)
+				if err != tc.wantErr {
+					t.Errorf("WalkMultiple(%q) error = %v, want %v", names, err, tc.wantErr)
+					return
+				}
+				if err == nil {
+					if status != tc.status || len(gotInodes) != tc.numInodes {
+						t.Errorf("WalkMultiple(%q) = (status %d, %d inodes), want (status %d, %d inodes)", names, status, len(gotInodes), tc.status, tc.numInodes)
+					}
+					return
+				}
+				if len(gotInodes) != 0 {
+					t.Errorf("WalkMultiple(%q) returned %d inodes with error, want 0", names, len(gotInodes))
+				}
+				// Flush the control FDs queued to be closed by WalkMultiple.
+				c.CloseFD(ctx, root.ControlFD, true /* flush */)
+				closedMu.Lock()
+				defer closedMu.Unlock()
+				for _, inode := range inodes {
+					if !closed[inode.ControlFD] {
+						t.Errorf("control FD %d from invalid Walk response was not closed", inode.ControlFD)
+					}
+				}
+			})
+		})
+	}
+}
+
+// unlinkRaceFD implements lisafs.ControlFDImpl for TestUnlinkCloseRace.
+type unlinkRaceFD struct {
+	testControlFD
+	onWalk   func(parent *unlinkRaceFD, name string) (*unlinkRaceFD, bool)
+	onUnlink func(parent *unlinkRaceFD, name string) error
+}
+
+// Walk implements lisafs.ControlFDImpl.Walk.
+func (fd *unlinkRaceFD) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, error) {
+	if fd.onWalk != nil {
+		if childFD, ok := fd.onWalk(fd, name); ok {
+			return childFD.FD(), lisafs.Statx{Mode: uint16(linux.S_IFDIR)}, nil
+		}
+	}
+	childFD := fd.allocateChild(name)
+	return childFD.FD(), lisafs.Statx{Mode: uint16(linux.S_IFDIR)}, nil
+}
+
+func (fd *unlinkRaceFD) allocateChild(name string) *unlinkRaceFD {
+	parentNode := fd.Node()
+	var childNode *lisafs.Node
+	parentNode.WithChildrenMu(func() {
+		childNode = parentNode.LookupChildLocked(name)
+		if childNode != nil {
+			childNode.IncRef()
+			return
+		}
+		childNode = &lisafs.Node{}
+		childNode.InitLocked(name, parentNode)
+	})
+	childFD := &unlinkRaceFD{onWalk: fd.onWalk, onUnlink: fd.onUnlink}
+	childFD.Init(fd.Conn(), childNode, linux.ModeDirectory, childFD) // +checklocksignore
+	return childFD
+}
+
+// Open implements lisafs.ControlFDImpl.Open.
+func (fd *unlinkRaceFD) Open(flags uint32) (*lisafs.OpenFD, int, error) {
+	return nil, -1, unix.EPERM
+}
+
+// Unlink implements lisafs.ControlFDImpl.Unlink.
+func (fd *unlinkRaceFD) Unlink(name string, flags uint32) error {
+	if fd.onUnlink != nil {
+		return fd.onUnlink(fd, name)
+	}
+	return nil
+}
+
+type unlinkRaceConnImpl struct {
+	testConnImpl
+	onWalk   func(parent *unlinkRaceFD, name string) (*unlinkRaceFD, bool)
+	onUnlink func(parent *unlinkRaceFD, name string) error
+}
+
+// Mount implements lisafs.ConnectionImpl.Mount.
+//
+// +checklocksread:c.server.renameMu
+// +checklocksexclude:c.fdsMu
+func (u *unlinkRaceConnImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*lisafs.ControlFD, lisafs.Statx, int, error) {
+	root := &unlinkRaceFD{onWalk: u.onWalk, onUnlink: u.onUnlink}
+	mountNode.IncRef()
+	root.Init(c, mountNode, linux.ModeDirectory, root)
+	return root.FD(), lisafs.Statx{Mode: uint16(linux.S_IFDIR)}, -1, nil
+}
+
+// SupportedMessages implements lisafs.ConnectionImpl.SupportedMessages.
+func (*unlinkRaceConnImpl) SupportedMessages() []lisafs.MID {
+	return []lisafs.MID{
+		lisafs.Mount,
+		lisafs.Channel,
+		lisafs.Walk,
+		lisafs.OpenAt,
+		lisafs.Close,
+		lisafs.UnlinkAt,
+	}
+}
+
+// TestUnlinkCloseRace tests that UnlinkAtHandler holds a reference on the
+// unlinked child Node across Unlink and marks any Node at the unlinked name as
+// deleted even when CloseHandler runs concurrently.
+func TestUnlinkCloseRace(t *testing.T) {
+	unlinkHandlers := make([]lisafs.RPCHandler, lisafs.UnlinkAt+1)
+	unlinkHandlers[lisafs.Error] = lisafs.ErrorHandler
+	unlinkHandlers[lisafs.Mount] = lisafs.MountHandler
+	unlinkHandlers[lisafs.Channel] = lisafs.ChannelHandler
+	unlinkHandlers[lisafs.Walk] = lisafs.WalkHandler
+	unlinkHandlers[lisafs.OpenAt] = lisafs.OpenAtHandler
+	unlinkHandlers[lisafs.Close] = lisafs.CloseHandler
+	unlinkHandlers[lisafs.UnlinkAt] = lisafs.UnlinkAtHandler
+
+	unlinkEntered := make(chan struct{})
+	closeDone := make(chan struct{})
+	var retainedSubFD *unlinkRaceFD
+
+	impl := &unlinkRaceConnImpl{
+		onWalk: func(_ *unlinkRaceFD, name string) (*unlinkRaceFD, bool) {
+			if name == "retained_sub" && retainedSubFD != nil {
+				return retainedSubFD, true
+			}
+			return nil, false
+		},
+		onUnlink: func(parent *unlinkRaceFD, name string) error {
+			close(unlinkEntered)
+			<-closeDone
+			// Simulate an Unlink implementation that looks up or allocates the child
+			// node while the original ControlFD on name was just closed.
+			tempChildFD := parent.allocateChild(name)
+			retainedSubFD = tempChildFD.allocateChild("sub")
+			tempChildFD.RemoveFromConn() // +checklocksignore
+			return nil
+		},
+	}
+
+	runServerClientWithImpl(t, unlinkHandlers, impl, func(c *lisafs.Client, root lisafs.Inode) {
+		ctx := context.Background()
+		rootFD := c.NewFD(root.ControlFD)
+
+		status, inodes, err := rootFD.WalkMultiple(ctx, []string{"dir"})
+		if err != nil || status != lisafs.WalkSuccess || len(inodes) != 1 {
+			t.Fatalf("WalkMultiple([\"dir\"]) = (%v, %v, %v), want WalkSuccess with 1 inode", status, inodes, err)
+		}
+		dirFDID := inodes[0].ControlFD
+
+		var unlinkWg sync.WaitGroup
+		unlinkWg.Add(1)
+		go func() {
+			defer unlinkWg.Done()
+			if err := rootFD.UnlinkAt(ctx, "dir", unix.AT_REMOVEDIR); err != nil {
+				t.Errorf("UnlinkAt(\"dir\") failed: %v", err)
+			}
+		}()
+
+		<-unlinkEntered
+		c.CloseFD(ctx, dirFDID, true /* flush */)
+		close(closeDone)
+		unlinkWg.Wait()
+
+		status, subInodes, err := rootFD.WalkMultiple(ctx, []string{"retained_sub"})
+		if err != nil || status != lisafs.WalkSuccess || len(subInodes) != 1 {
+			t.Fatalf("WalkMultiple([\"retained_sub\"]) = (%v, %v, %v), want WalkSuccess with 1 inode", status, subInodes, err)
+		}
+		retainedClientFD := c.NewFD(subInodes[0].ControlFD)
+		defer c.CloseFD(ctx, subInodes[0].ControlFD, true /* flush */)
+
+		// retainedSubFD's node must have been marked deleted by UnlinkAtHandler, so
+		// OpenAt on it must return EINVAL rather than reaching unlinkRaceFD.Open (EPERM).
+		if _, _, err := retainedClientFD.OpenAt(ctx, unix.O_RDONLY); err != unix.EINVAL {
+			t.Errorf("OpenAt on child under unlinked node got err = %v, want %v (EINVAL)", err, unix.EINVAL)
+		}
+	})
 }
 
 // BenchmarkSendRecv exists to compete against p9's BenchmarkSendRecvChannel.

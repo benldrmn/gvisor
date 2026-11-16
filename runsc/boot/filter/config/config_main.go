@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
+	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 )
 
@@ -40,13 +41,35 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.EqualTo(0),
 	},
-	unix.SYS_EVENTFD2: seccomp.PerArg{
-		seccomp.EqualTo(0),
+	// eventfd2(2) must create an empty counter, with one of these flag values:
+	// 0 or EFD_NONBLOCK from gVisor code, or EFD_CLOEXEC|EFD_NONBLOCK from the
+	// Go runtime network poller.
+	unix.SYS_EVENTFD2: seccomp.Or{
+		seccomp.PerArg{
+			seccomp.EqualTo(0), /* initval */
+			seccomp.EqualTo(0), /* flags */
+		},
+		seccomp.PerArg{
+			seccomp.EqualTo(0),                 /* initval */
+			seccomp.EqualTo(unix.EFD_NONBLOCK), /* flags */
+		},
+		seccomp.PerArg{
+			seccomp.EqualTo(0), /* initval */
+			seccomp.EqualTo(unix.EFD_CLOEXEC | unix.EFD_NONBLOCK), /* flags */
+		},
 	},
 	unix.SYS_EXIT:       seccomp.MatchAll{},
 	unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
-	unix.SYS_FALLOCATE:  seccomp.MatchAll{},
-	unix.SYS_FCHMOD:     seccomp.MatchAll{},
+	unix.SYS_FALLOCATE: seccomp.Or{
+		seccomp.PerArg{
+			seccomp.AnyValue{}, /* fd */
+			seccomp.EqualTo(0), /* mode */
+		},
+		seccomp.PerArg{
+			seccomp.AnyValue{}, /* fd */
+			seccomp.EqualTo(unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE), /* mode */
+		},
+	},
 	unix.SYS_FCNTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.AnyValue{},
@@ -176,11 +199,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.EqualTo(linux.TIOCGWINSZ),
 			seccomp.AnyValue{}, /* winsize struct */
 		},
-		seccomp.PerArg{
-			seccomp.NonNegativeFD{}, /* fd */
-			seccomp.EqualTo(linux.SIOCGIFTXQLEN),
-			seccomp.AnyValue{}, /* ifreq struct */
-		},
 	},
 	unix.SYS_IO_SETUP:     seccomp.MatchAll{},
 	unix.SYS_IO_DESTROY:   seccomp.MatchAll{},
@@ -261,10 +279,8 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 	},
 	unix.SYS_PREAD64:  seccomp.MatchAll{},
-	unix.SYS_PREADV:   seccomp.MatchAll{},
 	unix.SYS_PREADV2:  seccomp.MatchAll{},
 	unix.SYS_PWRITE64: seccomp.MatchAll{},
-	unix.SYS_PWRITEV:  seccomp.MatchAll{},
 	unix.SYS_PWRITEV2: seccomp.MatchAll{},
 	unix.SYS_READ:     seccomp.MatchAll{},
 	unix.SYS_READV:    seccomp.MatchAll{}, // Used by TAP/TUN fdbased links.
@@ -303,7 +319,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.EqualTo(unix.MSG_DONTWAIT | unix.MSG_NOSIGNAL),
 	},
-	unix.SYS_SETITIMER: seccomp.MatchAll{},
 	unix.SYS_SHUTDOWN: seccomp.Or{
 		// Used by fs/host to shutdown host sockets.
 		seccomp.PerArg{seccomp.AnyValue{}, seccomp.EqualTo(unix.SHUT_RD)},
@@ -317,24 +332,11 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.MaskedEqual(unix.AT_EMPTY_PATH, unix.AT_EMPTY_PATH),
 	},
-	unix.SYS_SYNC_FILE_RANGE: seccomp.MatchAll{},
 	unix.SYS_TEE: seccomp.PerArg{
 		seccomp.AnyValue{},
 		seccomp.AnyValue{},
 		seccomp.EqualTo(1),                      /* len */
 		seccomp.EqualTo(unix.SPLICE_F_NONBLOCK), /* flags */
-	},
-	unix.SYS_TIMER_CREATE: seccomp.PerArg{
-		seccomp.EqualTo(unix.CLOCK_THREAD_CPUTIME_ID), /* which */
-		seccomp.AnyValue{}, /* sevp */
-		seccomp.AnyValue{}, /* timerid */
-	},
-	unix.SYS_TIMER_DELETE: seccomp.MatchAll{},
-	unix.SYS_TIMER_SETTIME: seccomp.PerArg{
-		seccomp.AnyValue{}, /* timerid */
-		seccomp.EqualTo(0), /* flags */
-		seccomp.AnyValue{}, /* new_value */
-		seccomp.EqualTo(0), /* old_value */
 	},
 	unix.SYS_UTIMENSAT: seccomp.PerArg{
 		seccomp.AnyValue{},
@@ -377,8 +379,31 @@ func selfPIDFilters(pid uint64) seccomp.SyscallRules {
 	})
 }
 
+// cpuProfilerFilters contains the timer syscalls that the Go runtime makes
+// while it collects a CPU profile.
+func cpuProfilerFilters() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_SETITIMER: seccomp.MatchAll{},
+		unix.SYS_TIMER_CREATE: seccomp.PerArg{
+			seccomp.EqualTo(unix.CLOCK_THREAD_CPUTIME_ID), /* which */
+			seccomp.AnyValue{}, /* sevp */
+			seccomp.AnyValue{}, /* timerid */
+		},
+		unix.SYS_TIMER_DELETE: seccomp.MatchAll{},
+		unix.SYS_TIMER_SETTIME: seccomp.PerArg{
+			seccomp.AnyValue{}, /* timerid */
+			seccomp.EqualTo(0), /* flags */
+			seccomp.AnyValue{}, /* new_value */
+			seccomp.EqualTo(0), /* old_value */
+		},
+	})
+}
+
 // hostFilesystemFilters contains syscalls that are needed by directfs.
-func hostFilesystemFilters() seccomp.SyscallRules {
+func hostFilesystemFilters(vars precompiledseccomp.Values) seccomp.SyscallRules {
+	// procSelfFD is the directory FD through which directfs reopens host FDs
+	// by following their magic links (see gofer.SetProcSelfFD).
+	procSelfFD := vars[procSelfFDVarName]
 	// Directfs allows FD-based filesystem syscalls. We deny these syscalls with
 	// negative FD values (like AT_FDCWD or invalid FD numbers). We try to be as
 	// restrictive as possible because any restriction here improves security. We
@@ -390,6 +415,10 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW),
+		},
+		unix.SYS_FCHMOD: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
 		},
 		unix.SYS_FCHMODAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
@@ -406,29 +435,49 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 		},
-		unix.SYS_OPENAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.AnyValue{},
-			seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
-			seccomp.AnyValue{},
+		unix.SYS_OPENAT: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
+				seccomp.AnyValue{},
+			},
+			// Magic links must be followed to reopen host FDs; nothing is
+			// created through them.
+			seccomp.PerArg{
+				seccomp.EqualTo(procSelfFD),
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.O_CREAT|(unix.O_TMPFILE&^unix.O_DIRECTORY), 0),
+				seccomp.AnyValue{},
+			},
 		},
 		unix.SYS_LINKAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(procSelfFD),
 			seccomp.AnyValue{},
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
-			seccomp.EqualTo(0),
+			seccomp.EqualTo(unix.AT_SYMLINK_FOLLOW),
 		},
 		unix.SYS_MKDIRAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 		},
-		unix.SYS_MKNODAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.AnyValue{},
-			seccomp.AnyValue{},
-			seccomp.AnyValue{},
+		// Allow creating only regular files and (0, 0) character device
+		// whiteouts.
+		unix.SYS_MKNODAT: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.S_IFMT, unix.S_IFREG),
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.S_IFMT, unix.S_IFCHR),
+				seccomp.EqualTo(0),
+			},
 		},
 		unix.SYS_SYMLINKAT: seccomp.PerArg{
 			seccomp.AnyValue{},

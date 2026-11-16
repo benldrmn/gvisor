@@ -65,12 +65,16 @@ type FileDescription struct {
 	// asyncHandler handles O_ASYNC signal generation. It is set with the
 	// F_SETOWN or F_SETOWN_EX fcntls. For asyncHandler to be used, O_ASYNC must
 	// also be set by fcntl(2).
+	//
+	// +checklocks:flagsMu
 	asyncHandler FileAsync
 
-	// epolls is the set of epollInterests registered for this FileDescription.
-	// epolls is protected by epollMu.
 	epollMu epollMutex `state:"nosave"`
-	epolls  map[*epollInterest]struct{}
+
+	// epolls is the set of epollInterests registered for this FileDescription.
+	//
+	// +checklocks:epollMu
+	epolls map[*epollInterest]struct{}
 
 	// vd is the filesystem location at which this FileDescription was opened.
 	// A reference is held on vd. vd is immutable.
@@ -197,7 +201,12 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		}
 		fd.Dentry().InotifyWithParent(ctx, ev, 0, PathEvent)
 
-		// Unregister fd from all epoll instances.
+		// Detach the set before taking any EpollInstance.interestMu:
+		// registering or deleting an interest takes interestMu before epollMu.
+		//
+		// Linux's eventpoll_release_file likewise drops file->f_lock before
+		// acquiring ep->mtx:
+		// https://github.com/torvalds/linux/blob/adc218676/fs/eventpoll.c#L1095-L1107
 		fd.epollMu.Lock()
 		epolls := fd.epolls
 		fd.epolls = nil
@@ -531,7 +540,13 @@ type FileDescriptionImpl interface {
 	// TestPOSIX returns information about whether the specified lock can be held, in the style of the F_GETLK fcntl.
 	TestPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, r lock.LockRange) (linux.Flock, error)
 
+	// RegisterFileAsyncHandler registers fd's handler for I/O notifications.
+	// The caller holds fd.flagsMu. On error, the implementation must leave
+	// the handler unregistered.
 	RegisterFileAsyncHandler(fd *FileDescription) error
+
+	// UnregisterFileAsyncHandler removes a successful registration.
+	// The caller holds fd.flagsMu.
 	UnregisterFileAsyncHandler(fd *FileDescription)
 }
 
@@ -1053,6 +1068,7 @@ func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) (FileAsy
 		fd.asyncHandler = newHandler()
 		if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 {
 			if err := fd.impl.RegisterFileAsyncHandler(fd); err != nil {
+				fd.asyncHandler = nil
 				return nil, err
 			}
 		}

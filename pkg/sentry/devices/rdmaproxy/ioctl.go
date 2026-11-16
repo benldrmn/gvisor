@@ -237,6 +237,11 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		defer fdRelease()
 
 	case DmaCQCreate, DmaQPCreate, DmaSRQCreate:
+		if schema.Dma == DmaQPCreate {
+			if err := validateQPCreate(attrs); err != nil {
+				return 0, err
+			}
+		}
 		mp, err := fd.prepareCreateDMA(t, staged)
 		if err != nil {
 			log.Warningf("rdmaproxy: CQ/QP/SRQ CREATE page mirroring: %v", err)
@@ -423,6 +428,24 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 	return n, nil
 }
 
+// validateQPCreate rejects QP modes with unsupported send queue layouts.
+func validateQPCreate(attrs []ib.UverbsAttr) error {
+	for i := range attrs {
+		switch attrs[i].AttrID {
+		case ib.UVERBS_ATTR_CREATE_QP_TYPE:
+			if attrs[i].Len != 8 {
+				return linuxerr.EINVAL
+			}
+			if attrs[i].Data == ib.IB_UVERBS_QPT_RAW_PACKET {
+				return linuxerr.EOPNOTSUPP
+			}
+		case ib.UVERBS_ATTR_CREATE_QP_SOURCE_QPN:
+			return linuxerr.EOPNOTSUPP
+		}
+	}
+	return nil
+}
+
 // copyInPtr stages a guest PTR_IN payload of len bytes into a fresh sentry
 // buffer. length is the attribute's u16 wire length, so sb is at most 64 KiB.
 func (fd *uverbsFD) copyInPtr(t *kernel.Task, guestPtr uint64, length uint16) ([]byte, error) {
@@ -439,7 +462,7 @@ func (fd *uverbsFD) copyInPtr(t *kernel.Task, guestPtr uint64, length uint16) ([
 // is no longer needed.
 func (fd *uverbsFD) translateInputFD(t *kernel.Task, appFD int32) (int, *vfs.FileDescription, error) {
 	if appFD < 0 {
-		return 0, nil, linuxerr.EINVAL
+		return 0, nil, linuxerr.EBADF
 	}
 	file := t.GetFile(appFD)
 	if file == nil {
@@ -460,7 +483,7 @@ func (fd *uverbsFD) translateInputFD(t *kernel.Task, appFD int32) (int, *vfs.Fil
 // no longer needed.
 func (fd *uverbsFD) translateHostBackedFD(t *kernel.Task, appFD int32) (int, *vfs.FileDescription, error) {
 	if appFD < 0 {
-		return 0, nil, linuxerr.EINVAL
+		return 0, nil, linuxerr.EBADF
 	}
 	file := t.GetFile(appFD)
 	if file == nil {

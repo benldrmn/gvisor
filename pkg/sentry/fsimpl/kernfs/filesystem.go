@@ -232,9 +232,16 @@ func (fs *Filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.Resolving
 	return d, nil
 }
 
+// A syntheticMountpointWriter checks whether a runtime mountpoint can be
+// created under an inode without changing the underlying directory.
+type syntheticMountpointWriter interface {
+	CheckSyntheticMountpointWrite(context.Context, *auth.Credentials) error
+}
+
 // checkCreateLocked checks that a file named name may be created in parent.
-// forSyntheticMountpoint permits creating a synthetic mountpoint even if the
-// filesystem does not create negative dentries.
+// forSyntheticMountpoint permits creating a mountpoint even if the filesystem
+// does not create negative dentries or the directory is immutable. The caller
+// still needs write permission on the directory.
 //
 // Preconditions:
 //   - Filesystem.mu must be locked for writing.
@@ -271,10 +278,14 @@ func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string
 	if parent.VFSDentry().IsDead() {
 		return linuxerr.ENOENT
 	}
-	if err := parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite); err != nil {
-		return err
+	if forSyntheticMountpoint {
+		// An immutable directory may allow a synthetic mountpoint if
+		// creds would otherwise have write access.
+		if inode, ok := parent.inode.(syntheticMountpointWriter); ok {
+			return inode.CheckSyntheticMountpointWrite(ctx, creds)
+		}
 	}
-	return nil
+	return parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite)
 }
 
 // checkDeleteLocked checks that the file represented by vfsd may be deleted.
@@ -320,12 +331,52 @@ func (fs *Filesystem) Release(ctx context.Context) {
 	}
 	fs.mu.Lock()
 	root.releaseKeptDentriesLocked(ctx)
-	for fs.cachedDentriesLen != 0 {
-		fs.evictCachedDentryLocked(ctx)
-	}
+	fs.evictAllCachedDentriesLocked(ctx)
 	fs.mu.Unlock()
 	// Drop ref acquired in Dentry.InitRoot().
 	root.DecRef(ctx)
+}
+
+// EvictCachedDentries evicts all dentries that are only kept alive by the
+// dentry cache, except for dentries with inotify watches.
+func (fs *Filesystem) EvictCachedDentries(ctx context.Context) {
+	fs.mu.Lock()
+	defer fs.processDeferredDecRefs(ctx)
+	defer fs.mu.Unlock()
+	// Inotify watches don't hold a reference on their target, so a watched
+	// dentry can be cached with no references. Evicting it may destroy its
+	// inode along with its watches, so set it aside and cache it again below.
+	var watched dentryList
+	for fs.cachedDentriesLen != 0 {
+		d := fs.cachedDentries.Back()
+		if d.refs.Load() == 0 && !d.VFSDentry().IsDead() && d.inode.Watches().Size() > 0 {
+			fs.cachedDentries.Remove(d)
+			fs.cachedDentriesLen--
+			d.cached = false
+			watched.PushBack(d)
+			continue
+		}
+		d.evictLocked(ctx)
+	}
+	// Cache watched dentries as most recently used, so that they are the last
+	// to be evicted if the cache overflows.
+	for !watched.Empty() {
+		d := watched.Front()
+		watched.Remove(d)
+		fs.cachedDentries.PushFront(d)
+		fs.cachedDentriesLen++
+		d.cached = true
+	}
+}
+
+// Preconditions:
+//   - fs.mu must be locked for writing.
+func (fs *Filesystem) evictAllCachedDentriesLocked(ctx context.Context) {
+	// Evicting a dentry can add its parent to the cache, so loop until the
+	// cache is empty.
+	for fs.cachedDentriesLen != 0 {
+		fs.evictCachedDentryLocked(ctx)
+	}
 }
 
 // releaseKeptDentriesLocked recursively drops all dentry references created by
@@ -348,6 +399,11 @@ func (d *Dentry) releaseKeptDentriesLocked(ctx context.Context) {
 			child.releaseKeptDentriesLocked(ctx)
 		}
 	}
+}
+
+// DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
+func (fs *Filesystem) DrainDentryCache(ctx context.Context) error {
+	return linuxerr.EOPNOTSUPP
 }
 
 // Sync implements vfs.FilesystemImpl.Sync.
@@ -538,11 +594,18 @@ func (fs *Filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	return nil
 }
 
-// mayExecFile rejects FileExec opens of non-regular files before invoking the
-// inode's open handler, which may block or have side effects (e.g. acquiring
-// a controlling terminal), as in Linux's fs/namei.c:may_open(). Symlinks are
-// exempt so that they produce ELOOP, also per may_open().
-func mayExecFile(d *Dentry, opts vfs.OpenOptions) error {
+func (d *Dentry) mayOpen(ctx context.Context, creds *auth.Credentials, opts vfs.OpenOptions) error {
+	ats := vfs.AccessTypesForOpenFlags(&opts)
+	// Linux rejects a writable open of a directory before checking inode
+	// permissions. O_TMPFILE creates a file inside the directory instead.
+	if d.isDir() && opts.Flags&linux.O_TMPFILE == 0 && (opts.Flags&linux.O_CREAT != 0 || ats.MayWrite()) {
+		return linuxerr.EISDIR
+	}
+	if err := d.inode.CheckPermissions(ctx, creds, ats); err != nil {
+		return err
+	}
+	// A non-regular inode's open handler may block or acquire a controlling
+	// terminal. Let symlinks produce ELOOP, as in Linux's may_open().
 	if opts.FileExec && !d.isRegular() && !d.isSymlink() {
 		return linuxerr.EACCES
 	}
@@ -551,7 +614,6 @@ func mayExecFile(d *Dentry, opts vfs.OpenOptions) error {
 
 // OpenAt implements vfs.FilesystemImpl.OpenAt.
 func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	ats := vfs.AccessTypesForOpenFlags(&opts)
 	trunc := opts.Flags&linux.O_TRUNC != 0
 	mnt := rp.Mount()
 
@@ -564,11 +626,7 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			fs.mu.RUnlock()
 			return nil, err
 		}
-		if err := d.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil {
-			fs.mu.RUnlock()
-			return nil, err
-		}
-		if err := mayExecFile(d, opts); err != nil {
+		if err := d.mayOpen(ctx, rp.Credentials(), opts); err != nil {
 			fs.mu.RUnlock()
 			return nil, err
 		}
@@ -611,10 +669,7 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		if mustCreate {
 			return nil, linuxerr.EEXIST
 		}
-		if err := start.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil {
-			return nil, err
-		}
-		if err := mayExecFile(start, opts); err != nil {
+		if err := start.mayOpen(ctx, rp.Credentials(), opts); err != nil {
 			return nil, err
 		}
 		if trunc && start.isRegular() {
@@ -709,10 +764,7 @@ afterTrailingSymlink:
 	if rp.MustBeDir() && !child.isDir() {
 		return nil, linuxerr.ENOTDIR
 	}
-	if err := child.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil {
-		return nil, err
-	}
-	if err := mayExecFile(child, opts); err != nil {
+	if err := child.mayOpen(ctx, rp.Credentials(), opts); err != nil {
 		return nil, err
 	}
 	if trunc && child.isRegular() {
@@ -720,19 +772,6 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		defer mnt.EndWrite()
-	}
-	if child.isDir() {
-		// Can't open directories with O_CREAT.
-		if opts.Flags&linux.O_CREAT != 0 {
-			return nil, linuxerr.EISDIR
-		}
-		// Can't open directories writably.
-		if ats&vfs.MayWrite != 0 {
-			return nil, linuxerr.EISDIR
-		}
-		if opts.Flags&linux.O_DIRECT != 0 {
-			return nil, linuxerr.EINVAL
-		}
 	}
 	// Open may block so we need to unlock fs.mu. IncRef child to prevent
 	// its destruction while fs.mu is unlocked.

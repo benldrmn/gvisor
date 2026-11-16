@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -291,6 +292,40 @@ TEST(NetlinkRouteTest, GetLinkDump) {
   EXPECT_TRUE(loopbackFound);
 }
 
+TEST(NetlinkRouteTest, GetLinkDumpWithAck) {
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+  };
+
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifm.ifi_family = AF_UNSPEC;
+
+  // A successful dump ends with NLMSG_DONE and is not acked.
+  bool doneFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponse(
+      fd, &req, sizeof(req),
+      [&](const struct nlmsghdr* hdr) {
+        EXPECT_NE(hdr->nlmsg_type, NLMSG_ERROR);
+        if (hdr->nlmsg_type == NLMSG_DONE) {
+          doneFound = true;
+        }
+      },
+      false));
+  EXPECT_TRUE(doneFound);
+
+  char buf[4096];
+  EXPECT_THAT(recv(fd.get(), buf, sizeof(buf), MSG_DONTWAIT),
+              SyscallFailsWithErrno(EAGAIN));
+}
+
 // CheckLinkMsg checks a netlink message against an expected link.
 void CheckLinkMsg(const struct nlmsghdr* hdr, const Link& link) {
   ASSERT_THAT(hdr->nlmsg_type, Eq(RTM_NEWLINK));
@@ -440,21 +475,27 @@ MtuRequest GetMtuRequest(const Link& link, uint16_t nlmsg_type, uint32_t mtu) {
 
 TEST_P(NetlinkSetLinkTest, ChangeMTU) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  SKIP_IF(!IsRunningOnGvisor());
+
+  const FileDescriptor nsfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  Cleanup restore_netns = Cleanup([&] {
+    ASSERT_THAT(setns(nsfd.get(), CLONE_NEWNET), SyscallSucceedsWithValue(0));
+  });
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
+
   Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
 
   FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   // Change the MTU.
-  uint16_t nlmsg_type = GetParam();
-  MtuRequest req =
-      GetMtuRequest(loopback_link, nlmsg_type, loopback_link.mtu + 10);
-  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, sizeof(req)));
+  MtuRequest req = GetMtuRequest(loopback_link, GetParam(), 1234);
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, sizeof(req)));
 
   // Update the local loopback_link's MTU to the requested value.
-  loopback_link.mtu = req.mtu - ETH_HLEN;
+  loopback_link.mtu = req.mtu;
   // Verify the new MTU.
   struct searchrequest {
     struct nlmsghdr hdr;
@@ -1888,6 +1929,149 @@ TEST_P(NetlinkRouteIpInvariantTest, DeleteRoute) {
   EXPECT_THAT(
       DelUnicastRoute(loopback_link.index, family, prefixlen, dst, dst_len),
       PosixErrorIs(ESRCH, _));
+}
+
+// Route and address dumps for AF_INET or AF_INET6 only return entries of that
+// family.
+TEST_P(NetlinkRouteIpInvariantTest, DumpFiltersFamily) {
+  const int family = GetParam();
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtgenmsg rgm;
+  };
+
+  for (uint16_t type : {RTM_GETROUTE, RTM_GETADDR}) {
+    struct request req = {};
+    req.hdr.nlmsg_len = sizeof(req);
+    req.hdr.nlmsg_type = type;
+    req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.hdr.nlmsg_seq = kSeq;
+    req.rgm.rtgen_family = family;
+
+    ASSERT_NO_ERRNO(NetlinkRequestResponse(
+        fd, &req, sizeof(req),
+        [&](const struct nlmsghdr* hdr) {
+          if (hdr->nlmsg_type == RTM_NEWROUTE) {
+            const struct rtmsg* msg =
+                reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+            EXPECT_EQ(msg->rtm_family, family);
+          } else if (hdr->nlmsg_type == RTM_NEWADDR) {
+            const struct ifaddrmsg* msg =
+                reinterpret_cast<const struct ifaddrmsg*>(NLMSG_DATA(hdr));
+            EXPECT_EQ(msg->ifa_family, family);
+          }
+        },
+        false));
+  }
+}
+
+// Main-table routes are dumped in Linux FIB order: IPv4 by ascending
+// destination with longer prefixes first on ties, IPv6 with every route before
+// the routes containing it.
+TEST_P(NetlinkRouteIpInvariantTest, GetRouteDumpOrder) {
+  const int family = GetParam();
+  const int addr_len = family == AF_INET ? 4 : 16;
+  // Routes are not savable.
+  DisableSave ds;
+
+  std::vector<Cleanup> route_cleanups;
+  if (IsRunningOnGvisor() &&
+      ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN))) {
+    // Add routes that netstack's longest-prefix-first order would misorder.
+    std::vector<std::pair<std::string, int>> routes;
+    if (family == AF_INET) {
+      routes = {
+          {"203.0.113.0", 25}, {"203.0.113.0", 24}, {"203.0.113.128", 25}};
+    } else {
+      routes = {{"2001:db8:fe00::", 40},
+                {"2001:db8:fe00::", 48},
+                {"2001:db8:ff00::", 48}};
+    }
+    Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+    for (const auto& route : routes) {
+      int index = loopback_link.index;
+      int prefixlen = route.second;
+      struct in6_addr dst = {};
+      ASSERT_EQ(inet_pton(family, route.first.c_str(), &dst), 1);
+      ASSERT_NO_ERRNO(
+          AddUnicastRoute(index, family, prefixlen, &dst, addr_len));
+      route_cleanups.emplace_back([=] {
+        EXPECT_NO_ERRNO(
+            DelUnicastRoute(index, family, prefixlen, &dst, addr_len));
+      });
+    }
+  }
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+  };
+
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETROUTE;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.hdr.nlmsg_seq = kSeq;
+  req.rtm.rtm_family = family;
+
+  struct DumpedRoute {
+    std::vector<uint8_t> dst;
+    int len;
+  };
+  std::vector<DumpedRoute> dumped;
+  ASSERT_NO_ERRNO(NetlinkRequestResponse(
+      fd, &req, sizeof(req),
+      [&](const struct nlmsghdr* hdr) {
+        if (hdr->nlmsg_type != RTM_NEWROUTE) {
+          return;
+        }
+        const struct rtmsg* msg =
+            reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+        // hostinet reports the host's local table routes, which are not
+        // unicast, in the main table.
+        if (msg->rtm_family != family || msg->rtm_table != RT_TABLE_MAIN ||
+            msg->rtm_type != RTN_UNICAST) {
+          return;
+        }
+        DumpedRoute rt = {std::vector<uint8_t>(addr_len), msg->rtm_dst_len};
+        int len = RTM_PAYLOAD(hdr);
+        for (struct rtattr* attr = RTM_RTA(msg); RTA_OK(attr, len);
+             attr = RTA_NEXT(attr, len)) {
+          if (attr->rta_type == RTA_DST &&
+              RTA_PAYLOAD(attr) == static_cast<size_t>(addr_len)) {
+            memcpy(rt.dst.data(), RTA_DATA(attr), addr_len);
+          }
+        }
+        dumped.push_back(rt);
+      },
+      false));
+
+  auto compare = [family](const DumpedRoute& a, const DumpedRoute& b) {
+    int bits = family == AF_INET ? 32 : std::min(a.len, b.len);
+    for (int i = 0; i < bits; i++) {
+      int abit = (a.dst[i / 8] >> (7 - i % 8)) & 1;
+      int bbit = (b.dst[i / 8] >> (7 - i % 8)) & 1;
+      if (abit != bbit) {
+        return abit - bbit;
+      }
+    }
+    return b.len - a.len;
+  };
+  auto format = [family](const DumpedRoute& rt) {
+    char addr[INET6_ADDRSTRLEN] = {};
+    inet_ntop(family, rt.dst.data(), addr, sizeof(addr));
+    return absl::StrFormat("%s/%d", addr, rt.len);
+  };
+  for (size_t i = 1; i < dumped.size(); i++) {
+    EXPECT_LE(compare(dumped[i - 1], dumped[i]), 0)
+        << format(dumped[i - 1]) << " dumped before " << format(dumped[i]);
+  }
 }
 
 TEST_P(NetlinkRouteIpInvariantTest, AddAndRemoveRoute) {
@@ -3870,6 +4054,87 @@ TEST(NetlinkRouteTest, VethAddUnnamedPeer) {
   EXPECT_EQ(link_kinds["veth0"], "veth");
 }
 
+// Returns whether a socket can bind to addr. Linux allows that only once addr
+// is assigned and has completed duplicate address detection.
+PosixErrorOr<bool> Bindable(const struct sockaddr_in6& addr) {
+  ASSIGN_OR_RETURN_ERRNO(FileDescriptor s, Socket(AF_INET6, SOCK_DGRAM, 0));
+  if (bind(s.get(), AsSockAddr(&addr), sizeof(addr)) == 0) {
+    return true;
+  }
+  if (errno == EADDRNOTAVAIL) {
+    return false;
+  }
+  return PosixError(errno, "bind");
+}
+
+// Waits until a socket can bind to addr. On Linux, duplicate address detection
+// takes a few seconds. gVisor does not run it.
+PosixError WaitBindable(const struct sockaddr_in6& addr) {
+  for (int i = 0; i < 100; ++i) {
+    ASSIGN_OR_RETURN_ERRNO(bool bindable, Bindable(addr));
+    if (bindable) {
+      return NoError();
+    }
+    absl::SleepFor(absl::Milliseconds(100));
+  }
+  return PosixError(ETIMEDOUT, "address did not become bindable");
+}
+
+// Like Linux, bringing a veth interface up assigns it an EUI-64 IPv6 link-local
+// address, and bringing it down removes the address.
+TEST(NetlinkRouteTest, VethLinkLocalAddrOnUpDown) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(IsRunningWithHostinet());
+  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
+  const DisableSave ds;
+
+  const FileDescriptor curr_nsfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  Cleanup restore_netns = Cleanup([&] {
+    ASSERT_THAT(setns(curr_nsfd.get(), CLONE_NEWNET),
+                SyscallSucceedsWithValue(0));
+  });
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
+
+  // Linux derives veth1's link-local address, fe80::ff:fe00:1, from this MAC
+  // address.
+  constexpr uint8_t kMac[ETH_ALEN] = {0x02, 0, 0, 0, 0, 0x01};
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  VethRequest req = GetVethRequest(kSeq, "veth1", "veth2");
+  addattr(&req.hdr, sizeof(req), IFLA_ADDRESS, kMac, sizeof(kMac));
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+  const int veth1 = if_nametoindex("veth1");
+  ASSERT_NE(veth1, 0);
+  const int veth2 = if_nametoindex("veth2");
+  ASSERT_NE(veth2, 0);
+
+  struct sockaddr_in6 addr = {};
+  addr.sin6_family = AF_INET6;
+  addr.sin6_scope_id = veth1;
+  ASSERT_EQ(inet_pton(AF_INET6, "fe80::ff:fe00:1", &addr.sin6_addr), 1);
+
+  // Linux creates veth interfaces down, but gVisor creates them up. Take veth1
+  // down so it starts down on both.
+  // TODO(gvisor.dev/issue/16069): Remove this once gVisor creates veth
+  // interfaces down.
+  ASSERT_NO_ERRNO(LinkChangeFlags(veth1, 0, IFF_UP));
+  // Linux configures veth1 only once it has a carrier, which needs veth2 up.
+  ASSERT_NO_ERRNO(LinkChangeFlags(veth2, IFF_UP, IFF_UP));
+
+  // Bringing veth1 up assigns the address.
+  ASSERT_NO_ERRNO(LinkChangeFlags(veth1, IFF_UP, IFF_UP));
+  ASSERT_NO_ERRNO(WaitBindable(addr));
+
+  // Taking it down removes the address.
+  ASSERT_NO_ERRNO(LinkChangeFlags(veth1, 0, IFF_UP));
+  EXPECT_THAT(Bindable(addr), IsPosixErrorOkAndHolds(false));
+
+  // Bringing it back up assigns the address again.
+  ASSERT_NO_ERRNO(LinkChangeFlags(veth1, IFF_UP, IFF_UP));
+  EXPECT_NO_ERRNO(WaitBindable(addr));
+}
+
 TEST(NetlinkRouteTest, BridgeAddUnnamed) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
@@ -3902,6 +4167,7 @@ TEST(NetlinkRouteTest, BridgeAddUnnamed) {
 TEST(NetlinkRouteTest, LinkInfoKind) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
+  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -3924,16 +4190,27 @@ TEST(NetlinkRouteTest, LinkInfoKind) {
   SKIP_IF(!IsRunningOnGvisor() && err.errno_value() == EOPNOTSUPP);
   ASSERT_NO_ERRNO(err);
 
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
   std::vector<Link> links = ASSERT_NO_ERRNO_AND_VALUE(DumpLinks(fd));
-  std::map<std::string, std::string> link_kinds;
-  for (const Link& link : links) {
-    link_kinds[link.name] = link.kind;
-  }
+  for (const auto& [name, kind] :
+       {std::pair{"veth1", "veth"}, std::pair{"veth2", "veth"},
+        std::pair{"br0", "bridge"}, std::pair{"lo", ""}}) {
+    SCOPED_TRACE(name);
+    auto link = std::find_if(links.begin(), links.end(), [&](const Link& link) {
+      return link.name == name;
+    });
+    ASSERT_NE(link, links.end());
+    EXPECT_EQ(link->kind, kind);
 
-  EXPECT_EQ(link_kinds["veth1"], "veth");
-  EXPECT_EQ(link_kinds["veth2"], "veth");
-  EXPECT_EQ(link_kinds["br0"], "bridge");
-  EXPECT_EQ(link_kinds["lo"], "");
+    // Both the netlink dump and SIOCGIFFLAGS report multicast support.
+    const unsigned int multicast = link->name == "lo" ? 0 : IFF_MULTICAST;
+    EXPECT_EQ(link->flags & IFF_MULTICAST, multicast);
+    struct ifreq ifr = {};
+    strncpy(ifr.ifr_name, name, IFNAMSIZ);
+    ASSERT_THAT(ioctl(sock.get(), SIOCGIFFLAGS, &ifr), SyscallSucceeds());
+    EXPECT_EQ(ifr.ifr_flags & IFF_MULTICAST, multicast);
+  }
 }
 
 struct RouteRequest {
@@ -4017,6 +4294,8 @@ TEST(NetlinkRouteTest, NewRouteGatewayNotOnLink) {
 TEST(NetlinkRouteTest, NewRouteGatewayOnLink) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
+  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
+  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4998,6 +5277,54 @@ TEST_P(NetlinkRouteIpInvariantTest, RouteMulticastGroup) {
   for (const FileDescriptor* fd : obs.NotJoined()) {
     EXPECT_THAT(DrainNetlinkMessages(*fd), IsEmpty());
   }
+}
+
+// Like Linux's addrconf_ifdown, taking an interface down announces the IPv6
+// routes and addresses that it removes. The kernel removes them rather than
+// the request, so the notifications carry port ID 0 and sequence number 0.
+TEST(NetlinkRouteTest, LinkDownIPv6MulticastGroups) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(IsRunningWithHostinet());
+  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
+  const DisableSave ds;
+
+  const FileDescriptor curr_nsfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  Cleanup restore_netns = Cleanup([&] {
+    ASSERT_THAT(setns(curr_nsfd.get(), CLONE_NEWNET),
+                SyscallSucceedsWithValue(0));
+  });
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
+
+  // Bringing the loopback interface up assigns ::1/128 and adds its route.
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  ASSERT_NO_ERRNO(LinkChangeFlags(lo.index, IFF_UP, IFF_UP));
+
+  struct sockaddr_nl sa = {};
+  sa.nl_family = AF_NETLINK;
+  sa.nl_groups = RTMGRP_IPV6_IFADDR | RTMGRP_IPV6_ROUTE;
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE, &sa));
+
+  // keep_addr_on_down is off in a new network namespace, so taking the
+  // interface down removes ::1/128 and flushes its route.
+  ASSERT_NO_ERRNO(LinkChangeFlags(lo.index, 0, IFF_UP));
+
+  const std::string loopback(reinterpret_cast<const char*>(&in6addr_loopback),
+                             sizeof(in6addr_loopback));
+  auto msgs = DrainNetlinkMessages(fd);
+
+  const struct nlmsghdr* route = FindRouteMessage(
+      msgs, RTM_DELROUTE, AF_INET6, lo.index, /*prefixlen=*/128, loopback);
+  ASSERT_NE(route, nullptr) << "no RTM_DELROUTE for ::1/128";
+  EXPECT_EQ(route->nlmsg_pid, 0u);
+  EXPECT_EQ(route->nlmsg_seq, 0u);
+
+  const struct nlmsghdr* addr = FindAddrMessage(
+      msgs, RTM_DELADDR, AF_INET6, lo.index, /*prefixlen=*/128, loopback);
+  ASSERT_NE(addr, nullptr) << "no RTM_DELADDR for ::1/128";
+  EXPECT_EQ(addr->nlmsg_pid, 0u);
+  EXPECT_EQ(addr->nlmsg_seq, 0u);
 }
 
 // Creates a veth pair in the current network namespace, brings both ends up,

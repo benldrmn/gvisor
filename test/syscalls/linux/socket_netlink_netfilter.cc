@@ -4339,7 +4339,7 @@ TEST(NetlinkNetfilterTest, AddRuleToEndOfRuleList) {
 
 TEST(NetlinkNetfilterTest, AddDropRuleBeforeAcceptRule) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCaps()));
-  std::string test_table_name = GetUniqueTestTableName();
+  [[maybe_unused]] std::string test_table_name = GetUniqueTestTableName();
   FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetfilterBoundSocket());
 
   std::string table_name = GetUniqueTestTableName();
@@ -4394,7 +4394,7 @@ TEST(NetlinkNetfilterTest, AddDropRuleBeforeAcceptRule) {
 
 TEST(NetlinkNetfilterTest, AddDropRuleAfterAcceptRule) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCaps()));
-  std::string test_table_name = GetUniqueTestTableName();
+  [[maybe_unused]] std::string test_table_name = GetUniqueTestTableName();
   FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetfilterBoundSocket());
 
   std::string table_name = GetUniqueTestTableName();
@@ -4449,7 +4449,7 @@ TEST(NetlinkNetfilterTest, AddDropRuleAfterAcceptRule) {
 
 TEST(NetlinkNetfilterTest, GetRule) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCaps()));
-  std::string test_table_name = GetUniqueTestTableName();
+  [[maybe_unused]] std::string test_table_name = GetUniqueTestTableName();
   FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetfilterBoundSocket());
 
   std::string table_name = GetUniqueTestTableName();
@@ -4971,6 +4971,12 @@ std::vector<RuleWithExprTestParams> GetMetaRuleTestParams() {
                             .U32Attr(NFTA_META_DREG, NFT_REG32_00)
                             .U32Attr(NFTA_META_KEY, NFT_META_MARK)},
       RuleWithExprTestParams{
+          .test_name = "GetOifValid",
+          .expr_name = "meta",
+          .expr_attrs = NlNestedAttr()
+                            .U32Attr(NFTA_META_DREG, NFT_REG32_00)
+                            .U32Attr(NFTA_META_KEY, NFT_META_OIF)},
+      RuleWithExprTestParams{
           .test_name = "SetValid",
           .expr_name = "meta",
           .expr_attrs = NlNestedAttr()
@@ -5319,6 +5325,40 @@ std::vector<RuleWithExprTestParams> GetFibRuleTestParams() {
                             .U32Attr(NFTA_FIB_RESULT, 999)
                             .U32Attr(NFTA_FIB_FLAGS, NFTA_FIB_F_SADDR),
           .expected_error_no = EINVAL},
+      RuleWithExprTestParams{
+          .test_name = "DregAboveMax",
+          .expr_name = "fib",
+          .expr_attrs = NlNestedAttr()
+                            .U32Attr(NFTA_FIB_DREG, NFT_REG32_15 + 1)
+                            .U32Attr(NFTA_FIB_RESULT, NFT_FIB_RESULT_OIF)
+                            .U32Attr(NFTA_FIB_FLAGS, NFTA_FIB_F_SADDR),
+          .expected_error_no = ERANGE},
+      // Narrowing the destination to a byte would turn it into NFT_REG_1.
+      RuleWithExprTestParams{
+          .test_name = "DregWouldTruncate",
+          .expr_name = "fib",
+          .expr_attrs = NlNestedAttr()
+                            .U32Attr(NFTA_FIB_DREG, 256 + NFT_REG_1)
+                            .U32Attr(NFTA_FIB_RESULT, NFT_FIB_RESULT_OIF)
+                            .U32Attr(NFTA_FIB_FLAGS, NFTA_FIB_F_SADDR),
+          .expected_error_no = ERANGE},
+      RuleWithExprTestParams{
+          .test_name = "UnknownFlag",
+          .expr_name = "fib",
+          .expr_attrs =
+              NlNestedAttr()
+                  .U32Attr(NFTA_FIB_DREG, NFT_REG_1)
+                  .U32Attr(NFTA_FIB_RESULT, NFT_FIB_RESULT_OIF)
+                  .U32Attr(NFTA_FIB_FLAGS, NFTA_FIB_F_SADDR | (1U << 31)),
+          .expected_error_no = EINVAL},
+      RuleWithExprTestParams{
+          .test_name = "ValidLastRegister",
+          .expr_name = "fib",
+          .expr_attrs = NlNestedAttr()
+                            .U32Attr(NFTA_FIB_DREG, NFT_REG32_15)
+                            .U32Attr(NFTA_FIB_RESULT, NFT_FIB_RESULT_OIF)
+                            .U32Attr(NFTA_FIB_FLAGS, NFTA_FIB_F_SADDR),
+          .expected_error_no = 0},
       RuleWithExprTestParams{
           .test_name = "ValidOIF",
           .expr_name = "fib",

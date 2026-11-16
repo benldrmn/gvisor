@@ -179,10 +179,9 @@ type awaitingMountContext struct {
 	// The root of the filesystem created using FSCONFIG_CMD_CREATE.
 	root *vfs.Dentry
 
-	// The MountOptions which will be used to mount the filesystem by fsmount(2).
-	// Note that the filesystem-specific options have already been processed by
-	// FSCONFIG_CMD_CREATE, so only the mount-specific options are relevant here.
-	opts *vfs.MountOptions
+	// fsmount inherits the read-only setting from fsconfig. Filesystem-specific
+	// options have already been consumed by FSCONFIG_CMD_CREATE.
+	readOnly bool
 
 	// The credentials of the process that mounted the filesystem.
 	creds *auth.Credentials
@@ -192,6 +191,8 @@ func (awaitingMountContext) isFSContext() {}
 
 // reconfParamsContext represents a filesystem configuration context after fsmount(2) has
 // been called.
+//
+// +stateify savable
 type reconfParamsContext struct {
 	// The credentials of the process that mounted the filesystem.
 	creds *auth.Credentials
@@ -332,7 +333,7 @@ func (fd *Fd) DoCmdCreate(ctx context.Context, vfsObj *vfs.VirtualFilesystem) er
 	fd.context = &awaitingMountContext{
 		filesystem: fs,
 		root:       root,
-		opts:       opts,
+		readOnly:   opts.ReadOnly,
 		creds:      creds,
 	}
 
@@ -363,9 +364,27 @@ func (fd *Fd) DoCmdReconfigure(ctx context.Context, vfsObj *vfs.VirtualFilesyste
 	return nil
 }
 
+// PeekFilesystem returns the filesystem type name and a copy of the mount options, without
+// changing state, if the fd is in "awaiting-mount" mode. Otherwise, it returns an error.
+func (fd *Fd) PeekFilesystem() (string, vfs.MountOptions, error) {
+	fd.contextMu.Lock()
+	defer fd.contextMu.Unlock()
+
+	fdContext, ok := fd.context.(*awaitingMountContext)
+	if !ok {
+		switch fd.context.(type) {
+		case *createParamsContext:
+			return "", vfs.MountOptions{}, linuxerr.EINVAL
+		default:
+			return "", vfs.MountOptions{}, linuxerr.EBUSY
+		}
+	}
+	return fdContext.filesystem.FilesystemType().Name(), vfs.MountOptions{ReadOnly: fdContext.readOnly}, nil
+}
+
 // GetFilesystem returns the filesystem and transitions the fd into the appropriate state if the
 // fd is in "awaiting-mount" mode. If the fd is not in "awaiting-mount" mode, returns an error.
-func (fd *Fd) GetFilesystem() (*vfs.Filesystem, *vfs.Dentry, *vfs.MountOptions, error) {
+func (fd *Fd) GetFilesystem() (*vfs.Filesystem, *vfs.Dentry, error) {
 	fd.contextMu.Lock()
 	defer fd.contextMu.Unlock()
 
@@ -380,19 +399,18 @@ func (fd *Fd) GetFilesystem() (*vfs.Filesystem, *vfs.Dentry, *vfs.MountOptions, 
 		default:
 			err = linuxerr.EBUSY
 		}
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	fs := fdContext.filesystem
 	root := fdContext.root
-	opts := fdContext.opts
 
 	// Transition into reconfParamsContext
 	fd.context = &reconfParamsContext{
 		creds: fdContext.creds,
 	}
 
-	return fs, root, opts, nil
+	return fs, root, nil
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.

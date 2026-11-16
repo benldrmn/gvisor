@@ -15,6 +15,8 @@
 package proc
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -195,6 +197,32 @@ func TestSyntheticMountpointCreation(t *testing.T) {
 	}
 	if err := s.VFS.MkdirAt(s.Ctx, s.Creds, s.PathOpAtRoot("/proc/ordinary"), &vfs.MkdirOptions{Mode: 0755}); !linuxerr.Equals(linuxerr.ENOENT, err) {
 		t.Errorf("MkdirAt(/proc/ordinary): got %v, want ENOENT", err)
+	}
+}
+
+func TestSyntheticTaskMountpointCreation(t *testing.T) {
+	s := setup(t)
+	defer s.Destroy()
+
+	k := kernel.KernelFromContext(s.Ctx)
+	tg := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+	task, err := testutil.CreateTask(s.Ctx, "mountpoint", tg, s.MntNs, s.Root, s.Root)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	pid := k.RootPIDNamespace().IDOfTask(task)
+	withoutOverride := s.Creds.Fork()
+	withoutOverride.EffectiveCaps &^= auth.CapabilitySetOf(linux.CAP_DAC_OVERRIDE)
+	for _, parent := range []string{fmt.Sprintf("/proc/%d", pid), fmt.Sprintf("/proc/%d/task/%d", pid, pid)} {
+		name := parent + "/mountpoint"
+		if err := s.VFS.MakeSyntheticMountpoint(s.Ctx, name, s.Root, withoutOverride); !errors.Is(err, linuxerr.EACCES) {
+			t.Errorf("MakeSyntheticMountpoint(%q) without CAP_DAC_OVERRIDE: got %v, want EACCES", name, err)
+		}
+		if err := s.VFS.MakeSyntheticMountpoint(s.Ctx, name, s.Root, s.Creds); err != nil {
+			t.Fatalf("MakeSyntheticMountpoint(%q): %v", name, err)
+		}
+		d := s.GetDentryOrDie(s.PathOpAtRoot(name))
+		d.DecRef(s.Ctx)
 	}
 }
 
@@ -858,5 +886,63 @@ func TestSysNetIPv4FileModes(t *testing.T) {
 		if got := stat.Mode & 0777; got != tc.perm {
 			t.Errorf("%s mode = %#o, want %#o", tc.path, got, tc.perm)
 		}
+	}
+}
+
+func TestSysFsAIO(t *testing.T) {
+	s := setup(t)
+	defer s.Destroy()
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{path: "/proc/sys/fs/aio-max-nr", want: "65536\n"},
+		{path: "/proc/sys/fs/aio-nr", want: "0\n"},
+	} {
+		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, s.PathOpAtRoot(tc.path), &vfs.OpenOptions{})
+		if err != nil {
+			t.Errorf("OpenAt(%q) failed: %v", tc.path, err)
+			continue
+		}
+		buf := make([]byte, 64)
+		n, err := fd.Read(s.Ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+		fd.DecRef(s.Ctx)
+		if err != nil && err != io.EOF {
+			t.Errorf("Read(%q) failed: %v", tc.path, err)
+			continue
+		}
+		if got := string(buf[:n]); got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestCPUInfo checks that /proc/cpuinfo is generated from the kernel state and
+// reports the CPU frequency recorded at mount.
+func TestCPUInfo(t *testing.T) {
+	k, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Error creating kernel: %v", err)
+	}
+	ctx := k.SupervisorContext()
+
+	d := newCPUInfoData(k)
+	if got, want := d.freqMHz, k.FeatureSet().CPUFreqMHz(); got != want {
+		t.Errorf("freqMHz: got %v, want %v", got, want)
+	}
+
+	// Generate must report the recorded frequency, not the current host's.
+	d.freqMHz = 1234.5
+	var buf bytes.Buffer
+	if err := d.Generate(ctx, &buf); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	out := buf.String()
+	if got, want := uint(strings.Count(out, "processor\t: ")), k.ApplicationCores(); got != want {
+		t.Errorf("got %d processor entries, want %d", got, want)
+	}
+	if !strings.Contains(strings.ToLower(out), "bogomips\t: 1234.50\n") {
+		t.Errorf("/proc/cpuinfo does not report the recorded frequency:\n%s", out)
 	}
 }

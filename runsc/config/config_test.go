@@ -125,6 +125,31 @@ func TestFromFlags(t *testing.T) {
 	if want := "/run/netproxy.sock"; c.NetworkProxyPath != want || !c.UseNetworkProxy() {
 		t.Errorf("NetworkProxyPath=%q UseNetworkProxy()=%v, want %q and true", c.NetworkProxyPath, c.UseNetworkProxy(), want)
 	}
+
+	if err := testFlags.Lookup("network-proxy-path").Value.Set(""); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	if err := testFlags.Lookup("netgofer").Value.Set("proxy"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := NetgoferModeProxy; c.Netgofer != want || !c.UseNetworkProxy() || c.Netgofer.AllowLoopback() {
+		t.Errorf("Netgofer=%v UseNetworkProxy()=%v AllowLoopback()=%v, want %v, true, false", c.Netgofer, c.UseNetworkProxy(), c.Netgofer.AllowLoopback(), want)
+	}
+
+	if err := testFlags.Lookup("netgofer").Value.Set("proxy-loopback"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Netgofer != NetgoferModeProxyLoopback || !c.Netgofer.Enabled() || !c.Netgofer.AllowLoopback() {
+		t.Errorf("Netgofer=%v Enabled()=%v AllowLoopback()=%v, want NetgoferModeProxyLoopback, true, true", c.Netgofer, c.Netgofer.Enabled(), c.Netgofer.AllowLoopback())
+	}
 }
 
 func TestToFlagsFromFlags(t *testing.T) {
@@ -305,6 +330,11 @@ func TestInvalidFlags(t *testing.T) {
 			name:  "sidecar-usage-policy",
 			value: "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
 			error: "the embedded sidecar fallback has been removed",
+		},
+		{
+			name:  "netgofer",
+			value: "invalid",
+			error: "invalid netgofer mode",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -539,6 +569,38 @@ func TestValidationFail(t *testing.T) {
 				"platform_device_path": "/dev/kvm2",
 			},
 			error: "--platform=auto accepts only --platform_device_path={platform}={path}",
+		},
+		{
+			name: "netgofer+network:none",
+			flags: map[string]string{
+				"netgofer": "proxy",
+				"network":  "none",
+			},
+			error: "netgofer flag is only supported with sandbox networking",
+		},
+		{
+			name: "netgofer+network:host",
+			flags: map[string]string{
+				"netgofer": "proxy",
+				"network":  "host",
+			},
+			error: "netgofer flag is only supported with sandbox networking",
+		},
+		{
+			name: "netgofer+xdp",
+			flags: map[string]string{
+				"netgofer":         "proxy",
+				"EXPERIMENTAL-xdp": "ns",
+			},
+			error: "netgofer flag is incompatible with XDP",
+		},
+		{
+			name: "netgofer+network-proxy-path",
+			flags: map[string]string{
+				"netgofer":           "proxy",
+				"network-proxy-path": "/run/netproxy.sock",
+			},
+			error: "netgofer and network-proxy-path flags cannot both be set",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1440,6 +1502,55 @@ func TestSandboxCPUPolicy(t *testing.T) {
 			}
 			if got := p.Quota(quota, period); got != tc.wantQuota {
 				t.Errorf("p.Quota(%d, %d) = %d, want %d", quota, period, got, tc.wantQuota)
+			}
+		})
+	}
+}
+
+func TestIsFlagExplicitlySet(t *testing.T) {
+	var zero Config
+	if zero.IsFlagExplicitlySet("state-engine") {
+		t.Errorf("zero Config reported state-engine as explicitly set")
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "omitted", args: nil, want: false},
+		{name: "explicit_default", args: []string{"--state-engine=graph"}, want: true},
+		{name: "explicit_non_default", args: []string{"--state-engine=wire"}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+			RegisterFlags(flagSet)
+			if err := flagSet.Parse(tc.args); err != nil {
+				t.Fatalf("flagSet.Parse(%v): %v", tc.args, err)
+			}
+			conf, err := NewFromFlags(flagSet)
+			if err != nil {
+				t.Fatalf("NewFromFlags: %v", err)
+			}
+			if got := conf.IsFlagExplicitlySet("state-engine"); got != tc.want {
+				t.Errorf("IsFlagExplicitlySet(\"state-engine\") = %v, want %v", got, tc.want)
+			}
+			cliVal, cliOK := conf.CLIStateEngine()
+			if cliOK != tc.want {
+				t.Fatalf("CLIStateEngine() ok = %v, want %v", cliOK, tc.want)
+			}
+			if tc.want {
+				wantBeforeOverride := conf.StateEngine
+				other := "graph"
+				if wantBeforeOverride == StateEngineGraph {
+					other = "wire"
+				}
+				if err := conf.Override(flagSet, "state-engine", other, true); err != nil {
+					t.Fatalf("conf.Override: %v", err)
+				}
+				if got, ok := conf.CLIStateEngine(); !ok || got != cliVal || got != wantBeforeOverride {
+					t.Errorf("CLIStateEngine() after Override = (%v, %v), want (%v, true)", got, ok, wantBeforeOverride)
+				}
 			}
 		})
 	}

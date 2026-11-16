@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/sandboxposture"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 )
@@ -41,6 +43,15 @@ func postureConfig(t *testing.T) *config.Config {
 	conf, err := config.NewFromFlags(flag.CommandLine)
 	if err != nil {
 		t.Fatalf("Building a configuration from flags: %v", err)
+	}
+	if conf.EnableCoreTags {
+		supported, err := sandboxposture.CoreTagsSupported()
+		if err != nil {
+			t.Fatalf("Checking for core scheduling support: %v", err)
+		}
+		if !supported {
+			t.Skip("This kernel does not support core scheduling, or SMT is inactive")
+		}
 	}
 	return conf
 }
@@ -97,10 +108,11 @@ func TestSandboxPostureDocker(t *testing.T) {
 		NetworkMode:          conf.Network.String(),
 		EnableRaw:            conf.EnableRaw,
 		RequiresCapSysPtrace: sandboxposture.PlatformCapSysPtrace[conf.Platform],
-		GoDebug:              sandboxposture.GoDebug(conf.Platform),
+		GoDebug:              sandboxposture.GoDebug(conf.Platform, conf.ProfileEnable),
 		Cgroup:               !conf.IgnoreCgroups,
 		ExtraFDClasses:       extraFDClasses(conf),
 		CgoEnabled:           config.CgoEnabled,
+		CoreTags:             conf.EnableCoreTags,
 		NetNamespaceTarget:   netnsTarget,
 		ChildOfRef:           true, // Ref is shim
 		Ref:                  ref,
@@ -125,6 +137,9 @@ func TestSandboxPostureDocker(t *testing.T) {
 		t.Errorf("Sandbox %d: %s", pid, d)
 	}
 	checkThreads(t, "after start", pid, got)
+	if !conf.IgnoreCgroups {
+		checkDeviceCgroup(t, pid, shimPID)
+	}
 
 	// Check the threads a second time after forcing the sandbox to create more
 	// of them. The processes are backgrounded with their stdio redirected so
@@ -191,6 +206,8 @@ func TestSandboxPostureDo(t *testing.T) {
 		"--network=none",
 		"--platform="+conf.Platform,
 		"--directfs="+strconv.FormatBool(conf.DirectFS),
+		"--enable-core-tags="+strconv.FormatBool(conf.EnableCoreTags),
+		"--profile="+strconv.FormatBool(conf.ProfileEnable),
 		"--root", rootDir,
 		"do", "/bin/sh", "-c", "echo "+readyMarker+"; exec sleep 300")
 	stdout, err := cmd.StdoutPipe()
@@ -253,10 +270,11 @@ func TestSandboxPostureDo(t *testing.T) {
 		DirectFS:             conf.DirectFS,
 		EnableRaw:            conf.EnableRaw,
 		RequiresCapSysPtrace: sandboxposture.PlatformCapSysPtrace[conf.Platform],
-		GoDebug:              sandboxposture.GoDebug(conf.Platform),
+		GoDebug:              sandboxposture.GoDebug(conf.Platform, conf.ProfileEnable),
 		Cgroup:               !conf.IgnoreCgroups,
 		ExtraFDClasses:       extraFDClasses(conf),
 		CgoEnabled:           config.CgoEnabled,
+		CoreTags:             conf.EnableCoreTags,
 		// The sandbox is a child of the `runsc do` process this test spawned,
 		// not of the test itself.
 		ChildOfRef: false,
@@ -266,6 +284,9 @@ func TestSandboxPostureDo(t *testing.T) {
 		t.Errorf("Sandbox %d started by `runsc do`: %s", pid, d)
 	}
 	checkThreads(t, "under `runsc do`", pid, got)
+	if !conf.IgnoreCgroups {
+		checkDeviceCgroup(t, pid, cmd.Process.Pid)
+	}
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("Killing the `runsc do` process: %v", err)
 	}
@@ -286,6 +307,83 @@ func TestSandboxPostureDo(t *testing.T) {
 	}, 30*time.Second); err != nil {
 		t.Errorf("Sandbox %d outlived the `runsc do` process that owned it", pid)
 	}
+}
+
+// checkDeviceCgroup requires that the gofers under root are confined like the
+// sandbox, and that the sandbox's cgroup denies any process in it a device
+// outside the whitelist.
+func checkDeviceCgroup(t *testing.T, sandboxPID, root int) {
+	t.Helper()
+	gofers, err := goferPIDsUnder(root)
+	if err != nil {
+		t.Fatalf("Finding the gofers under PID %d: %v", root, err)
+	}
+	if len(gofers) == 0 {
+		t.Fatalf("Found no gofer under PID %d", root)
+	}
+	for _, pid := range gofers {
+		got, err := sandboxposture.DeviceCgroupOf(pid, procPath())
+		if err != nil {
+			t.Fatalf("Device cgroup of gofer %d: %v", pid, err)
+		}
+		if got != sandboxposture.DeviceCgroupConfined {
+			t.Errorf("Gofer %d: device cgroup is %s, want %s", pid, got, sandboxposture.DeviceCgroupConfined)
+		}
+	}
+
+	controller := "devices"
+	if cgroup.IsOnlyV2() {
+		controller = ""
+	}
+	sandboxDir, err := pidCgroupPath(sandboxPID, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfDir, err := pidCgroupPath(os.Getpid(), controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := []byte(strconv.Itoa(os.Getpid()))
+	if err := os.WriteFile(filepath.Join(sandboxDir, "cgroup.procs"), self, 0); err != nil {
+		t.Fatalf("Joining the sandbox's cgroup %s: %v", sandboxDir, err)
+	}
+	defer func() {
+		if err := os.WriteFile(filepath.Join(selfDir, "cgroup.procs"), self, 0); err != nil {
+			t.Fatalf("Leaving the sandbox's cgroup: %v", err)
+		}
+	}()
+	if f, err := os.Open("/dev/null"); err != nil {
+		t.Errorf("The sandbox's cgroup denies /dev/null: %v", err)
+	} else {
+		f.Close()
+	}
+	path := filepath.Join(t.TempDir(), "full")
+	if err := unix.Mknod(path, unix.S_IFCHR|0600, int(unix.Mkdev(1, 7))); !errors.Is(err, unix.EPERM) {
+		t.Errorf("mknod of /dev/full in the sandbox's cgroup: got %v, want %v", err, unix.EPERM)
+	}
+}
+
+// goferPIDsUnder returns the PIDs of the gofers descended from root.
+func goferPIDsUnder(root int) ([]int, error) {
+	entries, err := os.ReadDir(procPath())
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cmdline, err := os.ReadFile(procPath(e.Name(), "cmdline"))
+		if err != nil {
+			continue // The process went away.
+		}
+		if argv0, _, _ := strings.Cut(string(cmdline), "\x00"); argv0 == "runsc-gofer" && descendsFrom(pid, root) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
 }
 
 // isZombie reports whether a `/proc/<pid>/stat` line describes an exited but

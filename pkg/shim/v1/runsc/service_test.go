@@ -18,7 +18,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,12 +33,143 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
+	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
+	"gvisor.dev/gvisor/pkg/shim/v1/runtimeoptions"
+	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+func TestCheckpointAPISerializesRuntimeCalls(t *testing.T) {
+	for _, filesystem := range []bool{false, true} {
+		for _, cancelCheckpoint := range []bool{false, true} {
+			t.Run(fmt.Sprintf("filesystem=%t/cancel=%t", filesystem, cancelCheckpoint), func(t *testing.T) {
+				dir := t.TempDir()
+				gate := filepath.Join(dir, "checkpoint-gate")
+				if err := unix.Mkfifo(gate, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				writer, err := os.OpenFile(gate, os.O_RDWR|unix.O_NONBLOCK, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				release := sync.OnceFunc(func() { _ = writer.Close() })
+				t.Cleanup(release)
+				marker := filepath.Join(dir, "checkpoint-started")
+				unexpected := filepath.Join(dir, "unexpected-command")
+				argsPath := filepath.Join(dir, "checkpoint-args")
+				command := filepath.Join(dir, "runsc")
+				script := "#!/bin/sh\nfor arg do\ncase \"$arg\" in\ncheckpoint|fscheckpoint)\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsPath) + "\n: > " + strconv.Quote(marker) + "\nexec cat " + strconv.Quote(gate) + " >/dev/null\n;;\nesac\ndone\n: > " + strconv.Quote(unexpected) + "\nexit 1\n"
+				if err := os.WriteFile(command, []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				runtime := &runsccmd.Runsc{Command: command, Root: dir}
+				p := proc.New("test", runtime, stdio.Stdio{})
+				p.Rootfs = dir
+				c := &Container{ID: "test", task: p}
+				s := &runscService{containers: map[string]*Container{"test": c}}
+				g := NewGvisorTaskServer(s)
+				req := &pb.CheckpointRequest{
+					Id:           "test",
+					FsCheckpoint: filesystem,
+					ImagePath:    filepath.Join(dir, "image path"),
+					LeaveRunning: true,
+					Debug:        &pb.Debug{DebugLog: filepath.Join(dir, "debug.log")},
+				}
+				ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelOwner()
+				done := make(chan error, 1)
+				go func() { _, err := g.Checkpoint(ownerCtx, req); done <- err }()
+				wait := sync.OnceValue(func() error { return <-done })
+				t.Cleanup(func() { release(); cancelOwner(); _ = wait() })
+				deadline := time.Now().Add(time.Second)
+				for {
+					if _, err := os.Stat(marker); err == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("checkpoint API did not reach the runtime")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				calls := []func(context.Context) error{
+					func(ctx context.Context) error {
+						return c.Kill(ctx, &task.KillRequest{ID: "test", Signal: uint32(unix.SIGKILL), All: true})
+					},
+					func(ctx context.Context) error { return p.Delete(ctx) },
+					func(ctx context.Context) error { return c.Pause(ctx, &task.PauseRequest{ID: "test"}) },
+					func(ctx context.Context) error { return c.Resume(ctx, &task.ResumeRequest{ID: "test"}) },
+					func(ctx context.Context) error { _, err := s.getContainerPids(ctx, c); return err },
+					func(ctx context.Context) error { _, err := g.State(ctx, &pb.StateRequest{Id: "test"}); return err },
+				}
+				for i, call := range calls {
+					ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+					start := time.Now()
+					err := call(ctx)
+					cancel()
+					if elapsed := time.Since(start); err == nil || elapsed < 40*time.Millisecond || elapsed > time.Second {
+						t.Fatalf("runtime call %d during checkpoint: %v after %v", i, err, elapsed)
+					}
+				}
+				if _, err := os.Stat(unexpected); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("another command reached the runtime during checkpoint: %v", err)
+				}
+				args, err := os.ReadFile(argsPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				operation := "checkpoint"
+				if filesystem {
+					operation = "fscheckpoint"
+				}
+				for _, arg := range []string{operation, "--image-path=" + req.ImagePath, "--leave-running", "--debug", "--debug-log=" + req.Debug.DebugLog} {
+					if !strings.Contains("\n"+string(args), "\n"+arg+"\n") {
+						t.Errorf("checkpoint lost argument %q: %s", arg, args)
+					}
+				}
+				if runtime.Debug || runtime.DebugLog != "" {
+					t.Fatal("per-request debug settings changed the shared runtime")
+				}
+				if cancelCheckpoint {
+					cancelOwner()
+				} else {
+					release()
+				}
+				if err := wait(); (err != nil) != cancelCheckpoint {
+					t.Fatalf("checkpoint result = %v, canceled = %t", err, cancelCheckpoint)
+				}
+				if err := os.WriteFile(command, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := g.Checkpoint(context.Background(), req); err != nil {
+					t.Fatalf("checkpoint retry: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestVersionObservesCancellation(t *testing.T) {
+	command := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nexec sleep 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &runscService{}
+	s.versionCommand.Store(&command)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := NewGvisorTaskServer(s).Version(ctx, &pb.VersionRequest{}); err == nil {
+		t.Fatal("canceled Version succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Version ignored caller cancellation for %v", elapsed)
+	}
+}
 
 // errorPublisher is a publisher that always returns an error. It records the
 // contexts it is called with and whether it was closed.
@@ -434,5 +568,118 @@ func TestHasPodCgroupParent(t *testing.T) {
 func TestHasPodCgroupParentNoSpec(t *testing.T) {
 	if hasPodCgroupParent(filepath.Join(t.TempDir(), "missing"), "/kubepods.slice/pod.slice/c.scope") {
 		t.Error("hasPodCgroupParent() = true for a bundle with no spec")
+	}
+}
+
+// TestCreateDoesNotBlockOtherContainers verifies that runscService.Create does
+// not hold s.mu across NewContainer, so RPCs for other containers in the pod
+// can proceed while runsc create is in flight.
+func TestCreateDoesNotBlockOtherContainers(t *testing.T) {
+	dir := t.TempDir()
+	enteredFIFO := filepath.Join(dir, "entered.fifo")
+	releaseFIFO := filepath.Join(dir, "release.fifo")
+	if err := unix.Mkfifo(enteredFIFO, 0o600); err != nil {
+		t.Fatalf("Mkfifo(entered): %v", err)
+	}
+	if err := unix.Mkfifo(releaseFIFO, 0o600); err != nil {
+		t.Fatalf("Mkfifo(release): %v", err)
+	}
+
+	bundle := filepath.Join(dir, "bundle")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatalf("MkdirAll(bundle): %v", err)
+	}
+	if err := utils.WriteSpec(bundle, &specs.Spec{}); err != nil {
+		t.Fatalf("WriteSpec: %v", err)
+	}
+
+	pidFile := filepath.Join(bundle, "init.pid")
+	script := filepath.Join(dir, "fake-runsc")
+	scriptBody := fmt.Sprintf("#!/bin/sh\nprintf '0' >%q\nprintf 'x' >%q\ncat %q >/dev/null\nexit 0\n", pidFile, enteredFIFO, releaseFIFO)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake-runsc): %v", err)
+	}
+
+	configPath := filepath.Join(dir, "config.toml")
+	configBody := fmt.Sprintf("binary_name = %q\nroot = %q\n", script, filepath.Join(dir, "root"))
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("WriteFile(config.toml): %v", err)
+	}
+	optsAny, err := typeurl.MarshalAnyToProto(&runtimeoptions.Options{ConfigPath: configPath})
+	if err != nil {
+		t.Fatalf("MarshalAnyToProto: %v", err)
+	}
+
+	existingInit := proc.New("existing", &runsccmd.Runsc{Command: script}, stdio.Stdio{})
+	s := &runscService{
+		containers: map[string]*Container{
+			"existing": {
+				ID:   "existing",
+				task: existingInit,
+			},
+		},
+	}
+
+	ctx := namespaces.WithNamespace(t.Context(), "test")
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := s.Create(ctx, &task.CreateTaskRequest{
+			ID:      "creating",
+			Bundle:  bundle,
+			Options: optsAny,
+		})
+		createDone <- err
+	}()
+
+	// Wait until fake-runsc is executing inside NewContainer.
+	enteredFile, err := os.Open(enteredFIFO)
+	if err != nil {
+		t.Fatalf("Open(enteredFIFO): %v", err)
+	}
+	var buf [1]byte
+	if _, err := enteredFile.Read(buf[:]); err != nil {
+		enteredFile.Close()
+		t.Fatalf("Read(enteredFIFO): %v", err)
+	}
+	enteredFile.Close()
+
+	// While Create for "creating" is blocked in runsc create, lookups for
+	// "existing" must not block on s.mu.
+	connectDone := make(chan error, 1)
+	go func() {
+		_, err := s.Connect(ctx, &task.ConnectRequest{ID: "existing"})
+		if err == nil {
+			_, err = s.getContainer("existing")
+		}
+		connectDone <- err
+	}()
+
+	select {
+	case err := <-connectDone:
+		if err != nil {
+			t.Errorf("Connect/getContainer(existing) failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Errorf("Connect/getContainer(existing) blocked while another container's Create was in flight")
+	}
+
+	// Unblock fake-runsc and wait for Create to finish.
+	releaseFile, err := os.OpenFile(releaseFIFO, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile(releaseFIFO): %v", err)
+	}
+	releaseFile.Close()
+
+	select {
+	case err := <-createDone:
+		if err != nil {
+			t.Fatalf("Create(creating) failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Create(creating) did not finish after releasing fake-runsc")
+	}
+
+	if _, err := s.getContainer("creating"); err != nil {
+		t.Errorf("getContainer(creating) after Create: %v", err)
 	}
 }

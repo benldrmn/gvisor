@@ -25,17 +25,21 @@ go_library(
         "rdma.go",
         "save_restore.go",
         "sys.go",
+        "sys_amd64.go",
+        "sys_arm64.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/abi/tpu",
         "//pkg/atomicbitops",
+        "//pkg/bitmap",
         "//pkg/context",
         "//pkg/coverage",
         "//pkg/errors/linuxerr",
         "//pkg/fspath",
         "//pkg/fsutil",
+        "//pkg/hostarch",
         "//pkg/log",
         "//pkg/rdma",
         "//pkg/refs",
@@ -47,6 +51,7 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/memmap",
         "//pkg/sentry/vfs",
+        "//pkg/sync",
         "//pkg/usermem",
         "@org_golang_x_sys//unix:go_default_library",
     ],
@@ -56,6 +61,11 @@ go_test(
     name = "sys_test",
     srcs = ["sys_test.go"],
     embed = [":sys"],
+    deps = [
+        "//pkg/errors/linuxerr",
+        "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel/auth",
+    ],
 )
 
 go_test(
@@ -64,6 +74,7 @@ go_test(
     deps = [
         ":sys",
         "//pkg/abi/linux",
+        "//pkg/errors/linuxerr",
         "//pkg/rdma",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/kernel",
